@@ -338,7 +338,6 @@ For issues or questions:
 1. **Check CloudWatch Logs**: Monitor Lambda execution logs
 2. **Review S3 Configuration**: Ensure bucket exists and is accessible
 3. **Verify AKTO Connectivity**: Test endpoint and API key
-4. **GitHub Issues**: Report problems at https://github.com/akto-api-security/akto_aws_bedrock_discovery/issues
 
 ---
 
