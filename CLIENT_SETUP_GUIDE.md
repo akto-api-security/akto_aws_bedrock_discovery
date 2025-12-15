@@ -4,18 +4,11 @@
 
 This guide provides step-by-step instructions for setting up AKTO's AWS Bedrock monitoring solution in your AWS account. This solution automatically captures, processes, and sends AWS Bedrock agent conversations to your AKTO instance for security analysis.
 
-## What You'll Achieve
-
-✅ **Automated Bedrock Monitoring**: Capture all AWS Bedrock agent conversations  
-✅ **Real-time Processing**: Process logs every 5 minutes automatically  
-✅ **Security Analysis**: Send conversation data to AKTO for threat detection  
-✅ **Multi-Model Support**: Works with Amazon Nova, Claude, and other Bedrock models  
-✅ **Client-Side Deployment**: Complete data isolation in your AWS account  
 
 ## Prerequisites
 
 ### 1. AWS Account Requirements
-- AWS CLI installed and configured
+- AWS CLI installed and configured with user who has below permissions
 - IAM permissions for:
   - Lambda functions
   - S3 buckets
@@ -24,18 +17,15 @@ This guide provides step-by-step instructions for setting up AKTO's AWS Bedrock 
   - IAM role creation
 
 ### 2. AKTO Instance Requirements
-- AKTO instance running and accessible
-- Data ingestion service running on port 9095
+- AKTO Data ingestion service instance running and accessible
 - AKTO API key for authentication
 
-### 3. System Requirements
-- macOS, Linux, or Windows with bash support
-- Node.js 18+ (for local testing)
-- Internet connectivity
 
 ## Step-by-Step Setup
 
-### **Step 1: Install AWS CLI**
+### **Step 1: Install AWS CLI if not installed**
+
+If aws CLI is already configured then move to Step 2
 ```bash
 # On Mac:
 brew install awscli
@@ -82,7 +72,7 @@ aws sts get-caller-identity
 ```json
 {
     "UserId": "AIDACKXXXXXXXXXXXXXXXXX",
-    "Account": "123456789012",
+    "Account": "123456789***",
     "Arn": "arn:aws:iam::123456789012:user/your-username"
 }
 ```
@@ -111,9 +101,8 @@ Before running the deployment, gather this information:
    - Must be globally unique across all AWS accounts
 
 2. **AKTO Data Ingestion URL**: Your AKTO endpoint
-   - Format: `https://your-akto-instance.com:9095/api/ingestData`
-   - Replace `your-akto-instance.com` with your
- actual AKTO domain/IP
+   - Format: `https://your-akto-instance.com/api/ingestData`
+   - Replace `your-akto-instance.com` with your actual AKTO domain/IP
 
 3. **AKTO API Key**: Authentication key for your AKTO instance
    - Obtain from your AKTO dashboard
@@ -134,7 +123,7 @@ The script will prompt you for the required information:
 =================================================
 
 📊 Deployment Information:
-   AWS Account ID: 123456789012
+   AWS Account ID: 123456789***
    AWS Region: us-east-1
 
 S3 Bucket Configuration:
@@ -149,8 +138,8 @@ AKTO Data Ingestion Configuration:
   - Data ingestion service URL is REQUIRED
   - API key is REQUIRED for authentication
 
-Enter AKTO Data Ingestion URL (e.g., https://your-akto-instance.com:9095/api/ingestData): https://my-akto.company.com:9095/api/ingestData
-✅ Using Data Ingestion URL: https://my-akto.company.com:9095/api/ingestData
+Enter AKTO Data Ingestion URL (e.g., https://your-akto-instance.com/api/ingestData): https://my-akto.company.com/api/ingestData
+✅ Using Data Ingestion URL: https://my-akto.company.com/api/ingestData
 
 Enter AKTO API Key: ak_live_xxxxxxxxxxxxxxxxxxxx
 ✅ Using API Key: ak_live_...
@@ -189,13 +178,13 @@ The script will automatically:
 
 🔍 Next steps:
 1. Generate some AWS Bedrock conversations
-2. Monitor Lambda logs: aws logs tail /aws/lambda/akto-bedrock-log-processor-123456789012 --follow
-3. Test manually: aws lambda invoke --function-name akto-bedrock-log-processor-123456789012 --payload '{}' response.json
+2. Monitor Lambda logs: aws logs tail /aws/lambda/akto-bedrock-log-processor-123456789*** --follow
+3. Test manually: aws lambda invoke --function-name akto-bedrock-log-processor-123456789*** --payload '{}' response.json
 
 🎯 The system will automatically process Bedrock logs every 5 minutes!
 ```
 
-### Step 6: Verify the Deployment
+### Step 6: Verify the Deployment 
 
 Run the verification script:
 
@@ -295,7 +284,7 @@ aws logs tail /aws/lambda/akto-bedrock-log-processor-YOUR_ACCOUNT_ID --follow
 **4. AKTO Connection Issues**
 ```bash
 # Test connectivity to your AKTO instance
-curl -X POST "https://your-akto-instance.com:9095/api/ingestData" \
+curl -X POST "https://your-akto-instance.com/api/ingestData" \
      -H "Content-Type: application/json" \
      -H "X-API-KEY: your-api-key" \
      -d '{"test": "connection"}'
@@ -303,10 +292,9 @@ curl -X POST "https://your-akto-instance.com:9095/api/ingestData" \
 
 ### Important Notes
 
-1. **Bedrock Logging Configuration**: The Lambda function automatically enables Bedrock model invocation logging on first run
+1. **Bedrock Logging Configuration**: The Lambda function automatically enables Bedrock model invocation logging on first run if not enabled
 2. **Processing Schedule**: Logs are processed every 5 minutes via EventBridge
 3. **Data Format**: Conversations are formatted in AKTO StandardMessage format with security tags
-4. **Cost Considerations**: Monitor S3 storage costs and Lambda execution costs
 5. **Security**: All data remains in your AWS account; no external access required
 
 ## What Happens Next
@@ -317,19 +305,7 @@ Once deployed, the system will:
 2. **Process Conversations**: Extract and format conversation data every 5 minutes
 3. **Send to AKTO**: Forward processed data to your AKTO instance for analysis
 4. **Monitor Security**: AKTO will analyze conversations for potential threats
-5. **Generate Alerts**: Receive notifications for suspicious AI agent interactions
 
-## File Inventory
-
-Required files for client deployment:
-
-1. **`simple-deploy.sh`** - Main deployment script
-2. **`test-solution.sh`** - Verification and testing script
-3. **`lambda-function/`** directory containing:
-   - `index.js` - Main Lambda function code
-   - `package.json` - Node.js dependencies
-4. **`README.md`** - Quick reference guide
-5. **`CLIENT_SETUP_GUIDE.md`** - This comprehensive guide
 
 ## Support
 
