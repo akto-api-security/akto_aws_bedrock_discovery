@@ -35,16 +35,44 @@ This guide provides step-by-step instructions for setting up AKTO's AWS Bedrock 
 
 ## Step-by-Step Setup
 
-### Step 1: Configure AWS CLI
+### **Step 1: Install AWS CLI**
+```bash
+# On Mac:
+brew install awscli
 
-First, ensure your AWS CLI is properly configured:
+# On Windows: Download from https://aws.amazon.com/cli/
+# On Linux:
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+```
+
+### **Step 1.1: Install Node.js**
+```bash
+# On Mac:
+brew install node
+
+# On Windows/Linux: Download from https://nodejs.org/
+```
+
+### **Step 1.2: Configure AWS Credentials**
+
+You need to tell AWS who you are:
 
 ```bash
-# Check if AWS CLI is installed
-aws --version
-
-# Configure AWS CLI (if not already done)
 aws configure
+```
+
+It will ask for:
+- **AWS Access Key ID**: Get from AWS Console → IAM → Users → Your User → Security credentials
+- **AWS Secret Access Key**: Same place as above  
+- **Default region**: Use `us-east-1` (or your preferred region)
+- **Default output format**: Just press Enter
+
+### **Step 1.3: Test AWS Access**
+```bash
+aws sts get-caller-identity
+```
 
 # Verify your AWS identity
 aws sts get-caller-identity
@@ -58,6 +86,8 @@ aws sts get-caller-identity
     "Arn": "arn:aws:iam::123456789012:user/your-username"
 }
 ```
+✅ **Should show your account ID** - You're ready!  
+❌ **Shows error** - Fix your credentials first
 
 ### Step 2: Download the Solution
 
@@ -82,7 +112,8 @@ Before running the deployment, gather this information:
 
 2. **AKTO Data Ingestion URL**: Your AKTO endpoint
    - Format: `https://your-akto-instance.com:9095/api/ingestData`
-   - Replace `your-akto-instance.com` with your actual AKTO domain/IP
+   - Replace `your-akto-instance.com` with your
+ actual AKTO domain/IP
 
 3. **AKTO API Key**: Authentication key for your AKTO instance
    - Obtain from your AKTO dashboard
