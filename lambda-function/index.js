@@ -1,7 +1,7 @@
-const { 
-    BedrockClient, 
+const {
+    BedrockClient,
     GetModelInvocationLoggingConfigurationCommand,
-    PutModelInvocationLoggingConfigurationCommand 
+    PutModelInvocationLoggingConfigurationCommand
 } = require('@aws-sdk/client-bedrock');
 const { S3Client, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { gunzip } = require('zlib');
@@ -330,10 +330,10 @@ async function processBedrockLogEntry(logEntry, lineNumber, totalLines) {
             console.log(`\n💬 Processing conversation pair ${i + 1}:`);
             console.log(`   👤 User: ${pair.userMessage.substring(0, 100)}...`);
             console.log(`   🤖 Agent: ${pair.agentResponse.substring(0, 100)}...`);
-            
+
             const message = createStandardMessage(pair);
             messages.push(message);
-            
+
             console.log('✅ Created standard message:');
             // console.log(JSON.stringify(message, null, 2));
         }
@@ -533,7 +533,7 @@ function removeXMLTags(text, tag) {
 function createStandardMessage(pair) {
     // Parse timestamp
     const timestamp = new Date(pair.timestamp);
-    
+
     // Create request payload (user message)
     const requestPayload = {
         message: pair.userMessage,
@@ -541,19 +541,22 @@ function createStandardMessage(pair) {
         requestId: pair.requestId
     };
 
-    // Create response payload (agent response) 
+    // Create response payload (agent response)
     const responsePayload = {
         message: pair.agentResponse,
         model: pair.modelId
     };
 
-    // Extract agent ID from ARN for host header
+    // Set the original host to bedrock-runtime endpoint
+    const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+
+    // Extract agent ID from ARN
     const agentId = extractAgentID(pair.agentId);
-    const host = agentId ? `${AWS_ACCOUNT_ID}.${agentId}.bedrock.amazonaws.com` : 'bedrock.amazonaws.com';
 
     // Create standard message following exact Go format
     const message = {
-        path: '/bedrock/invoke',
+        path: `/model/${pair.modelId}/invoke`,
+        original_host: originalHost,
         method: 'POST',
         requestHeaders: JSON.stringify({
             'Content-Type': 'application/json',
@@ -562,7 +565,8 @@ function createStandardMessage(pair) {
             'X-Request-Id': pair.requestId,
             'aws-account-id': AWS_ACCOUNT_ID,
             'bedrock-agent-id': agentId || '',
-            'host': host
+            'agent-id': agentId || '',
+            'host': originalHost
         }),
         responseHeaders: JSON.stringify({
             'Content-Type': 'application/json',
@@ -579,7 +583,11 @@ function createStandardMessage(pair) {
         akto_vxlan_id: '0',
         is_pending: 'false',
         source: 'MIRRORING',
-        tag: JSON.stringify({ source: 'AWS_BEDROCK', 'gen-ai': 'Gen AI' })
+        tag: JSON.stringify({
+            source: 'AWS_BEDROCK',
+            'gen-ai': 'Gen AI',
+            'bot-name': `${AWS_ACCOUNT_ID}.${agentId}.bedrock-runtime.amazonaws.com`
+        })
     };
 
     return message;
