@@ -125,7 +125,8 @@ cat > custom-policy.json <<EOF
             "Effect": "Allow",
             "Action": [
                 "bedrock:GetModelInvocationLoggingConfiguration",
-                "bedrock:PutModelInvocationLoggingConfiguration"
+                "bedrock:PutModelInvocationLoggingConfiguration",
+                "bedrock:GetAgent"
             ],
             "Resource": "*"
         },

@@ -3,6 +3,7 @@ const {
     GetModelInvocationLoggingConfigurationCommand,
     PutModelInvocationLoggingConfigurationCommand
 } = require('@aws-sdk/client-bedrock');
+const { BedrockAgentClient, GetAgentCommand } = require('@aws-sdk/client-bedrock-agent');
 const { S3Client, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { gunzip } = require('zlib');
 const { promisify } = require('util');
@@ -18,7 +19,11 @@ const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID;
 
 // Initialize AWS clients
 const bedrockClient = new BedrockClient({ region: AWS_REGION });
+const bedrockAgentClient = new BedrockAgentClient({ region: AWS_REGION });
 const s3Client = new S3Client({ region: AWS_REGION });
+
+// Cache for agent names to avoid repeated API calls
+const agentNameCache = {};
 
 /**
  * Main Lambda handler triggered by EventBridge schedule
@@ -331,7 +336,7 @@ async function processBedrockLogEntry(logEntry, lineNumber, totalLines) {
             console.log(`   👤 User: ${pair.userMessage.substring(0, 100)}...`);
             console.log(`   🤖 Agent: ${pair.agentResponse.substring(0, 100)}...`);
 
-            const message = createStandardMessage(pair);
+            const message = await createStandardMessage(pair);
             messages.push(message);
 
             console.log('✅ Created standard message:');
@@ -530,7 +535,7 @@ function removeXMLTags(text, tag) {
 /**
  * Create standard message in AKTO format (based on Go implementation)
  */
-function createStandardMessage(pair) {
+async function createStandardMessage(pair) {
     // Parse timestamp
     const timestamp = new Date(pair.timestamp);
 
@@ -550,8 +555,9 @@ function createStandardMessage(pair) {
     // Set the original host to bedrock-runtime endpoint
     const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
 
-    // Extract agent ID from ARN
+    // Extract agent ID and fetch agent name
     const agentId = extractAgentID(pair.agentId);
+    const agentName = await fetchAgentName(agentId);
 
     // Create standard message following exact Go format
     const message = {
@@ -565,7 +571,7 @@ function createStandardMessage(pair) {
             'X-Request-Id': pair.requestId,
             'aws-account-id': AWS_ACCOUNT_ID,
             'bedrock-agent-id': agentId || '',
-            'agent-id': agentId || '',
+            'agent-name': agentName,
             'host': originalHost
         }),
         responseHeaders: JSON.stringify({
@@ -586,7 +592,7 @@ function createStandardMessage(pair) {
         tag: JSON.stringify({
             source: 'AWS_BEDROCK',
             'gen-ai': 'Gen AI',
-            'bot-name': `${AWS_ACCOUNT_ID}.${agentId}.bedrock-runtime.amazonaws.com`
+            'bot-name': agentName
         })
     };
 
@@ -602,6 +608,50 @@ function extractAgentID(arn) {
     // Pattern: BedrockAgents-{AGENT_ID}-{UUID}
     const match = arn.match(/BedrockAgents-([A-Z0-9]+)-[a-f0-9-]+$/);
     return match ? match[1] : '';
+}
+
+/**
+ * Fetch agent name from agent ID using Bedrock Agents API
+ */
+async function fetchAgentName(agentId) {
+    try {
+        if (!agentId) {
+            console.log('⚠️ fetchAgentName: No agent ID provided');
+            return '';
+        }
+
+        // Check cache first
+        if (agentNameCache[agentId]) {
+            console.log(`✅ Found agent name in cache: ${agentNameCache[agentId]}`);
+            return agentNameCache[agentId];
+        }
+
+        console.log(`🔍 Fetching agent details for agent ID: ${agentId}`);
+        const getAgentCommand = new GetAgentCommand({ agentId });
+        console.log(`🔍 GetAgentCommand created, sending request...`);
+        const agentDetails = await bedrockAgentClient.send(getAgentCommand);
+
+        console.log(`🔍 Response received:`, JSON.stringify(agentDetails).substring(0, 200));
+
+        if (agentDetails && agentDetails.agent && agentDetails.agent.agentName) {
+            console.log(`✅ Found agent name: ${agentDetails.agent.agentName}`);
+            agentNameCache[agentId] = agentDetails.agent.agentName;
+            return agentDetails.agent.agentName;
+        }
+
+        if (agentDetails && agentDetails.agentName) {
+            console.log(`✅ Found agent name: ${agentDetails.agentName}`);
+            agentNameCache[agentId] = agentDetails.agentName;
+            return agentDetails.agentName;
+        }
+
+        console.log('⚠️ Agent name not found in response, available keys:', Object.keys(agentDetails || {}));
+        return '';
+    } catch (error) {
+        console.error(`❌ Error fetching agent name for ${agentId}:`, error.message);
+        console.error(`❌ Full error:`, JSON.stringify(error).substring(0, 300));
+        return '';
+    }
 }
 
 /**
