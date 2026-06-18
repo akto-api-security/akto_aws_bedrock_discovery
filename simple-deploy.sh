@@ -58,6 +58,7 @@ done
 echo "✅ Using Data Ingestion URL: $DATA_INGESTION_URL"
 echo "✅ Using API Key: ${AKTO_API_KEY:0:8}..." # Show only first 8 characters for security
 
+
 echo ""
 echo "📦 Building Lambda package..."
 cd lambda-function
@@ -133,6 +134,14 @@ cat > custom-policy.json <<EOF
         {
             "Effect": "Allow",
             "Action": [
+                "bedrock-agentcore:ListHarnesses",
+                "bedrock-agentcore:GetHarness"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
                 "logs:CreateLogGroup",
                 "logs:CreateLogStream",
                 "logs:PutLogEvents"
@@ -145,12 +154,44 @@ cat > custom-policy.json <<EOF
                 "iam:PassRole",
                 "iam:GetRole",
                 "iam:CreateRole",
-                "iam:AttachRolePolicy"
+                "iam:AttachRolePolicy",
+                "iam:ListAttachedRolePolicies",
+                "iam:ListRolePolicies"
             ],
             "Resource": [
                 "arn:aws:iam::$ACCOUNT_ID:role/*bedrock*",
-                "arn:aws:iam::$ACCOUNT_ID:role/service-role/*bedrock*"
+                "arn:aws:iam::$ACCOUNT_ID:role/service-role/*bedrock*",
+                "arn:aws:iam::$ACCOUNT_ID:role/akto-bedrock-processor-role-*"
             ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "lambda:GetFunction",
+                "lambda:ListTags"
+            ],
+            "Resource": "arn:aws:lambda:*:$ACCOUNT_ID:function:akto-bedrock-log-processor-*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetBucketTagging"
+            ],
+            "Resource": "arn:aws:s3:::*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "bedrock:ListTagsForResource"
+            ],
+            "Resource": "arn:aws:bedrock:*:$ACCOUNT_ID:agent/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "bedrock-agentcore:ListTagsForResource"
+            ],
+            "Resource": "arn:aws:bedrock-agentcore:*:$ACCOUNT_ID:harness/*"
         },
         {
             "Effect": "Allow",

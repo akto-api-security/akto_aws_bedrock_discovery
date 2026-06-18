@@ -3,7 +3,10 @@ const {
     GetModelInvocationLoggingConfigurationCommand,
     PutModelInvocationLoggingConfigurationCommand
 } = require('@aws-sdk/client-bedrock');
-const { BedrockAgentClient, GetAgentCommand } = require('@aws-sdk/client-bedrock-agent');
+const { BedrockAgentClient, GetAgentCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
+const { BedrockAgentCoreControlClient, ListHarnessesCommand, GetHarnessCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
+const { LambdaClient, ListTagsCommand, GetFunctionCommand } = require('@aws-sdk/client-lambda');
+const { IAMClient, ListRolePoliciesCommand, ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
 const { S3Client, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { gunzip } = require('zlib');
 const { promisify } = require('util');
@@ -20,10 +23,20 @@ const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID;
 // Initialize AWS clients
 const bedrockClient = new BedrockClient({ region: AWS_REGION });
 const bedrockAgentClient = new BedrockAgentClient({ region: AWS_REGION });
+const bedrockAgentCoreControlClient = new BedrockAgentCoreControlClient({ region: AWS_REGION });
 const s3Client = new S3Client({ region: AWS_REGION });
+const lambdaClient = new LambdaClient({ region: AWS_REGION });
+const iamClient = new IAMClient({ region: AWS_REGION });
 
-// Cache for agent names to avoid repeated API calls
+// Cache for agent names and harness details to avoid repeated API calls
 const agentNameCache = {};
+const harnessNameCache = {}; // Maps role-suffix (fr53w, dv8m2) to harness name
+const harnessIdCache = {}; // Maps role-suffix (fr53w, dv8m2) to harness ID
+const harnessExecutionRoleCache = {}; // Maps role-suffix (fr53w, dv8m2) to execution role ARN
+
+// Cache for resource tags
+const resourceTagsCache = {};
+let harnessInitialized = false;
 
 /**
  * Main Lambda handler triggered by EventBridge schedule
@@ -35,6 +48,11 @@ exports.handler = async (event) => {
     console.log(`🔗 Data Ingestion Endpoint: ${DATA_INGESTION_ENDPOINT}`);
 
     try {
+        // Initialize harness cache once at startup
+        if (!harnessInitialized) {
+            await initializeHarnessCache();
+            harnessInitialized = true;
+        }
         // Step 1: Determine which S3 bucket to use
         const s3BucketName = await determineS3Bucket();
         console.log(`🗄️ Using S3 bucket: ${s3BucketName}`);
@@ -393,15 +411,31 @@ function extractConversationPairs(logEntry) {
         // create a conversation pair with the most recent user message
         if (finalAssistantResponse && userMessages.length > 0) {
             const lastUserMessage = userMessages[userMessages.length - 1];
-            console.log(`✅ Creating conversation pair:\n  User: "${lastUserMessage.substring(0, 50)}..."\n  Assistant: "${finalAssistantResponse.substring(0, 50)}..."`);
-            
+            const arn = logEntry.identity?.arn || '';
+            const logType = detectLogType(arn);
+            console.log(`✅ Creating conversation pair (Type: ${logType}):\n  User: "${lastUserMessage.substring(0, 50)}..."\n  Assistant: "${finalAssistantResponse.substring(0, 50)}..."`);
+
+            const harnessRoleSuffix = extractHarnessRoleSuffix(arn);
+            const harnessName = logType === 'HARNESS' ? getHarnessName(harnessRoleSuffix) : '';
+            const harnessId = logType === 'HARNESS' ? getHarnessId(harnessRoleSuffix) : '';
+
             pairs.push({
                 userMessage: lastUserMessage,
                 agentResponse: finalAssistantResponse,
                 timestamp: logEntry.timestamp,
                 requestId: logEntry.requestId,
                 modelId: logEntry.modelId,
-                agentId: logEntry.identity?.arn || ''
+                agentId: extractAgentID(arn),
+                harnessRoleSuffix: harnessRoleSuffix,
+                harnessName: harnessName,
+                harnessId: harnessId,
+                arn: arn,
+                logType: logType,
+                operation: logEntry.operation || 'Unknown',
+                accountId: logEntry.accountId || AWS_ACCOUNT_ID,
+                region: logEntry.region || AWS_REGION,
+                inputTokenCount: logEntry.input?.inputTokenCount || 0,
+                outputTokenCount: logEntry.output?.outputTokenCount || 0
             });
         }
 
@@ -417,22 +451,38 @@ function extractConversationPairs(logEntry) {
                 if (userText && !userText.includes('<function_results>') && userText.trim().length > 0) {
                     const cleanedResponse = cleanAgentResponse(assistantText);
                     if (cleanedResponse) {
-                        console.log(`📚 Found historical conversation pair:\n  User: "${userText.substring(0, 50)}..."\n  Assistant: "${cleanedResponse.substring(0, 50)}..."`);
-                        
+                        const arn = logEntry.identity?.arn || '';
+                        const logType = detectLogType(arn);
+                        console.log(`📚 Found historical conversation pair (Type: ${logType}):\n  User: "${userText.substring(0, 50)}..."\n  Assistant: "${cleanedResponse.substring(0, 50)}..."`);
+
                         // Avoid duplicating the final pair we already added
-                        const isDuplicate = pairs.some(pair => 
-                            pair.userMessage === userText && 
+                        const isDuplicate = pairs.some(pair =>
+                            pair.userMessage === userText &&
                             pair.agentResponse === cleanedResponse
                         );
-                        
+
                         if (!isDuplicate) {
+                            const harnessRoleSuffix = extractHarnessRoleSuffix(arn);
+                            const harnessName = logType === 'HARNESS' ? getHarnessName(harnessRoleSuffix) : '';
+                            const harnessId = logType === 'HARNESS' ? getHarnessId(harnessRoleSuffix) : '';
+
                             pairs.push({
                                 userMessage: userText,
                                 agentResponse: cleanedResponse,
                                 timestamp: logEntry.timestamp,
                                 requestId: logEntry.requestId,
                                 modelId: logEntry.modelId,
-                                agentId: logEntry.identity?.arn || ''
+                                agentId: extractAgentID(arn),
+                                harnessRoleSuffix: harnessRoleSuffix,
+                                harnessName: harnessName,
+                                harnessId: harnessId,
+                                arn: arn,
+                                logType: logType,
+                                operation: logEntry.operation || 'Unknown',
+                                accountId: logEntry.accountId || AWS_ACCOUNT_ID,
+                                region: logEntry.region || AWS_REGION,
+                                inputTokenCount: logEntry.input?.inputTokenCount || 0,
+                                outputTokenCount: logEntry.output?.outputTokenCount || 0
                             });
                         }
                     }
@@ -539,6 +589,30 @@ async function createStandardMessage(pair) {
     // Parse timestamp
     const timestamp = new Date(pair.timestamp);
 
+    // Fetch name based on log type
+    let botName = '';
+    if (pair.logType === 'AGENT') {
+        botName = await fetchAgentName(pair.agentId);
+    } else if (pair.logType === 'HARNESS') {
+        botName = getHarnessName(pair.harnessRoleSuffix);
+    }
+
+    // Fetch resource tags (only agent and harness)
+    let agentTags = {};
+    let harnessTags = {};
+
+    if (pair.logType === 'AGENT' && pair.agentId) {
+        agentTags = await getBedrockAgentTags(pair.agentId);
+    } else if (pair.logType === 'HARNESS' && pair.harnessId) {
+        harnessTags = await getHarnessTags(pair.harnessId);
+        // Add harness execution role and its policies to tags
+        const harnessExecutionRoleArn = getHarnessExecutionRoleArn(pair.harnessRoleSuffix);
+        harnessTags = await addHarnessRoleAndPermissions(harnessTags, harnessExecutionRoleArn);
+    }
+
+    // Set the original host to bedrock-runtime endpoint
+    const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+
     // Create request payload (user message)
     const requestPayload = {
         message: pair.userMessage,
@@ -552,28 +626,30 @@ async function createStandardMessage(pair) {
         model: pair.modelId
     };
 
-    // Set the original host to bedrock-runtime endpoint
-    const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
-
-    // Extract agent ID and fetch agent name
-    const agentId = extractAgentID(pair.agentId);
-    const agentName = await fetchAgentName(agentId);
+    // Build request headers with enriched metadata
+    const requestHeaders = {
+        'Content-Type': 'application/json',
+        'Authorization': 'AWS4-HMAC-SHA256',
+        'X-Bedrock-Model-Id': pair.modelId,
+        'X-Request-Id': pair.requestId,
+        'aws-account-id': pair.accountId || AWS_ACCOUNT_ID,
+        'bedrock-agent-id': pair.agentId || '',
+        'bedrock-harness-id': pair.harnessId || '',
+        'agent-name': botName,
+        'host': originalHost,
+        'bedrock-operation': pair.operation || 'Unknown',
+        'bedrock-identity-arn': pair.arn || '',
+        'bedrock-region': pair.region || AWS_REGION,
+        'bedrock-input-tokens': (pair.inputTokenCount || 0).toString(),
+        'bedrock-output-tokens': (pair.outputTokenCount || 0).toString()
+    };
 
     // Create standard message following exact Go format
     const message = {
         path: `/model/${pair.modelId}/invoke`,
         original_host: originalHost,
         method: 'POST',
-        requestHeaders: JSON.stringify({
-            'Content-Type': 'application/json',
-            'Authorization': 'AWS4-HMAC-SHA256',
-            'X-Bedrock-Model-Id': pair.modelId,
-            'X-Request-Id': pair.requestId,
-            'aws-account-id': AWS_ACCOUNT_ID,
-            'bedrock-agent-id': agentId || '',
-            'agent-name': agentName,
-            'host': originalHost
-        }),
+        requestHeaders: JSON.stringify(requestHeaders),
         responseHeaders: JSON.stringify({
             'Content-Type': 'application/json',
             'X-Request-Id': pair.requestId
@@ -592,7 +668,18 @@ async function createStandardMessage(pair) {
         tag: JSON.stringify({
             source: 'AWS_BEDROCK',
             'gen-ai': 'Gen AI',
-            'bot-name': agentName
+            'agentType': pair.logType === 'AGENT' ? 'BEDROCK_AGENT' : (pair.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : 'UNKNOWN'),
+            'bot-name': botName,
+            'operation': pair.operation || 'Unknown',
+            'agent-id': pair.logType === 'AGENT' ? (pair.agentId || '') : '',
+            'harness-id': pair.logType === 'HARNESS' ? (pair.harnessId || '') : '',
+            'account-id': pair.accountId || AWS_ACCOUNT_ID,
+            'region': pair.region || AWS_REGION,
+            'model': pair.modelId,
+            'input-tokens': (pair.inputTokenCount || 0).toString(),
+            'output-tokens': (pair.outputTokenCount || 0).toString(),
+            'bedrock-identity-arn': pair.arn || '',
+            ...(pair.logType === 'AGENT' ? agentTags : harnessTags)
         })
     };
 
@@ -652,6 +739,363 @@ async function fetchAgentName(agentId) {
         console.error(`❌ Full error:`, JSON.stringify(error).substring(0, 300));
         return '';
     }
+}
+
+/**
+ * Initialize harness cache by fetching all harnesses and mapping role suffix to harness name
+ */
+async function initializeHarnessCache() {
+    try {
+        console.log('🔄 Initializing harness cache...');
+        const listCommand = new ListHarnessesCommand({});
+        const listResponse = await bedrockAgentCoreControlClient.send(listCommand);
+
+        const harnessesArray = listResponse.harnesses || [];
+        console.log(`📋 Found ${harnessesArray.length} harnesses from ListHarnesses API`);
+
+        if (harnessesArray.length > 0) {
+            for (const harnessItem of harnessesArray) {
+                const harnessId = harnessItem.harnessId;
+                const harnessName = harnessItem.harnessName;
+
+                if (!harnessId || !harnessName) {
+                    console.log(`⚠️ Harness missing ID or name, skipping`);
+                    continue;
+                }
+
+                console.log(`🔍 Getting details for harness: ${harnessName} (ID: ${harnessId})`);
+
+                try {
+                    // Call GetHarness to get more details including IAM role info
+                    const getCommand = new GetHarnessCommand({ harnessId });
+                    const harnessDetails = await bedrockAgentCoreControlClient.send(getCommand);
+
+                    console.log(`🔍 GetHarness response keys: ${Object.keys(harnessDetails).join(', ')}`);
+                    console.log(`🔍 Harness object keys: ${Object.keys(harnessDetails.harness || {}).join(', ')}`);
+                    console.log(`🔍 Full harness response (first 300 chars): ${JSON.stringify(harnessDetails).substring(0, 300)}`);
+
+                    // Try to extract role suffix from the execution role ARN
+                    const executionRoleArn = harnessDetails.harness?.executionRoleArn;
+                    const harnesId = harnessDetails.harness?.harnessId;
+
+                    if (executionRoleArn) {
+                        const iamRoleMatch = executionRoleArn.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
+                        if (iamRoleMatch) {
+                            const roleSuffix = iamRoleMatch[1];
+                            harnessNameCache[roleSuffix] = harnessName;
+                            harnessIdCache[roleSuffix] = harnesId;
+                            harnessExecutionRoleCache[roleSuffix] = executionRoleArn;
+                            console.log(`✅ Mapped role suffix '${roleSuffix}' to harness name '${harnessName}', ID '${harnesId}', and role ARN`);
+                        } else {
+                            console.log(`⚠️ Role ARN doesn't match expected pattern: ${executionRoleArn}`);
+                        }
+                    } else {
+                        console.log(`⚠️ No executionRoleArn found in GetHarness response for ${harnessName}`);
+                    }
+                } catch (getError) {
+                    console.error(`❌ Error getting details for harness ${harnessId}:`, getError.message);
+                }
+            }
+        }
+
+        console.log(`✅ Harness cache initialized with ${Object.keys(harnessNameCache).length} mappings`);
+    } catch (error) {
+        console.error('❌ Error initializing harness cache:', error.message);
+        // Continue processing even if harness discovery fails - we'll just use identifiers instead of names
+    }
+}
+
+/**
+ * Fetch tags for Lambda function with source indicator
+ */
+async function getLambdaTags() {
+    try {
+        if (resourceTagsCache['lambda']) {
+            return resourceTagsCache['lambda'];
+        }
+
+        const functionArn = `arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:akto-bedrock-log-processor-${AWS_ACCOUNT_ID}`;
+        const listTagsCommand = new ListTagsCommand({ Resource: functionArn });
+        const response = await lambdaClient.send(listTagsCommand);
+
+        const tags = {};
+        if (response.Tags) {
+            Object.keys(response.Tags).forEach(key => {
+                tags[key] = `${response.Tags[key]}(lambda)`;
+            });
+        }
+
+        resourceTagsCache['lambda'] = tags;
+        console.log(`✅ Lambda tags fetched: ${JSON.stringify(tags).substring(0, 200)}`);
+        return tags;
+    } catch (error) {
+        console.log(`⚠️ Could not fetch Lambda tags: ${error.message}`);
+        return {};
+    }
+}
+
+/**
+ * Fetch tags for S3 bucket with source indicator
+ */
+async function getS3BucketTags(bucketName) {
+    try {
+        const cacheKey = `s3-${bucketName}`;
+        if (resourceTagsCache[cacheKey]) {
+            return resourceTagsCache[cacheKey];
+        }
+
+        const taggingCommand = new (require('@aws-sdk/client-s3')).GetBucketTaggingCommand({ Bucket: bucketName });
+        const response = await s3Client.send(taggingCommand);
+
+        const tags = {};
+        if (response.TagSet && Array.isArray(response.TagSet)) {
+            response.TagSet.forEach(tag => {
+                tags[tag.Key] = `${tag.Value}(s3)`;
+            });
+        }
+
+        resourceTagsCache[cacheKey] = tags;
+        console.log(`✅ S3 bucket tags fetched: ${JSON.stringify(tags).substring(0, 200)}`);
+        return tags;
+    } catch (error) {
+        console.log(`⚠️ Could not fetch S3 tags for ${bucketName}: ${error.message}`);
+        return {};
+    }
+}
+
+/**
+ * Fetch tags for Bedrock Agent
+ */
+async function getBedrockAgentTags(agentId) {
+    try {
+        const cacheKey = `agent-${agentId}`;
+        if (resourceTagsCache[cacheKey]) {
+            return resourceTagsCache[cacheKey];
+        }
+
+        const agentArn = `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agentId}`;
+        const listTagsCommand = new BedrockAgentListTagsCommand({ resourceArn: agentArn });
+        const response = await bedrockAgentClient.send(listTagsCommand);
+
+        const tags = {};
+        if (response.tags) {
+            Object.keys(response.tags).forEach(key => {
+                tags[key] = response.tags[key];
+            });
+        }
+
+        resourceTagsCache[cacheKey] = tags;
+        console.log(`✅ Agent tags fetched for ${agentId}: ${JSON.stringify(tags).substring(0, 200)}`);
+        return tags;
+    } catch (error) {
+        console.log(`⚠️ Could not fetch agent tags for ${agentId}: ${error.message}`);
+        return {};
+    }
+}
+
+/**
+ * Fetch tags for AgentCore Harness with role/permission info
+ */
+async function getHarnessTags(harnessId) {
+    try {
+        const cacheKey = `harness-${harnessId}`;
+        if (resourceTagsCache[cacheKey]) {
+            return resourceTagsCache[cacheKey];
+        }
+
+        const harnessArn = `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harnessId}`;
+        const listTagsCommand = new BedrockCoreListTagsCommand({ resourceArn: harnessArn });
+        const response = await bedrockAgentCoreControlClient.send(listTagsCommand);
+
+        const tags = {};
+        if (response.tags) {
+            Object.keys(response.tags).forEach(key => {
+                tags[key] = response.tags[key];
+            });
+        }
+
+        resourceTagsCache[cacheKey] = tags;
+        console.log(`✅ Harness tags fetched for ${harnessId}: ${JSON.stringify(tags).substring(0, 200)}`);
+        return tags;
+    } catch (error) {
+        console.log(`⚠️ Could not fetch harness tags for ${harnessId}: ${error.message}`);
+        return {};
+    }
+}
+
+/**
+ * Add harness execution role and permissions to tags
+ */
+async function addHarnessRoleAndPermissions(tags, harnessExecutionRoleArn) {
+    try {
+        if (!harnessExecutionRoleArn) {
+            return tags;
+        }
+
+        const roleName = extractRoleNameFromArn(harnessExecutionRoleArn);
+        if (!roleName) {
+            return tags;
+        }
+
+        const policies = await getRolePolicies(roleName);
+
+        const enhancedTags = {
+            ...tags,
+            'harness-execution-role-arn': harnessExecutionRoleArn,
+            'harness-execution-role': roleName,
+            'harness-role-policies': policies
+        };
+
+        return enhancedTags;
+    } catch (error) {
+        console.log(`⚠️ Could not add harness role and permissions: ${error.message}`);
+        return tags;
+    }
+}
+
+/**
+ * Fetch Lambda execution role and its attached policies with source indicator
+ */
+async function getLambdaRoleAndPermissions() {
+    try {
+        const cacheKey = 'lambda-role-permissions';
+        if (resourceTagsCache[cacheKey]) {
+            return resourceTagsCache[cacheKey];
+        }
+
+        const functionName = `akto-bedrock-log-processor-${AWS_ACCOUNT_ID}`;
+        const getFunctionCommand = new GetFunctionCommand({ FunctionName: functionName });
+        const functionResponse = await lambdaClient.send(getFunctionCommand);
+
+        const roleArn = functionResponse.Configuration.Role;
+        const roleName = roleArn.split('/').pop();
+
+        // Get attached managed policies
+        const attachedPoliciesCommand = new ListAttachedRolePoliciesCommand({ RoleName: roleName });
+        const attachedPolicies = await iamClient.send(attachedPoliciesCommand);
+
+        const policyNames = attachedPolicies.AttachedPolicies?.map(p => p.PolicyName).join(',') || '';
+
+        const roleInfo = {
+            'lambda-execution-role': `${roleName}(lambda)`,
+            'lambda-execution-role-arn': `${roleArn}(lambda)`,
+            'lambda-attached-policies': `${policyNames}(lambda)`
+        };
+
+        resourceTagsCache[cacheKey] = roleInfo;
+        console.log(`✅ Lambda role and permissions fetched: ${JSON.stringify(roleInfo).substring(0, 200)}`);
+        return roleInfo;
+    } catch (error) {
+        console.log(`⚠️ Could not fetch Lambda role and permissions: ${error.message}`);
+        return {};
+    }
+}
+
+/**
+ * Extract role name from IAM role ARN
+ */
+function extractRoleNameFromArn(roleArn) {
+    if (!roleArn) return '';
+    const parts = roleArn.split('/');
+    return parts[parts.length - 1];
+}
+
+/**
+ * Fetch attached policies for a role
+ */
+async function getRolePolicies(roleName) {
+    try {
+        const cacheKey = `role-policies-${roleName}`;
+        if (resourceTagsCache[cacheKey]) {
+            return resourceTagsCache[cacheKey];
+        }
+
+        const attachedPoliciesCommand = new ListAttachedRolePoliciesCommand({ RoleName: roleName });
+        const attachedPolicies = await iamClient.send(attachedPoliciesCommand);
+
+        const policyNames = attachedPolicies.AttachedPolicies?.map(p => p.PolicyName).join(',') || '';
+
+        resourceTagsCache[cacheKey] = policyNames;
+        console.log(`✅ Role policies fetched for ${roleName}: ${policyNames}`);
+        return policyNames;
+    } catch (error) {
+        console.log(`⚠️ Could not fetch policies for role ${roleName}: ${error.message}`);
+        return '';
+    }
+}
+
+/**
+ * Detect whether log is from regular Bedrock Agent or AgentCore Harness
+ */
+function detectLogType(arn) {
+    if (!arn) return 'UNKNOWN';
+
+    if (arn.includes('BedrockAgents-')) {
+        return 'AGENT';
+    } else if (arn.includes('AmazonBedrockAgentCoreHarnessDefaultServiceRole-')) {
+        return 'HARNESS';
+    }
+
+    return 'UNKNOWN';
+}
+
+/**
+ * Extract harness role suffix from ARN (e.g., 'fr53w' from role name suffix)
+ */
+function extractHarnessRoleSuffix(arn) {
+    if (!arn) return '';
+
+    // Pattern: AmazonBedrockAgentCoreHarnessDefaultServiceRole-{SUFFIX}/...
+    const match = arn.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
+    return match ? match[1] : '';
+}
+
+/**
+ * Get harness name from role suffix (using cached mapping)
+ */
+function getHarnessName(roleSuffix) {
+    if (!roleSuffix) return '';
+
+    const name = harnessNameCache[roleSuffix];
+    if (name) {
+        console.log(`✅ Found harness name in cache: ${name} (role suffix: ${roleSuffix})`);
+        return name;
+    }
+
+    console.log(`⚠️ Harness name not found in cache for role suffix: ${roleSuffix}`);
+    return '';
+}
+
+/**
+ * Get harness ID from role suffix (using cached mapping)
+ */
+function getHarnessId(roleSuffix) {
+    if (!roleSuffix) return '';
+
+    const id = harnessIdCache[roleSuffix];
+    if (id) {
+        console.log(`✅ Found harness ID in cache: ${id} (role suffix: ${roleSuffix})`);
+        return id;
+    }
+
+    console.log(`⚠️ Harness ID not found in cache for role suffix: ${roleSuffix}`);
+    return '';
+}
+
+/**
+ * Get harness execution role ARN from role suffix (using cached mapping)
+ */
+function getHarnessExecutionRoleArn(roleSuffix) {
+    if (!roleSuffix) return '';
+
+    const arn = harnessExecutionRoleCache[roleSuffix];
+    if (arn) {
+        console.log(`✅ Found harness execution role ARN in cache: ${arn} (role suffix: ${roleSuffix})`);
+        return arn;
+    }
+
+    console.log(`⚠️ Harness execution role ARN not found in cache for role suffix: ${roleSuffix}`);
+    return '';
 }
 
 /**
