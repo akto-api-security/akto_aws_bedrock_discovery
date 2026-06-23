@@ -1,0 +1,30 @@
+[
+  {
+    "ParameterKey": "S3BucketName",
+    "ParameterValue": "akto-bedrock-logs-prod"
+  },
+  {
+    "ParameterKey": "DataIngestionEndpoint",
+    "ParameterValue": "https://your-akto-prod-instance.com:9095/api/ingestData"
+  },
+  {
+    "ParameterKey": "AktoApiKey",
+    "ParameterValue": "your-prod-api-key-here"
+  },
+  {
+    "ParameterKey": "LambdaMemory",
+    "ParameterValue": "1024"
+  },
+  {
+    "ParameterKey": "LambdaTimeout",
+    "ParameterValue": "300"
+  },
+  {
+    "ParameterKey": "EventBridgeSchedule",
+    "ParameterValue": "rate(5 minutes)"
+  },
+  {
+    "ParameterKey": "EnvironmentTag",
+    "ParameterValue": "production"
+  }
+]

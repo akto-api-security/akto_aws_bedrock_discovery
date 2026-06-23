@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AKTO Bedrock Discovery - Complete CloudFormation deployment'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: 'S3 bucket name where Bedrock logs will be stored'
+
+  DataIngestionEndpoint:
+    Type: String
+    Description: 'AKTO Data Ingestion API endpoint URL'
+
+  AktoApiKey:
+    Type: String
+    NoEcho: true
+    Description: 'AKTO API Key for authentication'
+
+  LambdaMemory:
+    Type: Number
+    Default: 1024
+    Description: 'Lambda function memory in MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: 'Lambda function timeout in seconds'
+
+  EventBridgeSchedule:
+    Type: String
+    Default: 'rate(5 minutes)'
+    Description: 'EventBridge schedule expression'
+
+  EnvironmentTag:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: 'Environment tag for all resources'
+
+Resources:
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'akto-bedrock-processor-cf-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AktoBedrockerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketPolicy'
+                  - 's3:PutObject'
+                  - 's3:HeadObject'
+                Resource:
+                  - 'arn:aws:s3:::*'
+                  - 'arn:aws:s3:::*/*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:GetModelInvocationLoggingConfiguration'
+                  - 'bedrock:PutModelInvocationLoggingConfiguration'
+                  - 'bedrock:GetAgent'
+                  - 'bedrock:ListTagsForResource'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:ListHarnesses'
+                  - 'bedrock-agentcore:GetHarness'
+                  - 'bedrock-agentcore:ListTagsForResource'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:GetRole'
+                  - 'iam:ListAttachedRolePolicies'
+                  - 'iam:ListRolePolicies'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*bedrock*'
+
+  # Lambda Function
+  AktoBedrocklambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'akto-bedrock-log-processor-cf-${AWS::AccountId}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: 'lambda-code/akto-bedrock-processor.zip'
+      Environment:
+        Variables:
+          DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
+          AKTO_API_KEY: !Ref AktoApiKey
+          S3_BUCKET_NAME: !Ref S3BucketName
+          BEDROCK_AWS_REGION: !Ref 'AWS::Region'
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+      Description: 'Processes Bedrock model invocation logs and sends to AKTO'
+
+  # EventBridge Execution Role
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AllowLambdaInvocation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt AktoBedrocklambdaFunction.Arn
+
+  # EventBridge Schedule Rule
+  BedrocktogProcessingScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'akto-bedrock-schedule-cf-${AWS::AccountId}'
+      ScheduleExpression: !Ref EventBridgeSchedule
+      State: ENABLED
+      Description: 'Triggers AKTO Bedrock log processor Lambda function on schedule'
+      Targets:
+        - Arn: !GetAtt AktoBedrocklambdaFunction.Arn
+          Id: AktoBedrocktambdaTarget
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  # Lambda Permission for EventBridge
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AktoBedrocklambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BedrocktogProcessingScheduleRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref AktoBedrocklambdaFunction
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt AktoBedrocklambdaFunction.Arn
+
+  EventBridgeRuleName:
+    Description: 'Name of the EventBridge rule'
+    Value: !Ref BedrocktogProcessingScheduleRule
+
+  StackName:
+    Description: 'CloudFormation stack name'
+    Value: !Ref 'AWS::StackName'

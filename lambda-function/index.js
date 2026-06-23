@@ -256,10 +256,27 @@ async function getUnprocessedLogFiles(bucketName) {
  */
 async function isFileProcessed(bucketName, key) {
     try {
-        // Temporarily disabled S3 marker file checking - all files will be processed
-        // This ensures no IAM permission issues while we sort out S3 access
-        return false; // Always process files for now
-        
+        const markerKey = `${key}.processed`;
+
+        try {
+            // Try to head the marker file
+            const headCommand = new HeadObjectCommand({
+                Bucket: bucketName,
+                Key: markerKey
+            });
+            await s3Client.send(headCommand);
+            console.log(`✅ Marker file exists for ${key} - File already processed`);
+            return true;
+        } catch (error) {
+            // Marker file doesn't exist - file not processed yet
+            if (error.name === 'NotFound') {
+                console.log(`🆕 No marker file for ${key} - File not processed yet`);
+                return false;
+            }
+            // Some other error occurred
+            throw error;
+        }
+
     } catch (error) {
         console.error(`❌ Error checking if file is processed ${key}:`, error);
         return false; // If in doubt, process the file
@@ -267,16 +284,32 @@ async function isFileProcessed(bucketName, key) {
 }
 
 /**
- * Mark a file as processed
+ * Mark a file as processed by creating a marker file in S3
  */
 async function markFileAsProcessed(bucketName, key) {
     try {
-        console.log(`✅ Marking file as processed: ${key}`);
-        // Temporarily disabled S3 marker files - processing continues without deduplication
-        console.log(`📝 File marked as processed (in-memory only): ${key}`);
-        
+        const markerKey = `${key}.processed`;
+        const timestamp = new Date().toISOString();
+        const markerContent = JSON.stringify({
+            processedAt: timestamp,
+            originalFile: key,
+            version: '1.0'
+        });
+
+        const putCommand = new PutObjectCommand({
+            Bucket: bucketName,
+            Key: markerKey,
+            Body: markerContent,
+            ContentType: 'application/json'
+        });
+
+        await s3Client.send(putCommand);
+        console.log(`✅ Marker file created: ${markerKey}`);
+        console.log(`📝 File marked as processed at: ${timestamp}`);
+
     } catch (error) {
         console.error(`❌ Error marking file as processed ${key}:`, error);
+        throw error; // Don't silently fail - we want to know if marking fails
     }
 }
 
@@ -548,29 +581,23 @@ function cleanAgentResponse(rawResponse) {
         }
     }
 
-    // Skip responses that are primarily function calls or thinking
-    const trimmed = rawResponse.trim();
-    if (trimmed.startsWith('<thinking>') || trimmed.startsWith('<function_calls>')) {
-        console.log('⏭️ Skipping thinking/function content');
-        return '';
-    }
-
-    // Remove thinking tags and function calls
+    // Remove function calls and results, but KEEP thinking tags
     let cleaned = rawResponse;
-    cleaned = removeXMLTags(cleaned, 'thinking');
+    // Keep thinking tags - they contain valuable agent reasoning
+    // cleaned = removeXMLTags(cleaned, 'thinking'); // REMOVED - keep thinking tags
     cleaned = removeXMLTags(cleaned, 'function_calls');
     cleaned = removeXMLTags(cleaned, 'function_results');
     cleaned = cleaned.trim();
 
     console.log(`🔍 After cleaning: "${cleaned.substring(0, 100)}..." (length: ${cleaned.length})`);
 
-    // Return if meaningful content
+    // Return if meaningful content exists (at least 10 characters)
     if (cleaned.length >= 10) {
         console.log('✅ Returning cleaned response');
         return cleaned;
     }
 
-    console.log('❌ Response too short, returning empty');
+    console.log('❌ Response too short or empty, returning empty');
     return '';
 }
 
@@ -603,11 +630,16 @@ async function createStandardMessage(pair) {
 
     if (pair.logType === 'AGENT' && pair.agentId) {
         agentTags = await getBedrockAgentTags(pair.agentId);
+        // Add agent execution role and its policies to tags
+        agentTags = await addAgentRoleAndPermissions(agentTags, pair.agentId);
     } else if (pair.logType === 'HARNESS' && pair.harnessId) {
         harnessTags = await getHarnessTags(pair.harnessId);
         // Add harness execution role and its policies to tags
         const harnessExecutionRoleArn = getHarnessExecutionRoleArn(pair.harnessRoleSuffix);
         harnessTags = await addHarnessRoleAndPermissions(harnessTags, harnessExecutionRoleArn);
+        // Add harness configured tools and skills to tags
+        const toolsAndSkills = await getHarnessToolsAndSkills(pair.harnessId);
+        harnessTags = { ...harnessTags, ...toolsAndSkills };
     }
 
     // Set the original host to bedrock-runtime endpoint
@@ -919,6 +951,152 @@ async function getHarnessTags(harnessId) {
         return tags;
     } catch (error) {
         console.log(`⚠️ Could not fetch harness tags for ${harnessId}: ${error.message}`);
+        return {};
+    }
+}
+
+/**
+ * Add Bedrock agent execution role and permissions to tags
+ */
+async function addAgentRoleAndPermissions(tags, agentId) {
+    try {
+        if (!agentId) {
+            console.log('⚠️ addAgentRoleAndPermissions: No agent ID provided');
+            return tags;
+        }
+
+        console.log(`🔍 Fetching execution role for agent: ${agentId}`);
+        const getAgentCommand = new GetAgentCommand({ agentId });
+        const agentDetails = await bedrockAgentClient.send(getAgentCommand);
+
+        console.log(`🔍 Agent response keys: ${Object.keys(agentDetails).join(', ')}`);
+        if (agentDetails.agent) {
+            console.log(`🔍 Agent object keys: ${Object.keys(agentDetails.agent).join(', ')}`);
+        }
+
+        const agentExecutionRoleArn = agentDetails.agent?.agentRoleArn || agentDetails.agent?.executionRoleArn || '';
+
+        if (!agentExecutionRoleArn) {
+            console.log(`⚠️ No execution role found for agent ${agentId}`);
+            return tags;
+        }
+
+        console.log(`✅ Found agent execution role: ${agentExecutionRoleArn}`);
+
+        const roleName = extractRoleNameFromArn(agentExecutionRoleArn);
+        if (!roleName) {
+            console.log(`⚠️ Could not extract role name from ARN: ${agentExecutionRoleArn}`);
+            return tags;
+        }
+
+        const policies = await getRolePolicies(roleName);
+
+        const enhancedTags = {
+            ...tags,
+            'bedrock-execution-role-arn': agentExecutionRoleArn,
+            'bedrock-execution-role': roleName,
+            'bedrock-role-policies': policies
+        };
+
+        console.log(`✅ Agent role and permissions added to tags`);
+        return enhancedTags;
+    } catch (error) {
+        console.log(`⚠️ Could not add agent role and permissions: ${error.message}`);
+        return tags;
+    }
+}
+
+/**
+ * Get configured tools and skills for a harness
+ */
+async function getHarnessToolsAndSkills(harnessId) {
+    try {
+        if (!harnessId) {
+            console.log('⚠️ getHarnessToolsAndSkills: No harness ID provided');
+            return {};
+        }
+
+        console.log(`🔍 Fetching tools and skills for harness: ${harnessId}`);
+        const getHarnessCommand = new GetHarnessCommand({ harnessId });
+        const harnessDetails = await bedrockAgentCoreControlClient.send(getHarnessCommand);
+
+        console.log(`🔍 Harness response keys: ${Object.keys(harnessDetails).join(', ')}`);
+        if (harnessDetails.harness) {
+            console.log(`🔍 Harness object keys: ${Object.keys(harnessDetails.harness).join(', ')}`);
+        }
+
+        const toolsAndSkillsTags = {};
+
+        // Access tools directly from harness object
+        const tools = harnessDetails.harness?.tools || [];
+
+        console.log(`🔍 Tools data type: ${Array.isArray(tools) ? 'array' : typeof tools}`);
+        console.log(`🔍 Tools data: ${JSON.stringify(tools).substring(0, 500)}`);
+
+        if (tools && Array.isArray(tools) && tools.length > 0) {
+            console.log(`✅ Found ${tools.length} configured tools`);
+
+            const toolNames = tools.map(tool => {
+                const toolName = tool.toolName || tool.name || tool.toolSpec?.name || 'unknown';
+                const toolType = tool.type || tool.toolSpec?.type || 'unknown';
+                console.log(`  - Tool: ${toolName} (${toolType})`);
+                return `${toolName}:${toolType}`;
+            }).join(',');
+
+            if (toolNames) {
+                toolsAndSkillsTags['harness-configured-tools'] = toolNames;
+            }
+        } else {
+            console.log(`⚠️ No tools found in harness configuration`);
+        }
+
+        // Access skills directly from harness object
+        const skills = harnessDetails.harness?.skills || [];
+
+        console.log(`🔍 Skills data type: ${Array.isArray(skills) ? 'array' : typeof skills}`);
+        console.log(`🔍 Skills data: ${JSON.stringify(skills).substring(0, 500)}`);
+
+        if (skills && Array.isArray(skills) && skills.length > 0) {
+            console.log(`✅ Found ${skills.length} configured skills`);
+
+            const skillEntries = [];
+            skills.forEach((skill, index) => {
+                const skillKeys = Object.keys(skill);
+                console.log(`🔍 Skill ${index} keys: ${skillKeys.join(', ')}`);
+                console.log(`🔍 Skill ${index} full object: ${JSON.stringify(skill).substring(0, 300)}`);
+
+                // For each skill, the key IS the skill name/type
+                skillKeys.forEach(skillType => {
+                    const skillConfig = skill[skillType];
+
+                    // Extract source/url from the config if available
+                    let skillSource = 'default';
+                    if (skillConfig && typeof skillConfig === 'object') {
+                        skillSource = skillConfig.url ||
+                                     skillConfig.source ||
+                                     skillConfig.sourceType ||
+                                     JSON.stringify(skillConfig).substring(0, 50);
+                    }
+
+                    console.log(`  - Skill: ${skillType} (${skillSource})`);
+                    skillEntries.push(`${skillType}:${skillSource}`);
+                });
+            });
+
+            const skillNames = skillEntries.join(',');
+            if (skillNames) {
+                toolsAndSkillsTags['harness-configured-skills'] = skillNames;
+            }
+        } else {
+            console.log(`⚠️ No skills found in harness configuration`);
+            console.log(`🔍 Skills array length: ${Array.isArray(skills) ? skills.length : 'not an array'}`);
+        }
+
+        console.log(`✅ Tools and skills extracted: ${JSON.stringify(toolsAndSkillsTags).substring(0, 200)}`);
+        return toolsAndSkillsTags;
+    } catch (error) {
+        console.log(`⚠️ Could not fetch harness tools and skills for ${harnessId}: ${error.message}`);
+        console.log(`⚠️ Error details: ${JSON.stringify(error).substring(0, 300)}`);
         return {};
     }
 }
