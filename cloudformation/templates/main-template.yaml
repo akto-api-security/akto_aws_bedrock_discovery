@@ -15,30 +15,6 @@ Parameters:
     NoEcho: true
     Description: 'AKTO API Key for authentication'
 
-  LambdaMemory:
-    Type: Number
-    Default: 1024
-    Description: 'Lambda function memory in MB'
-
-  LambdaTimeout:
-    Type: Number
-    Default: 300
-    Description: 'Lambda function timeout in seconds'
-
-  EventBridgeSchedule:
-    Type: String
-    Default: 'rate(5 minutes)'
-    Description: 'EventBridge schedule expression'
-
-  EnvironmentTag:
-    Type: String
-    Default: 'production'
-    AllowedValues:
-      - development
-      - staging
-      - production
-    Description: 'Environment tag for all resources'
-
 Resources:
   # IAM Role for Lambda
   LambdaExecutionRole:
@@ -97,8 +73,8 @@ Resources:
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: !Ref LambdaTimeout
-      MemorySize: !Ref LambdaMemory
+      Timeout: 300
+      MemorySize: 1024
       Code:
         S3Bucket: !Ref S3BucketName
         S3Key: 'lambda-code/akto-bedrock-processor.zip'
@@ -137,7 +113,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub 'akto-bedrock-schedule-cf-${AWS::AccountId}'
-      ScheduleExpression: !Ref EventBridgeSchedule
+      ScheduleExpression: 'rate(5 minutes)'
       State: ENABLED
       Description: 'Triggers AKTO Bedrock log processor Lambda function on schedule'
       Targets:
