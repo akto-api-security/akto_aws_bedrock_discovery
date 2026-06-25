@@ -373,29 +373,37 @@ async function processLogFile(bucketName, key) {
 async function processBedrockLogEntry(logEntry, lineNumber, totalLines) {
     console.log(`\n🔄 Processing log entry ${lineNumber}/${totalLines}`);
     // console.log('📋 Raw log entry:', JSON.stringify(logEntry, null, 2));
-    
+
     try {
         const messages = [];
-        
+
+        // Extract trace data from log entry
+        const traceDataInfo = extractTraceData(logEntry);
+        console.log(`🔗 Extracted trace data with ${traceDataInfo.executionFlow.length} steps`);
+
         // Extract conversation pairs like the Go implementation
         const conversationPairs = extractConversationPairs(logEntry);
         console.log(`💬 Found ${conversationPairs.length} conversation pairs`);
-        
+
         for (let i = 0; i < conversationPairs.length; i++) {
             const pair = conversationPairs[i];
+            // Add trace data to pair
+            pair.traceData = traceDataInfo;
+
             console.log(`\n💬 Processing conversation pair ${i + 1}:`);
             console.log(`   👤 User: ${pair.userMessage.substring(0, 100)}...`);
             console.log(`   🤖 Agent: ${pair.agentResponse.substring(0, 100)}...`);
+            console.log(`   📊 Trace: ${traceDataInfo.executionFlow.length} execution steps`);
 
             const message = await createStandardMessage(pair);
             messages.push(message);
 
-            console.log('✅ Created standard message:');
+            console.log('✅ Created standard message');
             // console.log(JSON.stringify(message, null, 2));
         }
-        
+
         return messages;
-        
+
     } catch (error) {
         console.error(`❌ Error processing log entry ${lineNumber}:`, error);
         return [];
@@ -533,6 +541,97 @@ function extractConversationPairs(logEntry) {
 }
 
 /**
+ * Extract trace data from log entry (tool calls in assistant response or message history)
+ */
+function extractTraceData(logEntry) {
+    try {
+        const messages = logEntry.input?.inputBodyJson?.messages || [];
+        const stopReason = logEntry.output?.outputBodyJson?.stopReason;
+
+        console.log(`🔍 Extracting trace data - Messages: ${messages.length}, StopReason: ${stopReason}`);
+
+        // Look for assistant messages in input messages (conversation history)
+        let toolCallsFound = [];
+
+        for (let i = 0; i < messages.length; i++) {
+            if (messages[i].role === 'assistant') {
+                const content = messages[i].content || [];
+                const toolUses = content.filter(item => item.toolUse);
+                if (toolUses.length > 0) {
+                    console.log(`✅ Found ${toolUses.length} tool calls in message ${i}`);
+                    toolCallsFound = toolCallsFound.concat(toolUses);
+                }
+            }
+        }
+
+        // If no tools found in history, check output message for tool calls
+        if (toolCallsFound.length === 0 && stopReason === 'tool_use') {
+            const outputMessage = logEntry.output?.outputBodyJson?.output?.message;
+            if (outputMessage && outputMessage.content) {
+                const toolUses = outputMessage.content.filter(item => item.toolUse);
+                if (toolUses.length > 0) {
+                    console.log(`✅ Found ${toolUses.length} tool calls in output message`);
+                    toolCallsFound = toolUses;
+                }
+            }
+        }
+
+        if (toolCallsFound.length === 0) {
+            console.log(`⚠️ No tool calls found (this may be a thinking-only response)`);
+            return { executionFlow: [], toolsSummary: {} };
+        }
+
+        const traceData = [
+            {
+                step: 0,
+                type: "agent",
+                name: "AWS_AGENT",
+                action: "orchestrate",
+                description: "Agent orchestrating tool calls"
+            }
+        ];
+
+        let stepCounter = 1;
+        const toolsSet = new Set();
+        const actionsSet = new Set();
+
+        for (const toolUseItem of toolCallsFound) {
+            const toolName = toolUseItem.toolUse?.name || 'unknown';
+            const actionType = toolUseItem.toolUse?.input?.action?.type || 'unknown';
+
+            traceData.push({
+                step: stepCounter++,
+                type: "tool-call",
+                tool: toolName,
+                action: actionType,
+                toolUseId: toolUseItem.toolUse?.toolUseId || ''
+            });
+
+            toolsSet.add(toolName);
+            actionsSet.add(actionType);
+        }
+
+        const executionPattern = "AWS_AGENT→" + Array.from(toolsSet).join("→");
+
+        console.log(`📊 Trace summary: ${toolsSet.size} tools, ${toolCallsFound.length} tool calls`);
+
+        return {
+            executionFlow: traceData,
+            toolsSummary: {
+                agentOrchestrator: "AWS_AGENT",
+                tools: Array.from(toolsSet),
+                actions: Array.from(actionsSet),
+                totalToolCalls: stepCounter - 1,
+                executionPattern: executionPattern
+            }
+        };
+    } catch (error) {
+        console.log(`⚠️ Could not extract trace data: ${error.message}`);
+        return { executionFlow: [], toolsSummary: {} };
+    }
+}
+
+/**
  * Extract text from content array
  */
 function extractTextFromContent(content) {
@@ -627,6 +726,7 @@ async function createStandardMessage(pair) {
     // Fetch resource tags (only agent and harness)
     let agentTags = {};
     let harnessTags = {};
+    let awsMetadata = {};
 
     if (pair.logType === 'AGENT' && pair.agentId) {
         agentTags = await getBedrockAgentTags(pair.agentId);
@@ -640,6 +740,16 @@ async function createStandardMessage(pair) {
         // Add harness configured tools and skills to tags
         const toolsAndSkills = await getHarnessToolsAndSkills(pair.harnessId);
         harnessTags = { ...harnessTags, ...toolsAndSkills };
+
+        // Build awsMetadata for harness with key fields
+        awsMetadata = {
+            'harness-configured-tools': toolsAndSkills['harness-configured-tools'] || '',
+            'harness-configured-skills': toolsAndSkills['harness-configured-skills'] || '',
+            'model': pair.modelId,
+            'harness-execution-role': harnessTags['harness-execution-role'] || '',
+            'bedrock-execution-role': harnessTags['bedrock-execution-role'] || '',
+            'traceData': pair.traceData || {}
+        };
     }
 
     // Set the original host to bedrock-runtime endpoint
@@ -712,7 +822,8 @@ async function createStandardMessage(pair) {
             'output-tokens': (pair.outputTokenCount || 0).toString(),
             'bedrock-identity-arn': pair.arn || '',
             ...(pair.logType === 'AGENT' ? agentTags : harnessTags)
-        })
+        }),
+        awsMetadata: JSON.stringify(awsMetadata)
     };
 
     return message;
