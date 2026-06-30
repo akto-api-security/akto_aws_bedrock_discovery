@@ -377,16 +377,26 @@ async function processBedrockLogEntry(logEntry, lineNumber, totalLines) {
     try {
         const messages = [];
 
-        // Extract trace data from log entry
-        const traceDataInfo = extractTraceData(logEntry);
-        console.log(`🔗 Extracted trace data with ${traceDataInfo.executionFlow.length} steps`);
-
         // Extract conversation pairs like the Go implementation
         const conversationPairs = extractConversationPairs(logEntry);
         console.log(`💬 Found ${conversationPairs.length} conversation pairs`);
 
         for (let i = 0; i < conversationPairs.length; i++) {
             const pair = conversationPairs[i];
+
+            // Determine botName for this pair
+            let botName = '';
+            if (pair.logType === 'AGENT') {
+                botName = await fetchAgentName(pair.agentId);
+            } else if (pair.logType === 'HARNESS') {
+                botName = getHarnessName(pair.harnessRoleSuffix);
+            }
+            console.log(`🤖 Bot Name: ${botName}`);
+
+            // Extract trace data from log entry with botName
+            const traceDataInfo = extractTraceData(logEntry, botName);
+            console.log(`🔗 Extracted trace data with ${traceDataInfo.executionFlow.length} steps`);
+
             // Add trace data to pair
             pair.traceData = traceDataInfo;
 
@@ -543,7 +553,7 @@ function extractConversationPairs(logEntry) {
 /**
  * Extract trace data from log entry (tool calls in assistant response or message history)
  */
-function extractTraceData(logEntry) {
+function extractTraceData(logEntry, botName) {
     try {
         const messages = logEntry.input?.inputBodyJson?.messages || [];
         const stopReason = logEntry.output?.outputBodyJson?.stopReason;
@@ -585,7 +595,7 @@ function extractTraceData(logEntry) {
             {
                 step: 0,
                 type: "agent",
-                name: "AWS_AGENT",
+                name: botName,
                 action: "orchestrate",
                 description: "Agent orchestrating tool calls"
             }
@@ -611,14 +621,14 @@ function extractTraceData(logEntry) {
             actionsSet.add(actionType);
         }
 
-        const executionPattern = "AWS_AGENT→" + Array.from(toolsSet).join("→");
+        const executionPattern = botName + "→" + Array.from(toolsSet).join("→");
 
         console.log(`📊 Trace summary: ${toolsSet.size} tools, ${toolCallsFound.length} tool calls`);
 
         return {
             executionFlow: traceData,
             toolsSummary: {
-                agentOrchestrator: "AWS_AGENT",
+                agentOrchestrator: botName,
                 tools: Array.from(toolsSet),
                 actions: Array.from(actionsSet),
                 totalToolCalls: stepCounter - 1,
