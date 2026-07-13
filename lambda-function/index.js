@@ -15,9 +15,12 @@ const gunzipAsync = promisify(gunzip);
 
 // Configuration from environment variables
 const DATA_INGESTION_ENDPOINT = process.env.DATA_INGESTION_ENDPOINT;
-const S3_BUCKET_NAME_PARAM = process.env.S3_BUCKET_NAME;
+const LOGS_BUCKET_NAME = process.env.LOGS_BUCKET_NAME;
+const LOGS_PREFIX = process.env.LOGS_PREFIX || 'AWSLogs/'; // Default to AWS-created folder for model invocation logging
+const MARKERS_BUCKET_NAME = process.env.MARKERS_BUCKET_NAME;
 const AWS_REGION = process.env.BEDROCK_AWS_REGION || process.env.AWS_REGION;
 const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID;
+const MARKERS_PREFIX = 'akto/markers/'; // Hardcoded prefix for marker files
 
 // Initialize AWS clients
 const bedrockClient = new BedrockClient({ region: AWS_REGION });
@@ -26,6 +29,7 @@ const bedrockAgentCoreControlClient = new BedrockAgentCoreControlClient({ region
 const s3Client = new S3Client({ region: AWS_REGION });
 const lambdaClient = new LambdaClient({ region: AWS_REGION });
 const iamClient = new IAMClient({ region: AWS_REGION });
+
 
 // Cache for agent names and harness details to avoid repeated API calls
 const agentNameCache = {};
@@ -52,52 +56,41 @@ exports.handler = async (event) => {
             await initializeHarnessCache();
             harnessInitialized = true;
         }
-        // Step 1: Determine which S3 bucket to use
-        const s3BucketName = await determineS3Bucket();
-        console.log(`🗄️ Using S3 bucket: ${s3BucketName}`);
+        // Step 1: Determine paths for logs and markers
+        const { logsBucket, logsPrefix, markersBucket, markersPrefix } = await determinePaths();
 
-        if (!s3BucketName) {
-            console.log('⚠️ No S3 bucket configured for Bedrock logging yet');
-            return {
-                statusCode: 200,
-                body: JSON.stringify({ message: 'No S3 bucket configured yet' })
-            };
-        }
-
-        // Step 2: S3-based file tracking (no DynamoDB needed)
-
-        // Step 3: Get unprocessed log files from S3
-        const unprocessedFiles = await getUnprocessedLogFiles(s3BucketName);
+        // Step 2: Get unprocessed log files from S3
+        const unprocessedFiles = await getUnprocessedLogFiles(logsBucket, logsPrefix, markersBucket, markersPrefix);
         console.log(`📁 Found ${unprocessedFiles.length} unprocessed log files`);
 
         if (unprocessedFiles.length === 0) {
             console.log('✅ No new log files to process');
             return {
                 statusCode: 200,
-                body: JSON.stringify({ 
+                body: JSON.stringify({
                     message: 'No new log files to process',
-                    bucket: s3BucketName,
+                    bucket: logsBucket,
                     processedFiles: 0
                 })
             };
         }
 
-        // Step 4: Process each log file
+        // Step 3: Process each log file
         let totalMessages = 0;
         let processedFiles = 0;
 
         for (const file of unprocessedFiles) {
             try {
                 console.log(`\n🔄 Processing file: ${file.Key}`);
-                const messages = await processLogFile(s3BucketName, file.Key);
-                
+                const messages = await processLogFile(logsBucket, file.Key);
+
                 if (messages.length > 0) {
                     await sendToDataIngestionService(messages);
                     totalMessages += messages.length;
                 }
 
-                // Mark file as processed
-                await markFileAsProcessed(s3BucketName, file.Key);
+                // Mark file as processed in markers bucket
+                await markFileAsProcessed(markersBucket, file.Key, markersPrefix);
                 processedFiles++;
                 
                 console.log(`✅ File processed successfully: ${file.Key} (${messages.length} messages)`);
@@ -113,9 +106,10 @@ exports.handler = async (event) => {
 
         return {
             statusCode: 200,
-            body: JSON.stringify({ 
+            body: JSON.stringify({
                 message: 'Processing completed successfully',
-                bucket: s3BucketName,
+                logsBucket: logsBucket,
+                markersBucket: markersBucket,
                 processedFiles: processedFiles,
                 totalMessages: totalMessages
             })
@@ -136,32 +130,35 @@ exports.handler = async (event) => {
 };
 
 /**
- * Determine which S3 bucket to use for Bedrock logs
+ * Validate and return S3 paths for logs and markers
  */
-async function determineS3Bucket() {
+async function determinePaths() {
     try {
-        // User must provide bucket name - logging is pre-configured externally
-        if (!S3_BUCKET_NAME_PARAM || S3_BUCKET_NAME_PARAM.trim() === '') {
-            throw new Error('S3_BUCKET_NAME environment variable is required');
+        // Validate inputs
+        if (!LOGS_BUCKET_NAME || !LOGS_BUCKET_NAME.trim()) {
+            throw new Error('LOGS_BUCKET_NAME environment variable is required');
         }
 
-        console.log(`🔧 Using user-provided S3 bucket: ${S3_BUCKET_NAME_PARAM}`);
-
-        // Verify Bedrock logging is enabled
-        console.log('🔍 Verifying Bedrock logging is enabled...');
-        const getConfigCommand = new GetModelInvocationLoggingConfigurationCommand({});
-        const currentConfig = await bedrockClient.send(getConfigCommand);
-
-        if (!currentConfig.loggingConfig) {
-            throw new Error('Bedrock model invocation logging is not enabled. Please enable it in AWS Bedrock console.');
+        if (!LOGS_PREFIX || !LOGS_PREFIX.trim()) {
+            throw new Error('LOGS_PREFIX environment variable is required');
         }
 
-        console.log('📋 Bedrock logging config found');
-        console.log(`✅ Using S3 bucket: ${S3_BUCKET_NAME_PARAM} for Bedrock logs`);
-        return S3_BUCKET_NAME_PARAM;
+        if (!MARKERS_BUCKET_NAME || !MARKERS_BUCKET_NAME.trim()) {
+            throw new Error('MARKERS_BUCKET_NAME environment variable is required');
+        }
+
+        console.log(`📖 Logs bucket: ${LOGS_BUCKET_NAME}, prefix: ${LOGS_PREFIX}`);
+        console.log(`📍 Markers bucket: ${MARKERS_BUCKET_NAME}, prefix: ${MARKERS_PREFIX}`);
+
+        return {
+            logsBucket: LOGS_BUCKET_NAME,
+            logsPrefix: LOGS_PREFIX,
+            markersBucket: MARKERS_BUCKET_NAME,
+            markersPrefix: MARKERS_PREFIX
+        };
 
     } catch (error) {
-        console.error('❌ Error determining S3 bucket:', error);
+        console.error('❌ Error validating paths:', error);
         throw error;
     }
 }
@@ -173,23 +170,24 @@ async function determineS3Bucket() {
 /**
  * Get list of unprocessed log files from S3
  */
-async function getUnprocessedLogFiles(bucketName) {
+async function getUnprocessedLogFiles(logsBucket, logsPrefix, markersBucket, markersPrefix) {
     try {
-        console.log(`📁 Scanning S3 bucket for new log files: s3://${bucketName}/bedrock-logs/`);
-        
+        const s3Path = `s3://${logsBucket}/${logsPrefix}`;
+        console.log(`📁 Scanning S3 bucket for new log files: ${s3Path}`);
+
         const listCommand = new ListObjectsV2Command({
-            Bucket: bucketName,
-            Prefix: 'bedrock-logs/',
+            Bucket: logsBucket,
+            Prefix: logsPrefix,
             MaxKeys: 100 // Process max 100 files per run
         });
 
         const response = await s3Client.send(listCommand);
         const allFiles = response.Contents || [];
-        
+
         console.log(`📊 Found ${allFiles.length} total files in S3`);
 
         // Filter for .gz files only
-        const logFiles = allFiles.filter(file => 
+        const logFiles = allFiles.filter(file =>
             file.Key.endsWith('.gz') && file.Size > 0
         );
 
@@ -197,9 +195,9 @@ async function getUnprocessedLogFiles(bucketName) {
 
         // Check which files we haven't processed yet
         const unprocessedFiles = [];
-        
+
         for (const file of logFiles) {
-            const isProcessed = await isFileProcessed(bucketName, file.Key);
+            const isProcessed = await isFileProcessed(markersBucket, file.Key, markersPrefix);
             if (!isProcessed) {
                 unprocessedFiles.push(file);
             }
@@ -215,25 +213,25 @@ async function getUnprocessedLogFiles(bucketName) {
 }
 
 /**
- * Check if a file has been processed before
+ * Check if a file has been processed before (marker file in markers bucket)
  */
-async function isFileProcessed(bucketName, key) {
+async function isFileProcessed(markersBucket, originalKey, markersPrefix) {
     try {
-        const markerKey = `${key}.processed`;
+        const markerKey = `${markersPrefix}${originalKey}.processed`;
 
         try {
-            // Try to head the marker file
+            // Try to head the marker file in markers bucket
             const headCommand = new HeadObjectCommand({
-                Bucket: bucketName,
+                Bucket: markersBucket,
                 Key: markerKey
             });
             await s3Client.send(headCommand);
-            console.log(`✅ Marker file exists for ${key} - File already processed`);
+            console.log(`✅ Marker file exists for ${originalKey} - File already processed`);
             return true;
         } catch (error) {
             // Marker file doesn't exist - file not processed yet
             if (error.name === 'NotFound') {
-                console.log(`🆕 No marker file for ${key} - File not processed yet`);
+                console.log(`🆕 No marker file for ${originalKey} - File not processed yet`);
                 return false;
             }
             // Some other error occurred
@@ -241,38 +239,39 @@ async function isFileProcessed(bucketName, key) {
         }
 
     } catch (error) {
-        console.error(`❌ Error checking if file is processed ${key}:`, error);
+        console.error(`❌ Error checking if file is processed ${originalKey}:`, error);
         return false; // If in doubt, process the file
     }
 }
 
 /**
- * Mark a file as processed by creating a marker file in S3
+ * Mark a file as processed by creating a marker file in the markers bucket
  */
-async function markFileAsProcessed(bucketName, key) {
+async function markFileAsProcessed(markersBucket, originalKey, markersPrefix) {
     try {
-        const markerKey = `${key}.processed`;
+        // Create marker key in separate bucket with akto prefix
+        const markerKey = `${markersPrefix}${originalKey}.processed`;
         const timestamp = new Date().toISOString();
         const markerContent = JSON.stringify({
             processedAt: timestamp,
-            originalFile: key,
+            originalFile: originalKey,
             version: '1.0'
         });
 
         const putCommand = new PutObjectCommand({
-            Bucket: bucketName,
+            Bucket: markersBucket,
             Key: markerKey,
             Body: markerContent,
             ContentType: 'application/json'
         });
 
         await s3Client.send(putCommand);
-        console.log(`✅ Marker file created: ${markerKey}`);
+        console.log(`✅ Marker file created in ${markersBucket}: ${markerKey}`);
         console.log(`📝 File marked as processed at: ${timestamp}`);
 
     } catch (error) {
-        console.error(`❌ Error marking file as processed ${key}:`, error);
-        throw error; // Don't silently fail - we want to know if marking fails
+        console.error(`❌ Error marking file as processed ${originalKey}:`, error);
+        throw error;
     }
 }
 
