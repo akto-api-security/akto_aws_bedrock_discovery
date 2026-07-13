@@ -43,12 +43,11 @@ Resources:
                   - 's3:PutObject'
                   - 's3:HeadObject'
                 Resource:
-                  - 'arn:aws:s3:::*'
-                  - 'arn:aws:s3:::*/*'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
               - Effect: Allow
                 Action:
                   - 'bedrock:GetModelInvocationLoggingConfiguration'
-                  - 'bedrock:PutModelInvocationLoggingConfiguration'
                   - 'bedrock:GetAgent'
                   - 'bedrock:ListTagsForResource'
                 Resource: '*'

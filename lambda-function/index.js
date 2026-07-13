@@ -1,7 +1,6 @@
 const {
     BedrockClient,
-    GetModelInvocationLoggingConfigurationCommand,
-    PutModelInvocationLoggingConfigurationCommand
+    GetModelInvocationLoggingConfigurationCommand
 } = require('@aws-sdk/client-bedrock');
 const { BedrockAgentClient, GetAgentCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
 const { BedrockAgentCoreControlClient, ListHarnessesCommand, GetHarnessCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
@@ -141,64 +140,28 @@ exports.handler = async (event) => {
  */
 async function determineS3Bucket() {
     try {
-        // First, check if user provided a bucket name
-        if (S3_BUCKET_NAME_PARAM && S3_BUCKET_NAME_PARAM.trim() !== '') {
-            console.log(`🔧 Using user-provided S3 bucket: ${S3_BUCKET_NAME_PARAM}`);
-            
-            // Configure Bedrock logging to use this bucket
-            await configureBedrockLogging(S3_BUCKET_NAME_PARAM);
-            return S3_BUCKET_NAME_PARAM;
+        // User must provide bucket name - logging is pre-configured externally
+        if (!S3_BUCKET_NAME_PARAM || S3_BUCKET_NAME_PARAM.trim() === '') {
+            throw new Error('S3_BUCKET_NAME environment variable is required');
         }
 
-        // Check if Bedrock logging is already configured
-        console.log('🔍 Checking existing Bedrock logging configuration...');
+        console.log(`🔧 Using user-provided S3 bucket: ${S3_BUCKET_NAME_PARAM}`);
+
+        // Verify Bedrock logging is enabled
+        console.log('🔍 Verifying Bedrock logging is enabled...');
         const getConfigCommand = new GetModelInvocationLoggingConfigurationCommand({});
         const currentConfig = await bedrockClient.send(getConfigCommand);
-        
-        console.log('📋 Current Bedrock logging config found');
-        
-        if (currentConfig.loggingConfig?.s3Config?.bucketName) {
-            console.log(`✅ Found existing Bedrock logging bucket: ${currentConfig.loggingConfig.s3Config.bucketName}`);
-            return currentConfig.loggingConfig.s3Config.bucketName;
+
+        if (!currentConfig.loggingConfig) {
+            throw new Error('Bedrock model invocation logging is not enabled. Please enable it in AWS Bedrock console.');
         }
 
-        // No existing configuration, configure with default bucket
-        console.log('⚙️ No existing configuration found, setting up default bucket...');
-        const defaultBucket = 'akto-bedrock-logs-01';
-        await configureBedrockLogging(defaultBucket);
-        return defaultBucket;
+        console.log('📋 Bedrock logging config found');
+        console.log(`✅ Using S3 bucket: ${S3_BUCKET_NAME_PARAM} for Bedrock logs`);
+        return S3_BUCKET_NAME_PARAM;
 
     } catch (error) {
         console.error('❌ Error determining S3 bucket:', error);
-        return null;
-    }
-}
-
-/**
- * Configure Bedrock model invocation logging
- */
-async function configureBedrockLogging(bucketName) {
-    try {
-        console.log(`⚙️ Configuring Bedrock logging for bucket: ${bucketName}`);
-        
-        const putConfigCommand = new PutModelInvocationLoggingConfigurationCommand({
-            loggingConfig: {
-                s3Config: {
-                    bucketName: bucketName,
-                    keyPrefix: 'bedrock-logs/'
-                },
-                textDataDeliveryEnabled: true,
-                imageDataDeliveryEnabled: true,
-                embeddingDataDeliveryEnabled: true
-            }
-        });
-
-        await bedrockClient.send(putConfigCommand);
-        console.log('✅ Bedrock logging configured successfully');
-        console.log(`📁 Logs will be stored in: s3://${bucketName}/bedrock-logs/`);
-        
-    } catch (error) {
-        console.error('❌ Error configuring Bedrock logging:', error);
         throw error;
     }
 }
