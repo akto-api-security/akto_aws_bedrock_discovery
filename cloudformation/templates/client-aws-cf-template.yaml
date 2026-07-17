@@ -28,6 +28,13 @@ Parameters:
     NoEcho: true
     Description: 'AKTO API Key for authentication'
 
+  LambdaCodeVersion:
+    Type: String
+    Description: 'Version of Lambda code to deploy (e.g., v1.0, v1.1, v2.0). Check with AKTO team for latest version.'
+    Default: 'v1.0'
+    AllowedPattern: '^v[0-9]+\.[0-9]+$'
+    ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
+
 Resources:
   # IAM Role for Lambda
   LambdaExecutionRole:
@@ -57,18 +64,20 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:s3:::${LogsBucketName}'
                   - !Sub 'arn:aws:s3:::${LogsBucketName}/${LogsPrefix}*'
-              # Markers S3 Bucket - Write access to akto/markers/ prefix only
+              # Markers S3 Bucket - Read/Write access to akto/markers/ prefix only
               - Effect: Allow
                 Action:
+                  - 's3:GetObject'
                   - 's3:PutObject'
                   - 's3:HeadObject'
                   - 's3:ListBucket'
                 Resource:
                   - !Sub 'arn:aws:s3:::${MarkersBucketName}'
                   - !Sub 'arn:aws:s3:::${MarkersBucketName}/akto/markers/*'
-              # Bedrock permissions for verification and metadata
+              # Bedrock permissions for agent discovery and metadata
               - Effect: Allow
                 Action:
+                  - 'bedrock:ListAgents'
                   - 'bedrock:GetAgent'
                   - 'bedrock:ListTagsForResource'
                 Resource: '*'
@@ -79,13 +88,13 @@ Resources:
                   - 'bedrock-agentcore:GetHarness'
                   - 'bedrock-agentcore:ListTagsForResource'
                 Resource: '*'
-              # IAM permissions for role inspection
+              # IAM permissions for role inspection (agent execution roles + harness roles)
               - Effect: Allow
                 Action:
                   - 'iam:GetRole'
                   - 'iam:ListAttachedRolePolicies'
                   - 'iam:ListRolePolicies'
-                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*bedrock*'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
 
   # Lambda Function
   AktoBedrocklambdaFunction:
@@ -95,11 +104,11 @@ Resources:
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 300
+      Timeout: 900
       MemorySize: 1024
       Code:
         S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
-        S3Key: 'akto-bedrock-processor.zip'
+        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
       Environment:
         Variables:
           DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
@@ -137,12 +146,12 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub 'akto-bedrock-schedule-cf-${AWS::AccountId}'
-      ScheduleExpression: 'rate(5 minutes)'
+      ScheduleExpression: 'rate(10 minutes)'
       State: ENABLED
       Description: 'Triggers AKTO Bedrock log processor Lambda function on schedule'
       Targets:
         - Arn: !GetAtt AktoBedrocklambdaFunction.Arn
-          Id: AktoBedrocktambdaTarget
+          Id: AktoBedrocklambdaTarget
           RoleArn: !GetAtt EventBridgeExecutionRole.Arn
 
   # Lambda Permission for EventBridge

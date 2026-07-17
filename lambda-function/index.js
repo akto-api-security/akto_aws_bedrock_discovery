@@ -2,7 +2,7 @@ const {
     BedrockClient,
     GetModelInvocationLoggingConfigurationCommand
 } = require('@aws-sdk/client-bedrock');
-const { BedrockAgentClient, GetAgentCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
+const { BedrockAgentClient, GetAgentCommand, ListAgentsCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
 const { BedrockAgentCoreControlClient, ListHarnessesCommand, GetHarnessCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { LambdaClient, ListTagsCommand, GetFunctionCommand } = require('@aws-sdk/client-lambda');
 const { IAMClient, ListRolePoliciesCommand, ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
@@ -41,6 +41,9 @@ const harnessExecutionRoleCache = {}; // Maps role-suffix (fr53w, dv8m2) to exec
 const resourceTagsCache = {};
 let harnessInitialized = false;
 
+// Manifest for timestamp-based tracking (replaces per-file markers)
+const MANIFEST_KEY = `${MARKERS_PREFIX}bedrock-logs/manifest.json`;
+
 /**
  * Main Lambda handler triggered by EventBridge schedule
  */
@@ -59,25 +62,44 @@ exports.handler = async (event) => {
         // Step 1: Determine paths for logs and markers
         const { logsBucket, logsPrefix, markersBucket, markersPrefix } = await determinePaths();
 
-        // Step 2: Get unprocessed log files from S3
-        const unprocessedFiles = await getUnprocessedLogFiles(logsBucket, logsPrefix, markersBucket, markersPrefix);
+        // Step 2: Load manifest for timestamp-based tracking
+        console.log('📖 Loading manifest for timestamp-based processing...');
+        const manifest = await getManifest(markersBucket);
+
+        // Step 3: Get unprocessed log files from S3 (using timestamp filtering)
+        const unprocessedFiles = await getUnprocessedLogFiles(logsBucket, logsPrefix, manifest);
         console.log(`📁 Found ${unprocessedFiles.length} unprocessed log files`);
 
+        // Step 4: DISCOVER ALL AGENTS FIRST (metadata-first approach)
+        // This ensures all agents are known on day 1, before processing any conversations
+        console.log('\n📋 Step 1: Discovering all agents and harnesses...');
+        const { agentDiscoveryMessages, discoveredAgents } =
+            await discoverAllNewAgents(manifest);
+        console.log(`✅ Discovery complete: ${agentDiscoveryMessages.length} new agents found`);
+
+        // Step 5: Process each log file and collect conversation messages
+        let conversationMessages = [];
+        let processedFiles = 0;
+        let lastProcessedFileTimestamp = manifest.lastProcessedTimestamp;  // Track LAST file's timestamp
+
         if (unprocessedFiles.length === 0) {
-            console.log('✅ No new log files to process');
+            console.log('\n✅ No new log files to process');
+            // Still send discovery messages if any new agents found
+            if (agentDiscoveryMessages.length > 0) {
+                await sendToDataIngestionService(agentDiscoveryMessages);
+                await updateManifest(markersBucket, markersPrefix, 0, agentDiscoveryMessages.length, discoveredAgents, lastProcessedFileTimestamp);
+            }
+
             return {
                 statusCode: 200,
                 body: JSON.stringify({
                     message: 'No new log files to process',
                     bucket: logsBucket,
-                    processedFiles: 0
+                    processedFiles: 0,
+                    agentDiscoveriesCreated: agentDiscoveryMessages.length
                 })
             };
         }
-
-        // Step 3: Process each log file
-        let totalMessages = 0;
-        let processedFiles = 0;
 
         for (const file of unprocessedFiles) {
             try {
@@ -85,24 +107,53 @@ exports.handler = async (event) => {
                 const messages = await processLogFile(logsBucket, file.Key);
 
                 if (messages.length > 0) {
-                    await sendToDataIngestionService(messages);
-                    totalMessages += messages.length;
+                    conversationMessages.push(...messages);
                 }
 
-                // Mark file as processed in markers bucket
-                await markFileAsProcessed(markersBucket, file.Key, markersPrefix);
                 processedFiles++;
-                
-                console.log(`✅ File processed successfully: ${file.Key} (${messages.length} messages)`);
-                
+
+                // Example: File A (10:05), File B (10:03), File C (10:04) - we must track max (10:05)
+                const fileTimestamp = new Date(file.LastModified).toISOString();
+                if (!lastProcessedFileTimestamp || fileTimestamp > lastProcessedFileTimestamp) {
+                    lastProcessedFileTimestamp = fileTimestamp;
+                }
+                console.log(`✅ File processed successfully: ${file.Key} (${messages.length} messages) [LastModified: ${fileTimestamp}, Max: ${lastProcessedFileTimestamp}]`);
+
             } catch (error) {
                 console.error(`❌ Error processing file ${file.Key}:`, error);
                 // Continue processing other files even if one fails
             }
         }
 
+        console.log(`\n📊 Total conversation messages: ${conversationMessages.length}`);
+
+        // Step 6: Combine all messages (discovery already done in Step 4)
+        // Discovery messages go first, then conversation messages enhance them
+        const allMessages = [...agentDiscoveryMessages, ...conversationMessages];
+        console.log(`🎯 Total messages to send: ${allMessages.length} (discovery: ${agentDiscoveryMessages.length}, conversations: ${conversationMessages.length})`);
+
+
+        // If sending fails (502 error), manifest is already persisted
+        // This prevents infinite re-processing on API failures!
+        console.log('\n📝 Updating manifest with new processing timestamp and discovered agents...');
+        await updateManifest(markersBucket, markersPrefix, processedFiles, allMessages.length, discoveredAgents, lastProcessedFileTimestamp);
+        console.log('✅ Manifest updated successfully');
+
+        // Step 7: Send all messages to AKTO (after manifest is safe)
+        if (allMessages.length > 0) {
+            console.log('\n📤 Sending messages to AKTO ingestion API...');
+            await sendToDataIngestionService(allMessages);
+            console.log('✅ Messages sent to AKTO');
+        } else {
+            console.log('✅ No messages to send to AKTO');
+        }
+
         console.log(`\n🎉 Processing completed successfully`);
-        console.log(`📊 Summary: Processed ${processedFiles} files, extracted ${totalMessages} messages`);
+        console.log(`📊 Summary:`);
+        console.log(`   - Agent discovery: ${agentDiscoveryMessages.length} agents`);
+        console.log(`   - Files processed: ${processedFiles}`);
+        console.log(`   - Conversation messages: ${conversationMessages.length}`);
+        console.log(`   - Total messages sent: ${allMessages.length}`);
 
         return {
             statusCode: 200,
@@ -111,17 +162,19 @@ exports.handler = async (event) => {
                 logsBucket: logsBucket,
                 markersBucket: markersBucket,
                 processedFiles: processedFiles,
-                totalMessages: totalMessages
+                conversationMessages: conversationMessages.length,
+                agentDiscoveriesCreated: agentDiscoveryMessages.length,
+                totalMessages: allMessages.length
             })
         };
 
     } catch (error) {
         console.error('❌ Error in Lambda handler:', error);
         console.error('Stack trace:', error.stack);
-        
+
         return {
             statusCode: 500,
-            body: JSON.stringify({ 
+            body: JSON.stringify({
                 error: 'Processing failed',
                 message: error.message
             })
@@ -164,116 +217,163 @@ async function determinePaths() {
 }
 
 /**
- * Check if a file has been processed by looking for a marker file in S3
+ * Get manifest file that tracks last processed timestamp
  */
+async function getManifest(markersBucket) {
+    try {
+        console.log(`📖 Reading manifest from ${markersBucket}/${MANIFEST_KEY}`);
+        const response = await s3Client.send(new GetObjectCommand({
+            Bucket: markersBucket,
+            Key: MANIFEST_KEY
+        }));
+
+        // ✅ FIX: Properly read S3 GetObjectCommand stream
+        const chunks = [];
+        for await (const chunk of response.Body) {
+            chunks.push(chunk);
+        }
+        const manifestText = Buffer.concat(chunks).toString('utf-8');
+        const manifest = JSON.parse(manifestText);
+        console.log(`✅ Manifest loaded: lastProcessedTimestamp=${manifest.lastProcessedTimestamp}`);
+        return manifest;
+
+    } catch (error) {
+        if (error.name === 'NoSuchKey') {
+            console.log('📝 No manifest found - first run. Will start from 7 days ago');
+            return {};  // Return empty object, not null!
+        }
+        console.warn(`⚠️ Error reading manifest: ${error.message}`);
+        return {};  // Return empty object on error, not null!
+    }
+}
 
 /**
- * Get list of unprocessed log files from S3
+ * Update manifest with new processing timestamp and file count
+ * @param {string} lastProcessedFileTimestamp - The LastModified timestamp of the LAST file we processed (not Lambda end time)
  */
-async function getUnprocessedLogFiles(logsBucket, logsPrefix, markersBucket, markersPrefix) {
+async function updateManifest(markersBucket, markersPrefix, filesProcessed, messagesExtracted, discoveredAgents, lastProcessedFileTimestamp) {
+    try {
+        // ✅ FIX: Use the LAST file's LastModified timestamp, not the current time
+        // This prevents re-processing of already-processed files during partial runs
+        const timestampToStore = lastProcessedFileTimestamp || new Date().toISOString();
+
+        const manifest = {
+            version: '2.1',
+            lastProcessedTimestamp: timestampToStore,
+            filesProcessedCount: filesProcessed,
+            totalMessagesExtracted: messagesExtracted,
+            lastManifestUpdate: new Date().toISOString(),
+            discoveredAgents: discoveredAgents || {}
+        };
+
+        await s3Client.send(new PutObjectCommand({
+            Bucket: markersBucket,
+            Key: MANIFEST_KEY,
+            Body: JSON.stringify(manifest, null, 2),
+            ContentType: 'application/json'
+        }));
+
+        const agentCount = Object.keys(discoveredAgents || {}).length;
+        console.log(`✅ Manifest updated: ${filesProcessed} files, ${messagesExtracted} messages, ${agentCount} discovered agents`);
+        console.log(`   └─ lastProcessedTimestamp: ${timestampToStore}`);
+
+    } catch (error) {
+        console.error(`❌ Error updating manifest: ${error.message}`);
+        // Don't throw - manifest update failure shouldn't block log processing
+    }
+}
+
+/**
+ * Determine the timestamp to start processing from (manifest or 7 days ago)
+ */
+function getLogsStartTime(manifest) {
+    const now = new Date();
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    if (manifest && manifest.lastProcessedTimestamp) {
+        const lastRun = new Date(manifest.lastProcessedTimestamp);
+
+        // If last run is within 7-day window, resume from there
+        if (lastRun > sevenDaysAgo) {
+            console.log(`✅ Starting from last successful run: ${manifest.lastProcessedTimestamp}`);
+            return lastRun;
+        } else {
+            console.log(`⚠️ Last run (${manifest.lastProcessedTimestamp}) is older than 7 days`);
+            console.log(`   Resetting to 7 days ago: ${sevenDaysAgo.toISOString()}`);
+            return sevenDaysAgo;
+        }
+    }
+
+    console.log(`📝 First run detected. Starting from ${sevenDaysAgo.toISOString()}`);
+    return sevenDaysAgo;
+}
+
+/**
+ * Get list of unprocessed log files from S3 using manifest-based timestamp filtering
+ * Uses simple prefix search (works with AWS Bedrock log structure) + manifest timestamps
+ */
+async function getUnprocessedLogFiles(logsBucket, logsPrefix, manifest) {
     try {
         const s3Path = `s3://${logsBucket}/${logsPrefix}`;
         console.log(`📁 Scanning S3 bucket for new log files: ${s3Path}`);
 
-        const listCommand = new ListObjectsV2Command({
-            Bucket: logsBucket,
-            Prefix: logsPrefix,
-            MaxKeys: 100 // Process max 100 files per run
-        });
+        // Determine start time from manifest or default to 7 days ago
+        const startTime = getLogsStartTime(manifest);
 
-        const response = await s3Client.send(listCommand);
-        const allFiles = response.Contents || [];
+        // Simple approach: List all files under prefix recursively (OLD working approach)
+        // This works because S3 ListObjectsV2 returns ALL objects under a prefix recursively
+        let allFiles = [];
+        let continuationToken = null;
 
-        console.log(`📊 Found ${allFiles.length} total files in S3`);
+        do {
+            const response = await s3Client.send(new ListObjectsV2Command({
+                Bucket: logsBucket,
+                Prefix: logsPrefix,
+                ContinuationToken: continuationToken,
+                MaxKeys: 1000
+            }));
+
+            const objects = response.Contents || [];
+            allFiles.push(...objects);
+
+            if (objects.length > 0) {
+                console.log(`📄 Listed ${objects.length} objects (${allFiles.length} total)`);
+            }
+
+            continuationToken = response.NextContinuationToken;
+        } while (continuationToken);
+
+        console.log(`📊 Found ${allFiles.length} total files in prefix`);
 
         // Filter for .gz files only
-        const logFiles = allFiles.filter(file =>
+        let logFiles = allFiles.filter(file =>
             file.Key.endsWith('.gz') && file.Size > 0
         );
 
         console.log(`📦 Found ${logFiles.length} .gz log files`);
 
-        // Check which files we haven't processed yet
-        const unprocessedFiles = [];
 
-        for (const file of logFiles) {
-            const isProcessed = await isFileProcessed(markersBucket, file.Key, markersPrefix);
-            if (!isProcessed) {
-                unprocessedFiles.push(file);
-            }
-        }
+        // S3 returns files in random order, so we must sort for chronological processing
+        logFiles.sort((a, b) =>
+            new Date(a.LastModified).getTime() - new Date(b.LastModified).getTime()
+        );
 
-        console.log(`🆕 Found ${unprocessedFiles.length} unprocessed files`);
+        // Filter by timestamp: only process files modified AFTER startTime (strictly greater than)
+
+        const unprocessedFiles = logFiles.filter(file => {
+            if (!file.LastModified) return true;
+            return new Date(file.LastModified) > startTime;
+        });
+
+        console.log(`🆕 Found ${unprocessedFiles.length} files to process (modified after ${startTime.toISOString()})`);
         return unprocessedFiles;
-        
+
     } catch (error) {
         console.error('❌ Error listing S3 files:', error);
         return [];
     }
 }
 
-/**
- * Check if a file has been processed before (marker file in markers bucket)
- */
-async function isFileProcessed(markersBucket, originalKey, markersPrefix) {
-    try {
-        const markerKey = `${markersPrefix}${originalKey}.processed`;
-
-        try {
-            // Try to head the marker file in markers bucket
-            const headCommand = new HeadObjectCommand({
-                Bucket: markersBucket,
-                Key: markerKey
-            });
-            await s3Client.send(headCommand);
-            console.log(`✅ Marker file exists for ${originalKey} - File already processed`);
-            return true;
-        } catch (error) {
-            // Marker file doesn't exist - file not processed yet
-            if (error.name === 'NotFound') {
-                console.log(`🆕 No marker file for ${originalKey} - File not processed yet`);
-                return false;
-            }
-            // Some other error occurred
-            throw error;
-        }
-
-    } catch (error) {
-        console.error(`❌ Error checking if file is processed ${originalKey}:`, error);
-        return false; // If in doubt, process the file
-    }
-}
-
-/**
- * Mark a file as processed by creating a marker file in the markers bucket
- */
-async function markFileAsProcessed(markersBucket, originalKey, markersPrefix) {
-    try {
-        // Create marker key in separate bucket with akto prefix
-        const markerKey = `${markersPrefix}${originalKey}.processed`;
-        const timestamp = new Date().toISOString();
-        const markerContent = JSON.stringify({
-            processedAt: timestamp,
-            originalFile: originalKey,
-            version: '1.0'
-        });
-
-        const putCommand = new PutObjectCommand({
-            Bucket: markersBucket,
-            Key: markerKey,
-            Body: markerContent,
-            ContentType: 'application/json'
-        });
-
-        await s3Client.send(putCommand);
-        console.log(`✅ Marker file created in ${markersBucket}: ${markerKey}`);
-        console.log(`📝 File marked as processed at: ${timestamp}`);
-
-    } catch (error) {
-        console.error(`❌ Error marking file as processed ${originalKey}:`, error);
-        throw error;
-    }
-}
 
 /**
  * Process a single log file from S3
@@ -681,6 +781,369 @@ function removeXMLTags(text, tag) {
 }
 
 /**
+ * List all agents in the AWS account
+ */
+async function listAllAgents() {
+    try {
+        console.log('📋 Listing all agents in account...');
+        const response = await bedrockAgentClient.send(new ListAgentsCommand({}));
+        const agents = response.agentSummaries || [];
+        console.log(`✅ Found ${agents.length} agents in account`);
+        return agents;
+    } catch (error) {
+        console.error('❌ Error listing agents:', error.message);
+        console.log('⚠️ Agents will not be discovered in this run (may require bedrock:ListAgents permission)');
+        return [];
+    }
+}
+
+/**
+ * Get detailed agent metadata by agent ID
+ */
+async function getAgentMetadata(agentId) {
+    try {
+        const response = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
+        return response.agent;
+    } catch (error) {
+        console.error(`❌ Error fetching agent metadata for ${agentId}:`, error.message);
+        return null;
+    }
+}
+
+/**
+ * List all harnesses in the AWS account
+ */
+async function listAllHarnesses() {
+    try {
+        console.log('📋 Listing all harnesses in account...');
+        const response = await bedrockAgentCoreControlClient.send(new ListHarnessesCommand({}));
+        // ✅ FIX: Response field is "harnesses", not "harnessSummaries"
+        const harnesses = response.harnesses || [];
+        console.log(`✅ Found ${harnesses.length} harnesses in account`);
+        return harnesses;
+    } catch (error) {
+        console.error('❌ Error listing harnesses:', error.message);
+        return [];
+    }
+}
+
+/**
+ * Get detailed harness metadata by harness ID
+ */
+async function getHarnessMetadata(harnessId) {
+    try {
+        const response = await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }));
+        return response.harness;
+    } catch (error) {
+        console.error(`❌ Error fetching harness metadata for ${harnessId}:`, error.message);
+        return null;
+    }
+}
+
+/**
+ * Create unified message builder for both conversation and discovery data
+ * Consolidates createStandardMessage and createMetadataOnlyMessage logic
+ */
+function buildAgentMessage(data, isConversation) {
+    const timestamp = isConversation
+        ? Math.floor(new Date(data.timestamp).getTime() / 1000)
+        : Math.floor(Date.now() / 1000);
+
+    const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+
+    // Determine modelId and agent/harness ID based on conversation or discovery
+    let modelId, agentOrHarnessId, resourceName;
+    if (isConversation) {
+        modelId = data.modelId;
+        agentOrHarnessId = data.agentId;
+        resourceName = data.botName;
+    } else {
+        // ✅ FIX: Discovery must use foundationModel (like "amazon.nova-micro-v1:0"), not agent/harness ID
+        modelId = data.foundationModel || 'unknown-model';
+        agentOrHarnessId = data.resourceType === 'HARNESS' ? data.harnessId : data.agentId;
+        resourceName = data.resourceType === 'HARNESS' ? data.harnessName : data.agentName;
+    }
+
+    // Unified request headers (same for conversation and discovery)
+    const requestHeaders = {
+        'Content-Type': 'application/json',
+        'X-Bedrock-Model-Id': modelId,  // ✅ FIX: Now uses foundationModel for discovery
+        'bedrock-agent-id': agentOrHarnessId || '',
+        'agent-name': resourceName || '',
+        'bedrock-region': isConversation ? (data.region || AWS_REGION) : AWS_REGION,
+        'host': originalHost  // ✅ FIX: Always include host header (not just for conversation)
+    };
+
+    // Add conversation-specific headers only if conversation
+    if (isConversation) {
+        requestHeaders['Authorization'] = 'AWS4-HMAC-SHA256';
+        requestHeaders['X-Request-Id'] = data.requestId;
+        requestHeaders['bedrock-operation'] = data.operation || 'Unknown';
+        requestHeaders['bedrock-identity-arn'] = data.arn || '';
+        requestHeaders['bedrock-input-tokens'] = (data.inputTokenCount || 0).toString();
+        requestHeaders['bedrock-output-tokens'] = (data.outputTokenCount || 0).toString();
+        requestHeaders['aws-account-id'] = data.accountId || AWS_ACCOUNT_ID;
+    } else {
+        // Discovery headers (shared structure with conversation)
+        requestHeaders['bedrock-operation'] = 'DISCOVERY';
+        requestHeaders['bedrock-identity-arn'] = data.arn || '';
+        requestHeaders['aws-account-id'] = AWS_ACCOUNT_ID;
+    }
+
+    // Unified request payload (different content based on type)
+    let requestPayload;
+    if (isConversation) {
+        requestPayload = {
+            message: data.userMessage,
+            model: data.modelId,
+            requestId: data.requestId
+        };
+    } else {
+        // Discovery payload - handle both agents and harnesses
+        const resourceId = data.resourceType === 'HARNESS' ? data.harnessId : data.agentId;
+        const resourceName = data.resourceType === 'HARNESS' ? data.harnessName : data.agentName;
+
+        requestPayload = {
+            resourceId: resourceId,
+            resourceName: resourceName,
+            resourceType: data.resourceType,
+            description: data.description || '',
+            status: data.agentStatus,
+            foundationModel: data.foundationModel,
+            createdAt: data.createdAt,
+            updatedAt: data.updatedAt,
+            executionRoleArn: data.resourceType === 'HARNESS' ? data.executionRoleArn : data.agentResourceRoleArn
+        };
+    }
+
+    // Unified response payload (empty for discovery)
+    const responsePayload = isConversation
+        ? {
+            message: data.agentResponse,
+            model: data.modelId
+        }
+        : {};
+
+    // Unified tag structure
+    const baseTags = {
+        source: 'AWS_BEDROCK',
+        'gen-ai': 'Gen AI',
+        'account-id': isConversation ? (data.accountId || AWS_ACCOUNT_ID) : AWS_ACCOUNT_ID,
+        'region': isConversation ? (data.region || AWS_REGION) : AWS_REGION
+    };
+
+    const conversationTags = isConversation ? {
+        'agentType': data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : 'UNKNOWN'),
+        'bot-name': data.botName,
+        'operation': data.operation || 'Unknown',
+        'agent-id': data.logType === 'AGENT' ? (data.agentId || '') : '',
+        'harness-id': data.logType === 'HARNESS' ? (data.harnessId || '') : '',
+        'model': data.modelId,
+        'input-tokens': (data.inputTokenCount || 0).toString(),
+        'output-tokens': (data.outputTokenCount || 0).toString(),
+        'bedrock-identity-arn': data.arn || '',
+        ...(data.logType === 'AGENT' ? data.agentTags : data.harnessTags)  // ← Include enriched tags
+    } : {
+        // Discovery: Determine agent type (BEDROCK_AGENT or AGENTCORE_AGENT)
+        'agentType': data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : 'BEDROCK_AGENT',
+        'bot-name': data.resourceType === 'HARNESS' ? data.harnessName : data.agentName,
+        'agent-id': data.resourceType === 'AGENT' ? (data.agentId || '') : '',
+        'harness-id': data.resourceType === 'HARNESS' ? (data.harnessId || '') : '',
+        'model': data.foundationModel,
+        'discovery-type': 'METADATA_ONLY',
+        'has-conversations': 'false',  // ✅ FIX: String instead of boolean
+        'bedrock-identity-arn': data.arn || '',  // ← Now include ARN for discovered resources
+        ...(data.resourceType === 'AGENT' ? (data.agentTags || {}) : (data.harnessTags || {}))  // ← Include enriched tags
+    };
+
+    const tags = { ...baseTags, ...conversationTags };
+
+    // Unified message structure
+    const message = {
+        path: `/model/${modelId}/invoke`,  // ✅ FIX: Always include path (same for discovery and conversation)
+        original_host: originalHost,
+        method: 'POST',
+        requestHeaders: JSON.stringify(requestHeaders),
+        responseHeaders: JSON.stringify({
+            'Content-Type': 'application/json',
+            ...(isConversation && { 'X-Request-Id': data.requestId })
+        }),
+        requestPayload: JSON.stringify(requestPayload),
+        responsePayload: JSON.stringify(responsePayload),
+        ip: '0.0.0.0',
+        time: timestamp.toString(),
+        statusCode: '200',
+        type: 'HTTP',
+        status: 'OK',
+        akto_account_id: '1000000',
+        akto_vxlan_id: '0',
+        is_pending: 'false',
+        source: 'MIRRORING',
+        tag: JSON.stringify(tags),
+        awsMetadata: JSON.stringify(
+            isConversation
+                ? data.awsMetadata  // Use pre-built awsMetadata from createStandardMessage
+                : {
+                    agentStatus: data.agentStatus,
+                    createdAt: data.createdAt,
+                    updatedAt: data.updatedAt
+                }
+        )
+    };
+
+    return message;
+}
+
+/**
+ * Discover all agents and harnesses not yet in manifest
+ *
+ * METADATA-FIRST APPROACH:
+ * - Discovers ALL agents on day 1 (before any conversations)
+ * - Subsequent runs only discover NEW agents added to account
+ * - Ensures AKTO sees complete inventory from start
+ *
+ * Logic:
+ * - List all agents/harnesses in account
+ * - For each one NOT in manifest:
+ *   ✓ Fetch metadata, tags, execution role
+ *   ✓ Create discovery message (metadata only)
+ *   ✓ Add to manifest (prevents re-discovery)
+ * - Conversation messages will overlay on top later (same fields)
+ */
+async function discoverAllNewAgents(manifest) {
+    try {
+        const discoveredAgents = manifest.discoveredAgents || {};
+        const agentDiscoveryMessages = [];
+        const newDiscoveredAgents = { ...discoveredAgents };
+
+        // === DISCOVER BEDROCK AGENTS ===
+        console.log('\n🤖 Discovering Bedrock agents...');
+        const allAgents = await listAllAgents();
+        console.log(`📋 Found ${allAgents.length} agents in account`);
+
+        for (const agent of allAgents) {
+            const resourceKey = `agent-${agent.agentId}`;
+
+            // Simple check: Is this agent already in manifest?
+            if (discoveredAgents[resourceKey]) {
+                console.log(`  ⏭️ Agent ${agent.agentName} already processed`);
+                continue;  // Already processed (either has conversation or already discovered)
+            }
+
+            // NEW agent - create discovery message
+            try {
+                console.log(`  🔍 Discovering: ${agent.agentName} (${agent.agentId})`);
+                const metadata = await getAgentMetadata(agent.agentId);
+
+                if (metadata) {
+                    // Enrich with tags and role information
+                    let agentTags = await getBedrockAgentTags(agent.agentId);
+                    agentTags = await addAgentRoleAndPermissions(agentTags, agent.agentId);
+
+                    // Build ARN
+                    const agentArn = metadata.agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`;
+
+                    // Prepare enriched data for message builder
+                    const enrichedData = {
+                        ...metadata,
+                        resourceType: 'AGENT',
+                        arn: agentArn,
+                        agentTags: agentTags,
+                        harnessTags: {}
+                    };
+
+                    const message = buildAgentMessage(enrichedData, false);
+                    agentDiscoveryMessages.push(message);
+
+                    // Add to manifest
+                    newDiscoveredAgents[resourceKey] = {
+                        resourceId: agent.agentId,
+                        resourceType: 'AGENT',
+                        resourceName: agent.agentName,
+                        foundationModel: metadata.foundationModel,
+                        discoveredAt: new Date().toISOString()
+                    };
+
+                    console.log(`  ✅ Created discovery message for: ${agent.agentName}`);
+                }
+            } catch (error) {
+                console.error(`  ⚠️ Error processing agent ${agent.agentId}:`, error.message);
+            }
+        }
+
+        // === DISCOVER HARNESSES (AGENTCORE) ===
+        console.log('\n🏗️ Discovering harnesses...');
+        const allHarnesses = await listAllHarnesses();
+        console.log(`📋 Found ${allHarnesses.length} harnesses in account`);
+
+        for (const harness of allHarnesses) {
+            const resourceKey = `harness-${harness.harnessId}`;
+
+            // Simple check: Is this harness already in manifest?
+            if (discoveredAgents[resourceKey]) {
+                console.log(`  ⏭️ Harness ${harness.harnessName} already processed`);
+                continue;  // Already processed
+            }
+
+            // NEW harness - create discovery message
+            try {
+                console.log(`  🔍 Discovering: ${harness.harnessName} (${harness.harnessId})`);
+                const metadata = await getHarnessMetadata(harness.harnessId);
+
+                if (metadata) {
+                    // Enrich with tags and role information
+                    let harnessTags = await getHarnessTags(harness.harnessId);
+
+                    if (metadata.executionRoleArn) {
+                        harnessTags = await addHarnessRoleAndPermissions(harnessTags, metadata.executionRoleArn);
+                    }
+
+                    // Build ARN
+                    const harnessArn = metadata.harnessArn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harness.harnessId}`;
+
+                    // Prepare enriched data for message builder
+                    const enrichedData = {
+                        ...metadata,
+                        resourceType: 'HARNESS',
+                        harnessId: harness.harnessId,
+                        harnessName: harness.harnessName,
+                        arn: harnessArn,
+                        agentTags: {},
+                        harnessTags: harnessTags,
+                        agentStatus: metadata.harnessStatus || 'PREPARED',
+                        foundationModel: metadata.foundationModel || 'N/A'
+                    };
+
+                    const message = buildAgentMessage(enrichedData, false);
+                    agentDiscoveryMessages.push(message);
+
+                    // Add to manifest
+                    newDiscoveredAgents[resourceKey] = {
+                        resourceId: harness.harnessId,
+                        resourceType: 'HARNESS',
+                        resourceName: harness.harnessName,
+                        foundationModel: metadata.foundationModel || 'N/A',
+                        discoveredAt: new Date().toISOString()
+                    };
+
+                    console.log(`  ✅ Created discovery message for: ${harness.harnessName}`);
+                }
+            } catch (error) {
+                console.error(`  ⚠️ Error processing harness ${harness.harnessId}:`, error.message);
+            }
+        }
+
+        console.log(`\n✨ Created ${agentDiscoveryMessages.length} discovery messages`);
+        return { agentDiscoveryMessages, discoveredAgents: newDiscoveredAgents };
+
+    } catch (error) {
+        console.error('❌ Error in discovery:', error.message);
+        // ✅ FIX: Return newDiscoveredAgents instead of empty object to preserve discovered agents
+        return { agentDiscoveryMessages: [], discoveredAgents: newDiscoveredAgents };
+    }
+}
+
+/**
  * Create standard message in AKTO format (based on Go implementation)
  */
 async function createStandardMessage(pair) {
@@ -724,81 +1187,37 @@ async function createStandardMessage(pair) {
         };
     }
 
-    // Set the original host to bedrock-runtime endpoint
-    const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+    // Prepare enriched data object for unified message builder
+    const enrichedData = {
+        // Shared fields
+        timestamp: pair.timestamp,
+        modelId: pair.modelId,
+        agentId: pair.agentId,
+        accountId: pair.accountId || AWS_ACCOUNT_ID,
+        region: pair.region || AWS_REGION,
+        arn: pair.arn || '',
 
-    // Create request payload (user message)
-    const requestPayload = {
-        message: pair.userMessage,
-        model: pair.modelId,
-        requestId: pair.requestId
+        // Conversation-specific fields
+        requestId: pair.requestId,
+        userMessage: pair.userMessage,
+        agentResponse: pair.agentResponse,
+        botName: botName,
+        operation: pair.operation || 'Unknown',
+        inputTokenCount: pair.inputTokenCount || 0,
+        outputTokenCount: pair.outputTokenCount || 0,
+        harnessId: pair.harnessId || '',
+        logType: pair.logType,
+        harnessRoleSuffix: pair.harnessRoleSuffix,
+        traceData: pair.traceData || {},
+
+        // Tags (for tag enrichment in unified builder)
+        agentTags: agentTags,
+        harnessTags: harnessTags,
+        awsMetadata: awsMetadata
     };
 
-    // Create response payload (agent response)
-    const responsePayload = {
-        message: pair.agentResponse,
-        model: pair.modelId
-    };
-
-    // Build request headers with enriched metadata
-    const requestHeaders = {
-        'Content-Type': 'application/json',
-        'Authorization': 'AWS4-HMAC-SHA256',
-        'X-Bedrock-Model-Id': pair.modelId,
-        'X-Request-Id': pair.requestId,
-        'aws-account-id': pair.accountId || AWS_ACCOUNT_ID,
-        'bedrock-agent-id': pair.agentId || '',
-        'bedrock-harness-id': pair.harnessId || '',
-        'agent-name': botName,
-        'host': originalHost,
-        'bedrock-operation': pair.operation || 'Unknown',
-        'bedrock-identity-arn': pair.arn || '',
-        'bedrock-region': pair.region || AWS_REGION,
-        'bedrock-input-tokens': (pair.inputTokenCount || 0).toString(),
-        'bedrock-output-tokens': (pair.outputTokenCount || 0).toString()
-    };
-
-    // Create standard message following exact Go format
-    const message = {
-        path: `/model/${pair.modelId}/invoke`,
-        original_host: originalHost,
-        method: 'POST',
-        requestHeaders: JSON.stringify(requestHeaders),
-        responseHeaders: JSON.stringify({
-            'Content-Type': 'application/json',
-            'X-Request-Id': pair.requestId
-        }),
-        requestPayload: JSON.stringify(requestPayload),
-        responsePayload: JSON.stringify(responsePayload),
-        ip: '0.0.0.0',
-        time: Math.floor(timestamp.getTime() / 1000).toString(),
-        statusCode: '200',
-        type: 'HTTP',
-        status: 'OK',
-        akto_account_id: '1000000',
-        akto_vxlan_id: '0',
-        is_pending: 'false',
-        source: 'MIRRORING',
-        tag: JSON.stringify({
-            source: 'AWS_BEDROCK',
-            'gen-ai': 'Gen AI',
-            'agentType': pair.logType === 'AGENT' ? 'BEDROCK_AGENT' : (pair.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : 'UNKNOWN'),
-            'bot-name': botName,
-            'operation': pair.operation || 'Unknown',
-            'agent-id': pair.logType === 'AGENT' ? (pair.agentId || '') : '',
-            'harness-id': pair.logType === 'HARNESS' ? (pair.harnessId || '') : '',
-            'account-id': pair.accountId || AWS_ACCOUNT_ID,
-            'region': pair.region || AWS_REGION,
-            'model': pair.modelId,
-            'input-tokens': (pair.inputTokenCount || 0).toString(),
-            'output-tokens': (pair.outputTokenCount || 0).toString(),
-            'bedrock-identity-arn': pair.arn || '',
-            ...(pair.logType === 'AGENT' ? agentTags : harnessTags)
-        }),
-        awsMetadata: JSON.stringify(awsMetadata)
-    };
-
-    return message;
+    // Build message using unified builder
+    return buildAgentMessage(enrichedData, true);
 }
 
 /**
@@ -1366,53 +1785,81 @@ async function sendToDataIngestionService(messages) {
     console.log(`\n📤 Sending ${messages.length} messages to data ingestion service`);
     console.log(`🔗 Endpoint: ${DATA_INGESTION_ENDPOINT}`);
     console.log(`🔑 Using API Key: ${process.env.AKTO_API_KEY ? process.env.AKTO_API_KEY.substring(0, 8) + '...' : 'NOT SET'}`);
-    
+
+    if (messages.length === 0) {
+        console.log('⚠️ No messages to send');
+        return { status: 'skipped', message: 'No messages' };
+    }
+
     try {
-        const batchData = messages;
-        const payload = { batchData };
-        
-        console.log('\n📤 AKTO FORMAT JSON - Data being sent to ingestion API:');
-        console.log('='.repeat(60));
-        messages.forEach((msg, index) => {
-            console.log(`🔹 Message ${index + 1}:`);
-            console.log(JSON.stringify(msg, null, 2));
-            if (index < messages.length - 1) console.log('---');
-        });
-        console.log('='.repeat(60));
-        
-        const response = await fetch(DATA_INGESTION_ENDPOINT, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-KEY': process.env.AKTO_API_KEY || '',
-                'User-Agent': 'AKTO-Bedrock-Monitor/2.0'
-            },
-            body: JSON.stringify(payload)
-        });
-        
-        console.log(`📊 Response status: ${response.status} ${response.statusText}`);
-        
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('❌ HTTP error response:', errorText);
-            throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+        // Batch messages into chunks of 1000 for efficiency and timeout prevention
+        const BATCH_SIZE = 1000;
+        const totalBatches = Math.ceil(messages.length / BATCH_SIZE);
+
+        console.log(`📦 Splitting into ${totalBatches} batch(es) of up to ${BATCH_SIZE} messages`);
+
+        // Process batches sequentially to avoid overwhelming the API
+        const results = [];
+        for (let i = 0; i < messages.length; i += BATCH_SIZE) {
+            const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+            const batch = messages.slice(i, i + BATCH_SIZE);
+
+            console.log(`\n📨 Sending batch ${batchNum}/${totalBatches} (${batch.length} messages)`);
+
+            // Log batch details (first batch full, others summarized)
+            if (batchNum === 1) {
+                console.log('📤 AKTO FORMAT JSON - First batch data being sent:');
+                console.log('='.repeat(60));
+                batch.forEach((msg, index) => {
+                    console.log(`🔹 Message ${index + 1}:`);
+                    console.log(JSON.stringify(msg, null, 2));
+                    if (index < 2 && batch.length > 3) console.log('---');  // Show first 2, ellipsis if more
+                });
+                if (batch.length > 3) {
+                    console.log(`... (${batch.length - 3} more messages in this batch)`);
+                }
+                console.log('='.repeat(60));
+            } else {
+                console.log(`✓ Batch contains ${batch.length} messages (not logging to save output)`);
+            }
+
+            const payload = { batchData: batch };
+            const response = await fetch(DATA_INGESTION_ENDPOINT, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-KEY': process.env.AKTO_API_KEY || '',
+                    'User-Agent': 'AKTO-Bedrock-Monitor/2.0'
+                },
+                body: JSON.stringify(payload)
+            });
+
+            console.log(`📊 Batch ${batchNum} - Response status: ${response.status} ${response.statusText}`);
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error(`❌ HTTP error in batch ${batchNum}: ${response.status}`);
+                console.error('Response:', errorText);
+                throw new Error(`HTTP error in batch ${batchNum}! status: ${response.status}, body: ${errorText}`);
+            }
+
+            const result = await response.json();
+            results.push(result);
+            console.log(`✅ Batch ${batchNum} sent successfully`);
         }
-        
-        const result = await response.json();
-        console.log('✅ Successfully sent to data ingestion service');
-        console.log('📋 Response:', JSON.stringify(result, null, 2));
-        
-        return result;
-        
+
+        console.log(`\n🎉 All ${totalBatches} batch(es) sent successfully to data ingestion service`);
+        return { status: 'success', totalBatches, totalMessages: messages.length, results };
+
     } catch (error) {
         console.error('❌ Error sending to data ingestion service:', error);
-        
-        // Log the messages that failed to send  
+
+        // Log the messages that failed to send
         console.log('💾 Failed messages (first 2):');
         messages.slice(0, 2).forEach((msg, index) => {
             console.log(`Message ${index + 1}:`, JSON.stringify(msg, null, 2));
         });
-        
+
         throw error;
     }
 }
