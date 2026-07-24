@@ -17,7 +17,7 @@ const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID;
 const MARKERS_PREFIX = 'akto/markers/';
 const MANIFEST_KEY = `${MARKERS_PREFIX}bedrock-logs/manifest.json`;
 
-const SEND_BATCH_SIZE = 200;          // max messages per AKTO POST — bounds payload size, not just count
+const SEND_BATCH_SIZE = 1;            // max messages per AKTO POST — 1 for now, send requests individually while verifying with the client
 const FLUSH_THRESHOLD = 100;          // send+checkpoint once this many messages accumulate
 const TIME_SAFETY_MARGIN_MS = 90000;  // stop starting new work with less than this much Lambda time left
 const FETCH_TIMEOUT_MS = 25000;       // abort a stuck HTTP call instead of silently eating the whole invocation
