@@ -60,7 +60,6 @@ Resources:
                 Action:
                   - 's3:GetObject'
                   - 's3:ListBucket'
-                  - 's3:HeadObject'
                 Resource:
                   - !Sub 'arn:aws:s3:::${LogsBucketName}'
                   - !Sub 'arn:aws:s3:::${LogsBucketName}/${LogsPrefix}*'
@@ -69,7 +68,6 @@ Resources:
                 Action:
                   - 's3:GetObject'
                   - 's3:PutObject'
-                  - 's3:HeadObject'
                   - 's3:ListBucket'
                 Resource:
                   - !Sub 'arn:aws:s3:::${MarkersBucketName}'

@@ -1,7 +1,15 @@
 [
   {
-    "ParameterKey": "S3BucketName",
-    "ParameterValue": "akto-bedrock-logs-prod"
+    "ParameterKey": "LogsBucketName",
+    "ParameterValue": "akto-bedrock-prod"
+  },
+  {
+    "ParameterKey": "LogsPrefix",
+    "ParameterValue": "AWSLogs/"
+  },
+  {
+    "ParameterKey": "MarkersBucketName",
+    "ParameterValue": "akto-bedrock-prod"
   },
   {
     "ParameterKey": "DataIngestionEndpoint",
@@ -10,5 +18,9 @@
   {
     "ParameterKey": "AktoApiKey",
     "ParameterValue": "your-prod-api-key-here"
+  },
+  {
+    "ParameterKey": "LambdaCodeVersion",
+    "ParameterValue": "v1.0"
   }
 ]
