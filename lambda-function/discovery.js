@@ -125,8 +125,11 @@ async function getHarnessTags(harnessId) {
 async function addAgentRoleAndPermissions(tags, agentId) {
     try {
         const agentDetails = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
-        const roleArn = agentDetails.agent?.agentRoleArn || agentDetails.agent?.executionRoleArn || '';
-        if (!roleArn) return tags;
+        const roleArn = agentDetails.agent?.agentResourceRoleArn || agentDetails.agent?.executionRoleArn || '';
+        if (!roleArn) {
+            console.warn(`⚠️ No execution role found for agent ${agentId}`);
+            return tags;
+        }
         const roleName = extractRoleNameFromArn(roleArn);
         return { ...tags, 'bedrock-execution-role-arn': roleArn, 'bedrock-execution-role': roleName, 'bedrock-role-policies': await getRolePolicies(roleName) };
     } catch (error) {
