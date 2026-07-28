@@ -17,25 +17,38 @@ function buildAgentMessage(data, isConversation) {
     const resourceId = isConversation ? data.agentId : (data.resourceType === 'HARNESS' ? data.harnessId : data.agentId);
     const resourceName = isConversation ? data.botName : (data.resourceType === 'HARNESS' ? data.harnessName : data.agentName);
 
-    const requestHeaders = {
-        'Content-Type': 'application/json',
-        'X-Bedrock-Model-Id': modelId,
-        'bedrock-agent-id': resourceId || '',
-        'agent-name': resourceName || '',
-        'bedrock-region': isConversation ? (data.region || AWS_REGION) : AWS_REGION,
-        host: originalHost,
-        'bedrock-operation': isConversation ? (data.operation || 'Unknown') : 'DISCOVERY',
-        'bedrock-identity-arn': data.arn || '',
-        'aws-account-id': isConversation ? (data.accountId || AWS_ACCOUNT_ID) : AWS_ACCOUNT_ID
-    };
-    if (isConversation) {
-        requestHeaders['X-Request-Id'] = data.requestId;
-        requestHeaders['bedrock-input-tokens'] = String(data.inputTokenCount || 0);
-        requestHeaders['bedrock-output-tokens'] = String(data.outputTokenCount || 0);
-    }
+    const requestHeaders = isConversation
+        ? {
+            'Content-Type': 'application/json',
+            'X-Bedrock-Model-Id': modelId,
+            'X-Request-Id': data.requestId,
+            'bedrock-region': data.region || AWS_REGION,
+            'bedrock-operation': data.operation || 'Unknown',
+            'bedrock-identity-arn': data.arn || '',
+            'aws-account-id': data.accountId || AWS_ACCOUNT_ID,
+            host: originalHost
+        }
+        : {
+            'Content-Type': 'application/json',
+            'X-Bedrock-Model-Id': modelId,
+            'bedrock-region': AWS_REGION,
+            'bedrock-operation': 'DISCOVERY',
+            'bedrock-identity-arn': data.arn || '',
+            'aws-account-id': AWS_ACCOUNT_ID,
+            host: originalHost
+        };
 
     const requestPayload = isConversation
-        ? { message: data.userMessage, model: data.modelId, requestId: data.requestId }
+        ? {
+            messages: [
+                {
+                    role: 'user',
+                    content: data.userMessage
+                }
+            ],
+            model: data.modelId,
+            requestId: data.requestId
+        }
         : {
             resourceId,
             resourceName,
@@ -48,7 +61,24 @@ function buildAgentMessage(data, isConversation) {
             executionRoleArn: data.resourceType === 'HARNESS' ? data.executionRoleArn : data.agentResourceRoleArn
         };
 
-    const responsePayload = isConversation ? { message: data.agentResponse, model: data.modelId } : {};
+    const responsePayload = isConversation
+        ? {
+            output: {
+                message: {
+                    role: 'assistant',
+                    content: [
+                        {
+                            text: data.agentResponse
+                        }
+                    ]
+                }
+            },
+            usage: {
+                inputTokens: data.inputTokenCount || 0,
+                outputTokens: data.outputTokenCount || 0
+            }
+        }
+        : {};
 
     const tags = {
         source: 'AWS_BEDROCK',

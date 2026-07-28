@@ -7,9 +7,90 @@ const { gunzip } = require('zlib');
 const { promisify } = require('util');
 const { s3Client, LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS } = require('./config');
 const { extractConversationPairs, extractTraceData } = require('./extractors');
-const { fetchAgentName, getHarnessName, createStandardMessage } = require('./discovery');
+const { fetchAgentName, getHarnessName, createStandardMessage, findResourceByArn } = require('./discovery');
 
 const gunzipAsync = promisify(gunzip);
+
+/**
+ * Parses an S3 path (s3://bucket/key) into bucket and key components.
+ * Returns {bucket, key} or null if invalid.
+ */
+function parseS3Path(s3Path) {
+    if (!s3Path || typeof s3Path !== 'string') return null;
+    const match = s3Path.match(/^s3:\/\/([^\/]+)\/(.*)/);
+    if (!match) return null;
+    return { bucket: match[1], key: match[2] };
+}
+
+/**
+ * Fetches and decompresses a JSON object from an S3 path.
+ * S3 paths for Bedrock logs are always .gz compressed.
+ * Returns parsed JSON or null on failure.
+ */
+async function fetchJsonFromS3Path(s3Path) {
+    try {
+        const parsed = parseS3Path(s3Path);
+        if (!parsed) {
+            console.warn(`⚠️ Invalid S3 path format: ${s3Path}`);
+            return null;
+        }
+
+        const { bucket, key } = parsed;
+        const s3Object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+        const chunks = [];
+        for await (const chunk of s3Object.Body) chunks.push(chunk);
+        const decompressed = await gunzipAsync(Buffer.concat(chunks));
+        const jsonData = JSON.parse(decompressed.toString('utf-8'));
+        return jsonData;
+    } catch (error) {
+        console.error(`❌ Failed to fetch from S3 path ${s3Path}: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Resolves input body JSON from either direct JSON or S3 path.
+ * Returns the input body JSON object or {messages: []} if not found.
+ */
+async function getInputBodyJson(logEntry) {
+    // Check 1: Direct JSON (fast path - most common)
+    if (logEntry.input?.inputBodyJson) {
+        return logEntry.input.inputBodyJson;
+    }
+
+    // Check 2: S3 Reference (slow path - for large payloads)
+    if (logEntry.input?.inputBodyS3Path) {
+        console.log(`📥 Fetching input from S3: ${logEntry.input.inputBodyS3Path}`);
+        const data = await fetchJsonFromS3Path(logEntry.input.inputBodyS3Path);
+        if (data) return data;
+    }
+
+    // Fallback: Return empty
+    console.warn(`⚠️ No input data found (neither direct JSON nor S3 path)`);
+    return { messages: [] };
+}
+
+/**
+ * Resolves output body JSON from either direct JSON or S3 path.
+ * Returns the output body JSON object or {output: {message: {content: []}}} if not found.
+ */
+async function getOutputBodyJson(logEntry) {
+    // Check 1: Direct JSON (fast path - most common)
+    if (logEntry.output?.outputBodyJson) {
+        return logEntry.output.outputBodyJson;
+    }
+
+    // Check 2: S3 Reference (slow path - for large payloads)
+    if (logEntry.output?.outputBodyS3Path) {
+        console.log(`📤 Fetching output from S3: ${logEntry.output.outputBodyS3Path}`);
+        const data = await fetchJsonFromS3Path(logEntry.output.outputBodyS3Path);
+        if (data) return data;
+    }
+
+    // Fallback: Return empty
+    console.warn(`⚠️ No output data found (neither direct JSON nor S3 path)`);
+    return { output: { message: { content: [] } } };
+}
 
 /** Resumes from the manifest checkpoint, or falls back to LOOKBACK_DAYS ago if there's no checkpoint or it's stale. */
 function getLogsStartTime(manifest) {
@@ -79,11 +160,34 @@ async function processLogFile(bucket, key) {
 async function processBedrockLogEntry(logEntry) {
     const messages = [];
     try {
+        // Resolve resource from ARN using discovery mappings
+        const resource = findResourceByArn(logEntry.identity?.arn);
+        if (!resource) {
+            console.warn(`⚠️ Skipping log entry - cannot determine resource from ARN`);
+            return messages;
+        }
+
+        // Resolve input/output body JSON (handles both direct JSON and S3 paths)
+        const resolvedInputBody = await getInputBodyJson(logEntry);
+        const resolvedOutputBody = await getOutputBodyJson(logEntry);
+
+        // Update logEntry with resolved data for extractConversationPairs
+        if (resolvedInputBody) logEntry.input = { ...logEntry.input, inputBodyJson: resolvedInputBody };
+        if (resolvedOutputBody) logEntry.output = { ...logEntry.output, outputBodyJson: resolvedOutputBody };
+
         const pairs = extractConversationPairs(logEntry);
         for (const pair of pairs) {
-            pair.botName = pair.logType === 'AGENT'
-                ? await fetchAgentName(pair.agentId)
-                : (pair.logType === 'HARNESS' ? getHarnessName(pair.harnessRoleSuffix) : '');
+            // Populate from discovered resource
+            pair.logType = resource.type;
+            if (resource.type === 'AGENT') {
+                pair.agentId = resource.agentId;
+                pair.botName = await fetchAgentName(resource.agentId);
+            } else if (resource.type === 'HARNESS') {
+                pair.harnessId = resource.harnessId;
+                pair.harnessName = resource.harnessName;
+                pair.botName = resource.harnessName;
+            }
+
             pair.traceData = extractTraceData(logEntry, pair.botName);
             messages.push(await createStandardMessage(pair));
         }

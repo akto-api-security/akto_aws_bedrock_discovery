@@ -16,6 +16,9 @@ const harnessIdCache = {};         // role suffix -> harness ID
 const harnessExecutionRoleCache = {}; // role suffix -> execution role ARN
 const tagsCache = {};
 
+// Role-based mappings for log processing (discovery source is source of truth for type)
+const roleToResourcesMap = {}; // roleName -> [{agentId, agentName, type: 'AGENT', agentArn}, ...] or [{harnessId, harnessName, type: 'HARNESS', harnessArn}, ...]
+
 /** Lists every Bedrock Agent in the account. Returns [] (not a throw) if the API call fails. */
 async function listAllAgents() {
     try {
@@ -265,6 +268,21 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
             const arn = metadata.agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`;
             messages.push(buildAgentMessage({ ...metadata, resourceType: 'AGENT', arn, agentTags, harnessTags: {} }, false));
             discoveredAgents[key] = { resourceId: agent.agentId, resourceType: 'AGENT', resourceName: agent.agentName, foundationModel: metadata.foundationModel, discoveredAt: new Date().toISOString() };
+
+            // Build role mapping for log processing
+            if (metadata.agentResourceRoleArn) {
+                const roleName = extractRoleNameFromArn(metadata.agentResourceRoleArn);
+                if (roleName) {
+                    if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
+                    roleToResourcesMap[roleName].push({
+                        agentId: agent.agentId,
+                        agentName: agent.agentName,
+                        type: 'AGENT',
+                        agentArn: arn
+                    });
+                    console.log(`✅ Mapped agent role '${roleName}' → agent '${agent.agentName}'`);
+                }
+            }
         } catch (error) {
             console.error(`⚠️ Discovery failed for agent ${agent.agentId}: ${error.message}`);
         }
@@ -286,6 +304,21 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
                 agentTags: {}, harnessTags, agentStatus: metadata.harnessStatus || 'PREPARED', foundationModel: metadata.foundationModel || 'N/A'
             }, false));
             discoveredAgents[key] = { resourceId: harness.harnessId, resourceType: 'HARNESS', resourceName: harness.harnessName, foundationModel: metadata.foundationModel || 'N/A', discoveredAt: new Date().toISOString() };
+
+            // Build role mapping for log processing
+            if (metadata.executionRoleArn) {
+                const roleName = extractRoleNameFromArn(metadata.executionRoleArn);
+                if (roleName) {
+                    if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
+                    roleToResourcesMap[roleName].push({
+                        harnessId: harness.harnessId,
+                        harnessName: harness.harnessName,
+                        type: 'HARNESS',
+                        harnessArn: arn
+                    });
+                    console.log(`✅ Mapped harness role '${roleName}' → harness '${harness.harnessName}'`);
+                }
+            }
         } catch (error) {
             console.error(`⚠️ Discovery failed for harness ${harness.harnessId}: ${error.message}`);
         }
@@ -294,7 +327,77 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
     return messages;
 }
 
+/**
+ * Finds a resource (agent or harness) from a log STS ARN by:
+ * 1. Trying to extract agent ID from session name (if present)
+ * 2. Trying to extract harness suffix from role name (if present)
+ * 3. Looking up by role name in the map
+ * Returns null if not found or ambiguous (multiple resources on same role without determinable ID).
+ */
+function findResourceByArn(stsArn) {
+    if (!stsArn) return null;
+
+    // Extract role name from STS ARN
+    const roleNameMatch = stsArn.match(/assumed-role\/([^\/]+)/);
+    if (!roleNameMatch) return null;
+    const roleName = roleNameMatch[1];
+
+    // Try to extract agent ID from session name (format: BedrockAgents-AGENT_ID-...)
+    const sessionNameMatch = stsArn.match(/assumed-role\/[^\/]+\/(.+)$/);
+    if (sessionNameMatch) {
+        const sessionName = sessionNameMatch[1];
+        const agentIdMatch = sessionName.match(/^BedrockAgents-([A-Z0-9]+)-/);
+        if (agentIdMatch) {
+            const agentId = agentIdMatch[1];
+            const resources = roleToResourcesMap[roleName];
+            if (resources) {
+                const found = resources.find(r => r.agentId === agentId);
+                if (found) {
+                    console.log(`✅ Found agent by ID in session name: ${found.agentName}`);
+                    return found;
+                }
+            }
+        }
+
+        // Try to extract harness suffix from role name
+        const harnessMatch = sessionName.match(/^BedrockAgentCore-/);
+        if (harnessMatch) {
+            const suffixMatch = roleName.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
+            if (suffixMatch) {
+                const suffix = suffixMatch[1];
+                const resources = roleToResourcesMap[roleName];
+                if (resources && resources.length === 1 && resources[0].type === 'HARNESS') {
+                    console.log(`✅ Found harness by suffix: ${resources[0].harnessName}`);
+                    return resources[0];
+                }
+            }
+        }
+    }
+
+    // Look up by role name
+    const resources = roleToResourcesMap[roleName];
+
+    // No resources found
+    if (!resources) {
+        console.warn(`⚠️ Unknown role: ${roleName}. Skipping log entry.`);
+        return null;
+    }
+
+    // Exactly one resource on this role
+    if (resources.length === 1) {
+        console.log(`✅ Found resource by role name: ${resources[0].agentName || resources[0].harnessName}`);
+        return resources[0];
+    }
+
+    // Multiple resources on same role - cannot determine which one
+    console.warn(
+        `⚠️ Role '${roleName}' maps to ${resources.length} resources (${resources.map(r => r.agentName || r.harnessName).join(', ')}). ` +
+        `Cannot determine correct mapping from session name. Skipping log entry.`
+    );
+    return null;
+}
+
 module.exports = {
     initializeHarnessCache, discoverAllNewAgents, createStandardMessage,
-    fetchAgentName, getHarnessName
+    fetchAgentName, getHarnessName, findResourceByArn
 };
