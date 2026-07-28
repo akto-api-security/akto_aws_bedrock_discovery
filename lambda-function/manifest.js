@@ -34,7 +34,7 @@ async function getManifest() {
 async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTimestamp) {
     try {
         const manifest = {
-            version: '2.2',
+            version: '2.3',
             lastProcessedTimestamp: lastProcessedTimestamp || new Date().toISOString(),
             filesProcessedCount: filesProcessed,
             lastManifestUpdate: new Date().toISOString(),

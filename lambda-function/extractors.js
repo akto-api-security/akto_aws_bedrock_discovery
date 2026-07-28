@@ -24,6 +24,46 @@ function extractHarnessRoleSuffix(arn) {
     return match ? match[1] : '';
 }
 
+/** Pulls the IAM role name out of an assumed-role identity ARN (arn:aws:sts::ACCT:assumed-role/ROLE_NAME/session-id). */
+function extractRoleNameFromAssumedRoleArn(arn) {
+    const match = arn?.match(/assumed-role\/([^/]+)\//);
+    return match ? match[1] : '';
+}
+
+/**
+ * Resolves what actually called Bedrock for one log entry. Tries the
+ * authoritative roleNameToResourceMap first — an exact match against a role
+ * we've confirmed (via discovery.js's GetAgent/GetHarness/GetAgentRuntime) is
+ * a real resource's execution role, which works regardless of whether that
+ * role uses AWS's auto-generated default name or a customer-supplied custom
+ * name. Falls back to the naming-convention regex only for roles the map
+ * doesn't (yet) cover — not backfilled, or genuinely unattributed.
+ */
+function resolveLogIdentity(arn, roleNameToResourceMap) {
+    const roleName = extractRoleNameFromAssumedRoleArn(arn);
+    const match = roleName ? roleNameToResourceMap?.[roleName] : null;
+    if (match) {
+        return {
+            logType: match.resourceType,
+            agentId: match.resourceType === 'AGENT' ? match.resourceId : '',
+            harnessId: match.resourceType === 'HARNESS' ? match.resourceId : '',
+            harnessRoleSuffix: extractHarnessRoleSuffix(arn),
+            runtimeId: match.resourceType === 'RUNTIME' ? match.resourceId : '',
+            resourceName: match.resourceName || '',
+            executionRoleArn: match.executionRoleArn || ''
+        };
+    }
+    return {
+        logType: detectLogType(arn),
+        agentId: extractAgentID(arn),
+        harnessId: '',
+        harnessRoleSuffix: extractHarnessRoleSuffix(arn),
+        runtimeId: '',
+        resourceName: '',
+        executionRoleArn: ''
+    };
+}
+
 /** Pulls plain text out of a Bedrock content-block array (Nova/Claude shapes both use `{ text: ... }`). */
 function extractTextFromContent(content) {
     if (!Array.isArray(content)) return '';
@@ -52,8 +92,11 @@ function removeXMLTags(text, tag) {
  * Extracts every user/assistant conversation pair found in one log entry: the
  * final assistant response (from the output field) paired with the most recent
  * user message, plus any earlier user→assistant pairs from the message history.
+ * roleNameToResourceMap is built in discovery.js from already-discovered resources'
+ * real execution role ARNs — passed in as plain data so identity resolution here
+ * stays a lookup, not an AWS call.
  */
-function extractConversationPairs(logEntry) {
+function extractConversationPairs(logEntry, roleNameToResourceMap) {
     const pairs = [];
     try {
         let finalAssistantResponse = '';
@@ -71,18 +114,19 @@ function extractConversationPairs(logEntry) {
             .filter((text) => text && !text.includes('<function_results>') && text.trim().length > 0);
 
         const arn = logEntry.identity?.arn || '';
-        const logType = detectLogType(arn);
-        const harnessRoleSuffix = extractHarnessRoleSuffix(arn);
-        // Note: harnessName/harnessId are resolved from the caches in discovery.js by the
-        // caller (processBedrockLogEntry in s3Logs.js) — this module has no AWS access.
+        const identity = resolveLogIdentity(arn, roleNameToResourceMap);
         const baseFields = {
             timestamp: logEntry.timestamp,
             requestId: logEntry.requestId,
             modelId: logEntry.modelId,
-            agentId: extractAgentID(arn),
-            harnessRoleSuffix,
+            agentId: identity.agentId,
+            harnessId: identity.harnessId,
+            harnessRoleSuffix: identity.harnessRoleSuffix,
+            runtimeId: identity.runtimeId,
+            resourceName: identity.resourceName,
+            executionRoleArn: identity.executionRoleArn,
             arn,
-            logType,
+            logType: identity.logType,
             operation: logEntry.operation || 'Unknown',
             accountId: logEntry.accountId || AWS_ACCOUNT_ID,
             region: logEntry.region || AWS_REGION,

@@ -9,7 +9,7 @@
 const config = require('./config');
 const { getManifest, updateManifest } = require('./manifest');
 const { getUnprocessedLogFiles, processLogFile } = require('./s3Logs');
-const { discoverAllNewAgents, initializeHarnessCache } = require('./discovery');
+const { discoverAllNewAgents, initializeHarnessCache, backfillExecutionRoleArns, buildRoleNameToResourceMap } = require('./discovery');
 const { sendToDataIngestionService } = require('./aktoClient');
 
 let harnessInitialized = false;
@@ -71,6 +71,13 @@ exports.handler = async (event, context) => {
             totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp);
         }
 
+        // Self-healing backfill for resources discovered before executionRoleArn was
+        // tracked — fills the gap so every known resource, not just newly-discovered
+        // ones, is covered by the role-identity map below.
+        await backfillExecutionRoleArns(discoveredAgents, timeLeft);
+        const roleNameToResourceMap = buildRoleNameToResourceMap(discoveredAgents);
+        console.log(`🔑 Role-identity map built: ${Object.keys(roleNameToResourceMap).length} known execution role(s)`);
+
         const unprocessedFiles = await getUnprocessedLogFiles(manifest);
         console.log(`📁 ${unprocessedFiles.length} unprocessed log file(s)`);
 
@@ -86,7 +93,7 @@ exports.handler = async (event, context) => {
             }
 
             try {
-                const messages = await processLogFile(config.LOGS_BUCKET_NAME, file.Key);
+                const messages = await processLogFile(config.LOGS_BUCKET_NAME, file.Key, roleNameToResourceMap);
                 pending.push(...messages);
                 filesDone++;
                 const fileTs = new Date(file.LastModified).toISOString();
