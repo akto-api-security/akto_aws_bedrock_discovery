@@ -16,11 +16,28 @@ const harnessIdCache = {};         // role suffix -> harness ID
 const harnessExecutionRoleCache = {}; // role suffix -> execution role ARN
 const tagsCache = {};
 
-/** Lists every Bedrock Agent in the account. Returns [] (not a throw) if the API call fails. */
+/**
+ * Generic pager: calls `sendPage(nextToken)` repeatedly until no nextToken comes
+ * back, concatenating whatever `pluck(response)` returns from each page.
+ */
+async function listAllPages(sendPage, pluck) {
+    let items = [];
+    let nextToken;
+    do {
+        const response = await sendPage(nextToken);
+        items = items.concat(pluck(response) || []);
+        nextToken = response.nextToken;
+    } while (nextToken);
+    return items;
+}
+
+/** Lists every Bedrock Agent in the account, across all pages. Returns [] (not a throw) if the API call fails. */
 async function listAllAgents() {
     try {
-        const response = await bedrockAgentClient.send(new ListAgentsCommand({}));
-        return response.agentSummaries || [];
+        return await listAllPages(
+            (nextToken) => bedrockAgentClient.send(new ListAgentsCommand({ nextToken })),
+            (response) => response.agentSummaries
+        );
     } catch (error) {
         console.error(`❌ ListAgents failed (check bedrock:ListAgents permission): ${error.message}`);
         return [];
@@ -37,11 +54,13 @@ async function getAgentMetadata(agentId) {
     }
 }
 
-/** Lists every AgentCore harness in the account. Returns [] (not a throw) if the API call fails. */
+/** Lists every AgentCore harness in the account, across all pages. Returns [] (not a throw) if the API call fails. */
 async function listAllHarnesses() {
     try {
-        const response = await bedrockAgentCoreControlClient.send(new ListHarnessesCommand({}));
-        return response.harnesses || [];
+        return await listAllPages(
+            (nextToken) => bedrockAgentCoreControlClient.send(new ListHarnessesCommand({ nextToken })),
+            (response) => response.harnesses
+        );
     } catch (error) {
         console.error(`❌ ListHarnesses failed: ${error.message}`);
         return [];
@@ -66,7 +85,7 @@ async function getHarnessMetadata(harnessId) {
  */
 async function initializeHarnessCache() {
     try {
-        const harnesses = (await bedrockAgentCoreControlClient.send(new ListHarnessesCommand({}))).harnesses || [];
+        const harnesses = await listAllHarnesses();
         for (const item of harnesses) {
             if (!item.harnessId || !item.harnessName) continue;
             try {
@@ -236,6 +255,7 @@ async function createStandardMessage(pair) {
             'harness-configured-skills': toolsAndSkills['harness-configured-skills'] || '',
             model: pair.modelId,
             'harness-execution-role': harnessTags['harness-execution-role'] || '',
+            'bedrock-execution-role': harnessTags['bedrock-execution-role'] || '',
             traceData: pair.traceData || {}
         };
     }

@@ -14,7 +14,7 @@ function detectLogType(arn) {
 
 /** Pulls the Bedrock Agent ID out of a BedrockAgents-* execution role ARN. */
 function extractAgentID(arn) {
-    const match = arn?.match(/BedrockAgents-([A-Z0-9]+)-[a-f0-9-]+$/);
+    const match = arn?.match(/BedrockAgents-([A-Z0-9]+)-[a-f0-9-]+/);
     return match ? match[1] : '';
 }
 
