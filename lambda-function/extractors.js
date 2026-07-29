@@ -81,7 +81,8 @@ function extractConversationPairs(logEntry) {
             accountId: logEntry.accountId || AWS_ACCOUNT_ID,
             region: logEntry.region || AWS_REGION,
             inputTokenCount: logEntry.input?.inputTokenCount || 0,
-            outputTokenCount: logEntry.output?.outputTokenCount || 0
+            outputTokenCount: logEntry.output?.outputTokenCount || 0,
+            awsMetadata: {}
         };
 
         if (finalAssistantResponse && userMessages.length > 0) {

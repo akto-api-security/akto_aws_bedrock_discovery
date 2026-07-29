@@ -26,8 +26,13 @@ function logMemory(label) {
  * actually delivered.
  */
 async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp) {
-    if (messages.length === 0) return 0;
+    if (messages.length === 0) {
+        console.log(`⏭️ Skipping flush: 0 messages to send`);
+        return 0;
+    }
+    console.log(`📤 Flushing ${messages.length} message(s) to AKTO Ingestion API...`);
     await sendToDataIngestionService(messages);
+    console.log(`✅ Successfully sent ${messages.length} message(s) to AKTO`);
     await updateManifest(filesProcessed, discoveredAgents, lastTimestamp);
     return messages.length;
 }

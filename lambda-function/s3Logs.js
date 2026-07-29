@@ -186,7 +186,7 @@ async function processBedrockLogEntry(logEntry) {
                 pair.harnessId = resource.harnessId;
                 pair.harnessName = resource.harnessName;
                 pair.botName = resource.harnessName;
-            } else if (resource.type === 'RUNTIME_AGENT') {
+            } else if (resource.type === 'STANDALONE_RUNTIME') {
                 pair.runtimeAgentId = resource.agentId;
                 pair.agentId = resource.agentId;
                 pair.botName = resource.agentName;

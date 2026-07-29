@@ -15,12 +15,14 @@ async function postWithTimeout(body) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
+        console.log(`🌐 POST ${DATA_INGESTION_ENDPOINT} | Headers: Content-Type=application/json, X-API-KEY=[${AKTO_API_KEY.slice(0, 20)}...], User-Agent=AKTO-Bedrock-Monitor/3.0 | Body size: ${JSON.stringify(body).length} bytes`);
         const response = await fetch(DATA_INGESTION_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-API-KEY': AKTO_API_KEY, 'User-Agent': 'AKTO-Bedrock-Monitor/3.0' },
             body: JSON.stringify(body),
             signal: controller.signal
         });
+        console.log(`📬 Response: ${response.status} ${response.statusText}`);
         if (!response.ok) {
             const text = await response.text();
             throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
