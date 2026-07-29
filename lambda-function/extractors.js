@@ -74,6 +74,7 @@ function extractConversationPairs(logEntry) {
             logType: '',
             agentId: '',
             harnessId: '',
+            runtimeAgentId: '',
             harnessRoleSuffix: '',
             harnessName: '',
             operation: logEntry.operation || 'Unknown',

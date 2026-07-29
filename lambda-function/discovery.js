@@ -51,12 +51,39 @@ async function listAllHarnesses() {
     }
 }
 
+/** Lists every AgentCore runtime-agent in the account. Returns [] if API fails or is unsupported. */
+async function listAllRuntimeAgents() {
+    try {
+        const { ListAgentsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
+        const response = await bedrockAgentCoreControlClient.send(new ListAgentsCommand({}));
+        return response.agents || [];
+    } catch (error) {
+        if (error.name === 'UnknownCommandError') {
+            console.warn(`⚠️ ListAgents not available in AgentCore (may not be supported yet)`);
+        } else {
+            console.error(`❌ ListAgents failed for runtime-agents: ${error.message}`);
+        }
+        return [];
+    }
+}
+
 /** Fetches full metadata for one harness. Returns null on failure. */
 async function getHarnessMetadata(harnessId) {
     try {
         return (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
     } catch (error) {
         console.error(`❌ GetHarness failed for ${harnessId}: ${error.message}`);
+        return null;
+    }
+}
+
+/** Fetches full metadata for one runtime-agent. Returns null on failure. */
+async function getRuntimeAgentMetadata(agentId) {
+    try {
+        const { GetAgentCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
+        return (await bedrockAgentCoreControlClient.send(new GetAgentCommand({ agentId }))).agent;
+    } catch (error) {
+        console.error(`❌ GetAgent failed for runtime-agent ${agentId}: ${error.message}`);
         return null;
     }
 }
@@ -327,6 +354,42 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
         }
     }
 
+    const runtimeAgents = await listAllRuntimeAgents();
+    for (const agent of runtimeAgents) {
+        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining runtime-agent discovery'); return messages; }
+        const key = `runtime-agent-${agent.agentId}`;
+        if (discoveredAgents[key]) continue;
+        try {
+            const metadata = await getRuntimeAgentMetadata(agent.agentId);
+            if (!metadata) continue;
+            let agentTags = await fetchTagsCached(`runtime-agent-${agent.agentId}`, () => getBedrockAgentTags(agent.agentId));
+            if (metadata.executionRoleArn) agentTags = await addAgentRoleAndPermissions(agentTags, agent.agentId);
+            const arn = metadata.agentArn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`;
+            messages.push(buildAgentMessage({
+                ...metadata, resourceType: 'RUNTIME_AGENT', agentId: agent.agentId, agentName: agent.agentName, arn,
+                agentTags, harnessTags: {}, agentStatus: metadata.agentStatus || 'PREPARED', foundationModel: metadata.foundationModel || 'N/A'
+            }, false));
+            discoveredAgents[key] = { resourceId: agent.agentId, resourceType: 'RUNTIME_AGENT', resourceName: agent.agentName, foundationModel: metadata.foundationModel || 'N/A', discoveredAt: new Date().toISOString() };
+
+            // Build role mapping for log processing
+            if (metadata.executionRoleArn) {
+                const roleName = extractRoleNameFromArn(metadata.executionRoleArn);
+                if (roleName) {
+                    if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
+                    roleToResourcesMap[roleName].push({
+                        agentId: agent.agentId,
+                        agentName: agent.agentName,
+                        type: 'RUNTIME_AGENT',
+                        agentArn: arn
+                    });
+                    console.log(`✅ Mapped runtime-agent role '${roleName}' → agent '${agent.agentName}'`);
+                }
+            }
+        } catch (error) {
+            console.error(`⚠️ Discovery failed for runtime-agent ${agent.agentId}: ${error.message}`);
+        }
+    }
+
     return messages;
 }
 
@@ -400,7 +463,104 @@ function findResourceByArn(stsArn) {
     return null;
 }
 
+/**
+ * Rebuilds roleToResourcesMap from already-discovered agents/harnesses.
+ * Called at startup to ensure log processing can find agents discovered in previous runs.
+ * Prevents the bug where an agent discovered in run 1 becomes "unknown" in run 2+ because
+ * its role was never added to the in-memory roleToResourcesMap.
+ */
+async function rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft) {
+    const agents = await listAllAgents();
+    for (const agent of agents) {
+        if (timeLeft && timeLeft() < TIME_SAFETY_MARGIN_MS) {
+            console.warn('⏱️ Time budget low — deferring role map rebuild');
+            return;
+        }
+
+        const key = `agent-${agent.agentId}`;
+        if (!discoveredAgents[key]) continue;
+
+        try {
+            const metadata = await getAgentMetadata(agent.agentId);
+            if (!metadata || !metadata.agentResourceRoleArn) continue;
+
+            const roleName = extractRoleNameFromArn(metadata.agentResourceRoleArn);
+            if (roleName) {
+                if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
+                roleToResourcesMap[roleName].push({
+                    agentId: agent.agentId,
+                    agentName: agent.agentName,
+                    type: 'AGENT',
+                    agentArn: metadata.agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`
+                });
+            }
+        } catch (error) {
+            console.error(`⚠️ Role map rebuild failed for agent ${agent.agentId}: ${error.message}`);
+        }
+    }
+
+    const harnesses = await listAllHarnesses();
+    for (const harness of harnesses) {
+        if (timeLeft && timeLeft() < TIME_SAFETY_MARGIN_MS) {
+            console.warn('⏱️ Time budget low — deferring role map rebuild');
+            return;
+        }
+
+        const key = `harness-${harness.harnessId}`;
+        if (!discoveredAgents[key]) continue;
+
+        try {
+            const metadata = await getHarnessMetadata(harness.harnessId);
+            if (!metadata || !metadata.executionRoleArn) continue;
+
+            const roleName = extractRoleNameFromArn(metadata.executionRoleArn);
+            if (roleName) {
+                if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
+                roleToResourcesMap[roleName].push({
+                    harnessId: harness.harnessId,
+                    harnessName: harness.harnessName,
+                    type: 'HARNESS',
+                    harnessArn: metadata.harnessArn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harness.harnessId}`
+                });
+            }
+        } catch (error) {
+            console.error(`⚠️ Role map rebuild failed for harness ${harness.harnessId}: ${error.message}`);
+        }
+    }
+
+    const runtimeAgents = await listAllRuntimeAgents();
+    for (const agent of runtimeAgents) {
+        if (timeLeft && timeLeft() < TIME_SAFETY_MARGIN_MS) {
+            console.warn('⏱️ Time budget low — deferring role map rebuild');
+            return;
+        }
+
+        const key = `runtime-agent-${agent.agentId}`;
+        if (!discoveredAgents[key]) continue;
+
+        try {
+            const metadata = await getRuntimeAgentMetadata(agent.agentId);
+            if (!metadata || !metadata.executionRoleArn) continue;
+
+            const roleName = extractRoleNameFromArn(metadata.executionRoleArn);
+            if (roleName) {
+                if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
+                roleToResourcesMap[roleName].push({
+                    agentId: agent.agentId,
+                    agentName: agent.agentName,
+                    type: 'RUNTIME_AGENT',
+                    agentArn: metadata.agentArn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`
+                });
+            }
+        } catch (error) {
+            console.error(`⚠️ Role map rebuild failed for runtime-agent ${agent.agentId}: ${error.message}`);
+        }
+    }
+
+    console.log(`✅ Role map rebuilt: ${Object.keys(roleToResourcesMap).length} role(s) mapped`);
+}
+
 module.exports = {
-    initializeHarnessCache, discoverAllNewAgents, createStandardMessage,
+    initializeHarnessCache, rebuildRoleMapFromDiscoveredAgents, discoverAllNewAgents, createStandardMessage,
     fetchAgentName, getHarnessName, findResourceByArn
 };

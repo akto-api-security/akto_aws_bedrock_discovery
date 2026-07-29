@@ -9,7 +9,7 @@
 const config = require('./config');
 const { getManifest, updateManifest } = require('./manifest');
 const { getUnprocessedLogFiles, processLogFile } = require('./s3Logs');
-const { discoverAllNewAgents, initializeHarnessCache } = require('./discovery');
+const { discoverAllNewAgents, rebuildRoleMapFromDiscoveredAgents, initializeHarnessCache } = require('./discovery');
 const { sendToDataIngestionService } = require('./aktoClient');
 
 let harnessInitialized = false;
@@ -59,6 +59,9 @@ exports.handler = async (event, context) => {
         const discoveredAgents = { ...(manifest.discoveredAgents || {}) };
         let lastTimestamp = manifest.lastProcessedTimestamp || null;
         let totalSent = 0;
+
+        console.log('📋 Rebuilding role map from discovered agents...');
+        await rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft);
 
         console.log('📋 Discovering agents/harnesses...');
         const discoveryMessages = await discoverAllNewAgents(discoveredAgents, timeLeft);
