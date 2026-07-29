@@ -85,6 +85,7 @@ Resources:
                   - 'bedrock-agentcore:ListHarnesses'
                   - 'bedrock-agentcore:GetHarness'
                   - 'bedrock-agentcore:ListTagsForResource'
+                  - 'bedrock-agentcore:ListAgentRuntimes'
                 Resource: '*'
               # IAM permissions for role inspection (agent execution roles + harness roles)
               - Effect: Allow

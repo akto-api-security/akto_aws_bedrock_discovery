@@ -104,12 +104,12 @@ function buildAgentMessage(data, isConversation) {
         'account-id': isConversation ? (data.accountId || AWS_ACCOUNT_ID) : AWS_ACCOUNT_ID,
         region: isConversation ? (data.region || AWS_REGION) : AWS_REGION,
         agentType: isConversation
-            ? (data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'RUNTIME_AGENT' ? 'AGENTCORE_RUNTIME_AGENT' : 'UNKNOWN')))
-            : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.resourceType === 'RUNTIME_AGENT' ? 'AGENTCORE_RUNTIME_AGENT' : 'BEDROCK_AGENT')),
+            ? (data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'UNKNOWN')))
+            : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.resourceType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'BEDROCK_AGENT')),
         'bot-name': resourceName || '',
-        'agent-id': (isConversation ? data.logType === 'AGENT' || data.logType === 'RUNTIME_AGENT' : data.resourceType === 'AGENT' || data.resourceType === 'RUNTIME_AGENT') ? (data.agentId || '') : '',
+        'agent-id': (isConversation ? data.logType === 'AGENT' || data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'AGENT' || data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
         'harness-id': (isConversation ? data.logType === 'HARNESS' : data.resourceType === 'HARNESS') ? (data.harnessId || '') : '',
-        'runtime-agent-id': (isConversation ? data.logType === 'RUNTIME_AGENT' : data.resourceType === 'RUNTIME_AGENT') ? (data.agentId || '') : '',
+        'runtime-id': (isConversation ? data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
         model: modelId,
         'bedrock-identity-arn': data.arn || '',
         ...(isConversation
