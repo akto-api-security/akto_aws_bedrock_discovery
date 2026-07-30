@@ -1,23 +1,24 @@
 /**
- * Bedrock Agent / AgentCore Harness discovery, plus tag and IAM-role enrichment
- * for both discovery messages and real conversation messages. Owns the
- * per-invocation in-memory caches that avoid repeat API calls for the same
- * resource within one Lambda run.
+ * Bedrock Agent (Classic) discovery, plus tag and IAM-role enrichment for
+ * discovery messages and real conversation messages. Owns the per-invocation
+ * in-memory caches that avoid repeat API calls for the same resource within
+ * one Lambda run.
+ *
+ * AgentCore Harness/Runtime discovery and conversation extraction live in
+ * traceDiscovery.js/logGroupReader.js/traceParser.js instead (CloudWatch
+ * traces, not S3 logs) — this module only ever produces resourceType/logType
+ * 'AGENT'.
  */
 const { GetAgentCommand, ListAgentsCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
-const { ListHarnessesCommand, GetHarnessCommand, ListAgentRuntimesCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, bedrockAgentClient, bedrockAgentCoreControlClient, iamClient } = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, bedrockAgentClient, iamClient } = require('./config');
 const { buildAgentMessage } = require('./messageBuilder');
 
 const agentNameCache = {};
-const harnessNameCache = {};       // role suffix -> harness name
-const harnessIdCache = {};         // role suffix -> harness ID
-const harnessExecutionRoleCache = {}; // role suffix -> execution role ARN
 const tagsCache = {};
 
 // Role-based mappings for log processing (discovery source is source of truth for type)
-const roleToResourcesMap = {}; // roleName -> [{agentId, agentName, type: 'AGENT', agentArn}, ...] or [{harnessId, harnessName, type: 'HARNESS', harnessArn}, ...]
+const roleToResourcesMap = {}; // roleName -> [{agentId, agentName, type: 'AGENT', agentArn}, ...]
 
 /** Lists every Bedrock Agent in the account. Returns [] (not a throw) if the API call fails. */
 async function listAllAgents() {
@@ -40,69 +41,6 @@ async function getAgentMetadata(agentId) {
     }
 }
 
-/** Lists every AgentCore harness in the account. Returns [] (not a throw) if the API call fails. */
-async function listAllHarnesses() {
-    try {
-        const response = await bedrockAgentCoreControlClient.send(new ListHarnessesCommand({}));
-        return response.harnesses || [];
-    } catch (error) {
-        console.error(`❌ ListHarnesses failed: ${error.message}`);
-        return [];
-    }
-}
-
-/** Fetches full metadata for one harness. Returns null on failure. */
-async function getHarnessMetadata(harnessId) {
-    try {
-        return (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
-    } catch (error) {
-        console.error(`❌ GetHarness failed for ${harnessId}: ${error.message}`);
-        return null;
-    }
-}
-
-/** Lists every AgentCore Agent Runtime in the account (standalone + harness-attached). Returns [] on failure. */
-async function listAllAgentRuntimes() {
-    try {
-        const response = await bedrockAgentCoreControlClient.send(new ListAgentRuntimesCommand({}));
-        return response.agentRuntimes || [];
-    } catch (error) {
-        console.error(`❌ ListAgentRuntimes failed: ${error.message}`);
-        return [];
-    }
-}
-
-
-/**
- * Populates harnessNameCache/harnessIdCache/harnessExecutionRoleCache by mapping
- * each harness's execution-role suffix (e.g. "fr53w") to its name/ID/role ARN.
- * Log entries only carry the role suffix, not the harness name, so this cache is
- * what lets processBedrockLogEntry resolve a human-readable bot name.
- */
-async function initializeHarnessCache() {
-    try {
-        const harnesses = (await bedrockAgentCoreControlClient.send(new ListHarnessesCommand({}))).harnesses || [];
-        for (const item of harnesses) {
-            if (!item.harnessId || !item.harnessName) continue;
-            try {
-                const details = (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId: item.harnessId }))).harness;
-                const roleMatch = details?.executionRoleArn?.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
-                if (roleMatch) {
-                    const suffix = roleMatch[1];
-                    harnessNameCache[suffix] = item.harnessName;
-                    harnessIdCache[suffix] = details.harnessId;
-                    harnessExecutionRoleCache[suffix] = details.executionRoleArn;
-                }
-            } catch (error) {
-                console.error(`❌ GetHarness failed during cache init for ${item.harnessId}: ${error.message}`);
-            }
-        }
-        console.log(`✅ Harness cache initialized: ${Object.keys(harnessNameCache).length} mapping(s)`);
-    } catch (error) {
-        console.error(`❌ Harness cache init failed (will use raw identifiers instead of names): ${error.message}`);
-    }
-}
-
 /** Generic cached tag-fetch wrapper — every AKTO tag lookup follows this exact shape. */
 async function fetchTagsCached(cacheKey, fetcher) {
     if (tagsCache[cacheKey]) return tagsCache[cacheKey];
@@ -122,17 +60,6 @@ async function getBedrockAgentTags(agentId) {
     }
 }
 
-/** Fetches AWS resource tags for one AgentCore harness. */
-async function getHarnessTags(harnessId) {
-    try {
-        const arn = `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harnessId}`;
-        return (await bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: arn }))).tags || {};
-    } catch (error) {
-        console.error(`⚠️ Tag fetch failed for harness ${harnessId}: ${error.message}`);
-        return {};
-    }
-}
-
 /** Adds the agent's execution role ARN + its attached policy names to a tag set. */
 async function addAgentRoleAndPermissions(tags, agentId) {
     try {
@@ -147,42 +74,6 @@ async function addAgentRoleAndPermissions(tags, agentId) {
     } catch (error) {
         console.error(`⚠️ Role lookup failed for agent ${agentId}: ${error.message}`);
         return tags;
-    }
-}
-
-/** Adds a harness's execution role ARN + its attached policy names to a tag set. */
-async function addHarnessRoleAndPermissions(tags, executionRoleArn) {
-    if (!executionRoleArn) return tags;
-    try {
-        const roleName = extractRoleNameFromArn(executionRoleArn);
-        return { ...tags, 'harness-execution-role-arn': executionRoleArn, 'harness-execution-role': roleName, 'harness-role-policies': await getRolePolicies(roleName) };
-    } catch (error) {
-        console.error(`⚠️ Role lookup failed for role ${executionRoleArn}: ${error.message}`);
-        return tags;
-    }
-}
-
-/** Reads a harness's configured tools/skills and formats them as tag values. */
-async function getHarnessToolsAndSkills(harnessId) {
-    try {
-        const details = (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
-        const tags = {};
-        const tools = details?.tools || [];
-        if (tools.length > 0) {
-            tags['harness-configured-tools'] = tools.map((t) => `${t.toolName || t.name || t.toolSpec?.name || 'unknown'}:${t.type || t.toolSpec?.type || 'unknown'}`).join(',');
-        }
-        const skills = details?.skills || [];
-        if (skills.length > 0) {
-            tags['harness-configured-skills'] = skills.flatMap((skill) => Object.keys(skill).map((type) => {
-                const config = skill[type];
-                const source = (config && typeof config === 'object') ? (config.url || config.source || config.sourceType || JSON.stringify(config).slice(0, 50)) : 'default';
-                return `${type}:${source}`;
-            })).join(',');
-        }
-        return tags;
-    } catch (error) {
-        console.error(`⚠️ Tools/skills fetch failed for harness ${harnessId}: ${error.message}`);
-        return {};
     }
 }
 
@@ -221,48 +112,27 @@ async function fetchAgentName(agentId) {
     }
 }
 
-/** Looks up a harness's name from its execution-role suffix (populated by initializeHarnessCache). */
-function getHarnessName(roleSuffix) { return roleSuffix ? (harnessNameCache[roleSuffix] || '') : ''; }
-/** Looks up a harness's ID from its execution-role suffix. */
-function getHarnessId(roleSuffix) { return roleSuffix ? (harnessIdCache[roleSuffix] || '') : ''; }
-/** Looks up a harness's execution role ARN from its role suffix. */
-function getHarnessExecutionRoleArn(roleSuffix) { return roleSuffix ? (harnessExecutionRoleCache[roleSuffix] || '') : ''; }
-
 /**
  * Builds one AKTO message from a real conversation pair: resolves the bot name,
- * fetches and enriches agent/harness tags, then hands everything to buildAgentMessage.
+ * fetches and enriches agent tags, then hands everything to buildAgentMessage.
  */
 async function createStandardMessage(pair) {
-    pair.botName = pair.logType === 'AGENT'
-        ? await fetchAgentName(pair.agentId)
-        : (pair.logType === 'HARNESS' ? getHarnessName(pair.harnessRoleSuffix) : '');
+    pair.botName = pair.logType === 'AGENT' ? await fetchAgentName(pair.agentId) : '';
 
     let agentTags = {};
-    let harnessTags = {};
-    let awsMetadata = {};
+    const harnessTags = {};
+    const awsMetadata = {};
 
     if (pair.logType === 'AGENT' && pair.agentId) {
         agentTags = await fetchTagsCached(`agent-${pair.agentId}`, () => getBedrockAgentTags(pair.agentId));
         agentTags = await addAgentRoleAndPermissions(agentTags, pair.agentId);
-    } else if (pair.logType === 'HARNESS' && pair.harnessId) {
-        harnessTags = await fetchTagsCached(`harness-${pair.harnessId}`, () => getHarnessTags(pair.harnessId));
-        harnessTags = await addHarnessRoleAndPermissions(harnessTags, getHarnessExecutionRoleArn(pair.harnessRoleSuffix));
-        const toolsAndSkills = await getHarnessToolsAndSkills(pair.harnessId);
-        harnessTags = { ...harnessTags, ...toolsAndSkills };
-        awsMetadata = {
-            'harness-configured-tools': toolsAndSkills['harness-configured-tools'] || '',
-            'harness-configured-skills': toolsAndSkills['harness-configured-skills'] || '',
-            model: pair.modelId,
-            'harness-execution-role': harnessTags['harness-execution-role'] || '',
-            traceData: pair.traceData || {}
-        };
     }
 
     return buildAgentMessage({ ...pair, accountId: pair.accountId || AWS_ACCOUNT_ID, region: pair.region || AWS_REGION, agentTags, harnessTags, awsMetadata }, true);
 }
 
 /**
- * Discovers agents/harnesses not yet in `discoveredAgents` (mutated in place) and
+ * Discovers agents not yet in `discoveredAgents` (mutated in place) and
  * returns metadata-only messages for them. Bails early if the time budget is
  * running low — anything not yet discovered stays absent from `discoveredAgents`,
  * so it's picked up automatically on the next invocation.
@@ -305,138 +175,13 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
         }
     }
 
-    const harnesses = await listAllHarnesses();
-    // Collect harness-attached runtime IDs to classify standalone runtimes later
-    const harnessAttachedRuntimeIds = new Set();
-
-    for (const harness of harnesses) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining harness discovery'); return messages; }
-        const key = `harness-${harness.harnessId}`;
-        if (discoveredAgents[key]) {
-            // Even if harness was already discovered, collect its runtime ID for classification
-            try {
-                const metadata = await getHarnessMetadata(harness.harnessId);
-                if (metadata?.environment?.agentCoreRuntimeEnvironment?.agentRuntimeId) {
-                    harnessAttachedRuntimeIds.add(metadata.environment.agentCoreRuntimeEnvironment.agentRuntimeId);
-                }
-            } catch (error) {
-                // Ignore errors during runtime ID collection
-            }
-            continue;
-        }
-        try {
-            const metadata = await getHarnessMetadata(harness.harnessId);
-            if (!metadata) continue;
-
-            // Collect the underlying runtime ID
-            if (metadata?.environment?.agentCoreRuntimeEnvironment?.agentRuntimeId) {
-                harnessAttachedRuntimeIds.add(metadata.environment.agentCoreRuntimeEnvironment.agentRuntimeId);
-            }
-
-            let harnessTags = await fetchTagsCached(`harness-${harness.harnessId}`, () => getHarnessTags(harness.harnessId));
-            if (metadata.executionRoleArn) harnessTags = await addHarnessRoleAndPermissions(harnessTags, metadata.executionRoleArn);
-            const arn = metadata.harnessArn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harness.harnessId}`;
-            messages.push(buildAgentMessage({
-                ...metadata, resourceType: 'HARNESS', harnessId: harness.harnessId, harnessName: harness.harnessName, arn,
-                agentTags: {}, harnessTags, agentStatus: metadata.harnessStatus || 'PREPARED', foundationModel: metadata.foundationModel || 'N/A'
-            }, false));
-            discoveredAgents[key] = { resourceId: harness.harnessId, resourceType: 'HARNESS', resourceName: harness.harnessName, foundationModel: metadata.foundationModel || 'N/A', discoveredAt: new Date().toISOString() };
-
-            // Build role mapping for log processing
-            if (metadata.executionRoleArn) {
-                const roleName = extractRoleNameFromArn(metadata.executionRoleArn);
-                if (roleName) {
-                    if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
-                    roleToResourcesMap[roleName].push({
-                        harnessId: harness.harnessId,
-                        harnessName: harness.harnessName,
-                        type: 'HARNESS',
-                        harnessArn: arn
-                    });
-                    console.log(`✅ Mapped harness role '${roleName}' (from ${metadata.executionRoleArn}) → harness '${harness.harnessName}'`);
-                } else {
-                    console.warn(`⚠️ Could not extract role name from ARN: ${metadata.executionRoleArn}`);
-                }
-            }
-        } catch (error) {
-            console.error(`⚠️ Discovery failed for harness ${harness.harnessId}: ${error.message}`);
-        }
-    }
-
-    // Discover standalone (non-harness-attached) agent runtimes
-    const allRuntimes = await listAllAgentRuntimes();
-    console.log(`📋 Found ${allRuntimes.length} total agent runtime(s), ${harnessAttachedRuntimeIds.size} attached to harnesses`);
-
-    for (const runtime of allRuntimes) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining runtime discovery'); return messages; }
-
-        // Skip harness-attached runtimes (they're already covered by harness discovery)
-        if (harnessAttachedRuntimeIds.has(runtime.agentRuntimeId)) {
-            console.log(`⏭️ Skipping harness-attached runtime: ${runtime.agentRuntimeName}`);
-            continue;
-        }
-
-        const key = `runtime-agent-${runtime.agentRuntimeId}`;
-        if (discoveredAgents[key]) continue;
-
-        try {
-            let agentTags = await fetchTagsCached(`runtime-agent-${runtime.agentRuntimeId}`, () =>
-                getBedrockAgentTags(runtime.agentRuntimeId).catch(() => ({})));
-
-            const arn = runtime.agentRuntimeArn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:runtime/${runtime.agentRuntimeId}`;
-
-            messages.push(buildAgentMessage({
-                agentName: runtime.agentRuntimeName,
-                agentId: runtime.agentRuntimeId,
-                foundationModel: 'N/A',
-                resourceType: 'STANDALONE_RUNTIME',
-                arn,
-                agentTags,
-                harnessTags: {},
-                agentStatus: runtime.status || 'READY',
-                createdAt: runtime.createdAt,
-                updatedAt: runtime.lastUpdatedAt
-            }, false));
-
-            discoveredAgents[key] = {
-                resourceId: runtime.agentRuntimeId,
-                resourceType: 'STANDALONE_RUNTIME',
-                resourceName: runtime.agentRuntimeName,
-                foundationModel: 'N/A',
-                discoveredAt: new Date().toISOString()
-            };
-
-            // Build role mapping for log processing
-            if (runtime.roleArn) {
-                const roleName = extractRoleNameFromArn(runtime.roleArn);
-                if (roleName) {
-                    if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
-                    roleToResourcesMap[roleName].push({
-                        agentId: runtime.agentRuntimeId,
-                        agentName: runtime.agentRuntimeName,
-                        type: 'STANDALONE_RUNTIME',
-                        agentArn: arn
-                    });
-                    console.log(`✅ Mapped standalone runtime role '${roleName}' (from ${runtime.roleArn}) → runtime '${runtime.agentRuntimeName}'`);
-                } else {
-                    console.warn(`⚠️ Could not extract role name from ARN: ${runtime.roleArn}`);
-                }
-            }
-
-            console.log(`✅ Discovered standalone runtime: ${runtime.agentRuntimeName}`);
-        } catch (error) {
-            console.error(`⚠️ Discovery failed for standalone runtime ${runtime.agentRuntimeId}: ${error.message}`);
-        }
-    }
-
     return messages;
 }
 
 /**
- * Finds a resource (agent or harness) from a log STS ARN by:
+ * Finds a resource (agent) from a log STS ARN by:
  * 1. Trying to extract agent ID from session name (if present)
- * 2. Trying to extract harness suffix from role name (if present)
- * 3. Looking up by role name in the map
+ * 2. Looking up by role name in the map
  * Returns null if not found or ambiguous (multiple resources on same role without determinable ID).
  */
 function findResourceByArn(stsArn) {
@@ -467,20 +212,6 @@ function findResourceByArn(stsArn) {
                 }
             }
         }
-
-        // Try to extract harness suffix from role name
-        const harnessMatch = sessionName.match(/^BedrockAgentCore-/);
-        if (harnessMatch) {
-            const suffixMatch = roleName.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
-            if (suffixMatch) {
-                const suffix = suffixMatch[1];
-                const resources = roleToResourcesMap[roleName];
-                if (resources && resources.length === 1 && resources[0].type === 'HARNESS') {
-                    console.log(`✅ Found harness by suffix: ${resources[0].harnessName}`);
-                    return resources[0];
-                }
-            }
-        }
     }
 
     // Look up by role name
@@ -494,20 +225,20 @@ function findResourceByArn(stsArn) {
 
     // Exactly one resource on this role
     if (resources.length === 1) {
-        console.log(`✅ Found resource by role name: ${resources[0].agentName || resources[0].harnessName}`);
+        console.log(`✅ Found resource by role name: ${resources[0].agentName}`);
         return resources[0];
     }
 
     // Multiple resources on same role - cannot determine which one
     console.warn(
-        `⚠️ Role '${roleName}' maps to ${resources.length} resources (${resources.map(r => r.agentName || r.harnessName).join(', ')}). ` +
+        `⚠️ Role '${roleName}' maps to ${resources.length} resources (${resources.map(r => r.agentName).join(', ')}). ` +
         `Cannot determine correct mapping from session name. Skipping log entry.`
     );
     return null;
 }
 
 /**
- * Rebuilds roleToResourcesMap from already-discovered agents/harnesses.
+ * Rebuilds roleToResourcesMap from already-discovered agents.
  * Called at startup to ensure log processing can find agents discovered in previous runs.
  * Prevents the bug where an agent discovered in run 1 becomes "unknown" in run 2+ because
  * its role was never added to the in-memory roleToResourcesMap.
@@ -543,91 +274,14 @@ async function rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft) {
         }
     }
 
-    const harnesses = await listAllHarnesses();
-    for (const harness of harnesses) {
-        if (timeLeft && timeLeft() < TIME_SAFETY_MARGIN_MS) {
-            console.warn('⏱️ Time budget low — deferring role map rebuild');
-            return;
-        }
-
-        const key = `harness-${harness.harnessId}`;
-        if (!discoveredAgents[key]) continue;
-
-        try {
-            const metadata = await getHarnessMetadata(harness.harnessId);
-            if (!metadata || !metadata.executionRoleArn) continue;
-
-            const roleName = extractRoleNameFromArn(metadata.executionRoleArn);
-            if (roleName) {
-                if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
-                roleToResourcesMap[roleName].push({
-                    harnessId: harness.harnessId,
-                    harnessName: harness.harnessName,
-                    type: 'HARNESS',
-                    harnessArn: metadata.harnessArn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harness.harnessId}`
-                });
-                console.log(`  ├─ Rebuilt role '${roleName}' → harness '${harness.harnessName}'`);
-            }
-        } catch (error) {
-            console.error(`⚠️ Role map rebuild failed for harness ${harness.harnessId}: ${error.message}`);
-        }
-    }
-
-    // Rebuild role mappings for standalone runtimes
-    const allRuntimes = await listAllAgentRuntimes();
-    // Collect harness-attached runtime IDs to skip them
-    const harnessRuntimeIds = new Set();
-    const harnesses2 = await listAllHarnesses();
-    for (const harness of harnesses2) {
-        try {
-            const meta = await getHarnessMetadata(harness.harnessId);
-            if (meta?.environment?.agentCoreRuntimeEnvironment?.agentRuntimeId) {
-                harnessRuntimeIds.add(meta.environment.agentCoreRuntimeEnvironment.agentRuntimeId);
-            }
-        } catch (error) {
-            // Ignore
-        }
-    }
-
-    for (const runtime of allRuntimes) {
-        if (timeLeft && timeLeft() < TIME_SAFETY_MARGIN_MS) {
-            console.warn('⏱️ Time budget low — deferring role map rebuild');
-            return;
-        }
-
-        // Skip harness-attached runtimes
-        if (harnessRuntimeIds.has(runtime.agentRuntimeId)) continue;
-
-        const key = `runtime-agent-${runtime.agentRuntimeId}`;
-        if (!discoveredAgents[key]) continue;
-
-        try {
-            if (runtime.roleArn) {
-                const roleName = extractRoleNameFromArn(runtime.roleArn);
-                if (roleName) {
-                    if (!roleToResourcesMap[roleName]) roleToResourcesMap[roleName] = [];
-                    roleToResourcesMap[roleName].push({
-                        agentId: runtime.agentRuntimeId,
-                        agentName: runtime.agentRuntimeName,
-                        type: 'STANDALONE_RUNTIME',
-                        agentArn: runtime.agentRuntimeArn
-                    });
-                    console.log(`  ├─ Rebuilt role '${roleName}' → standalone runtime '${runtime.agentRuntimeName}'`);
-                }
-            }
-        } catch (error) {
-            console.error(`⚠️ Role map rebuild failed for standalone runtime ${runtime.agentRuntimeId}: ${error.message}`);
-        }
-    }
-
     const roleList = Object.entries(roleToResourcesMap).map(([role, resources]) =>
-        `${role}: ${resources.map(r => `${r.agentName || r.harnessName}(${r.type})`).join(', ')}`
+        `${role}: ${resources.map(r => `${r.agentName}(${r.type})`).join(', ')}`
     );
     console.log(`✅ Role map rebuilt: ${Object.keys(roleToResourcesMap).length} role(s) mapped`);
     console.log(`📋 Role map:\n${roleList.map(r => `  ├─ ${r}`).join('\n')}`);
 }
 
 module.exports = {
-    initializeHarnessCache, rebuildRoleMapFromDiscoveredAgents, discoverAllNewAgents, createStandardMessage,
-    fetchAgentName, getHarnessName, findResourceByArn
+    rebuildRoleMapFromDiscoveredAgents, discoverAllNewAgents, createStandardMessage,
+    fetchAgentName, findResourceByArn
 };

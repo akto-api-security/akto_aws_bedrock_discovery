@@ -7,7 +7,7 @@ const { gunzip } = require('zlib');
 const { promisify } = require('util');
 const { s3Client, LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS } = require('./config');
 const { extractConversationPairs, extractTraceData } = require('./extractors');
-const { fetchAgentName, getHarnessName, createStandardMessage, findResourceByArn } = require('./discovery');
+const { fetchAgentName, createStandardMessage, findResourceByArn } = require('./discovery');
 
 const gunzipAsync = promisify(gunzip);
 

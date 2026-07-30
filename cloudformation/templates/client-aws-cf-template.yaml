@@ -1,5 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'AKTO Bedrock Discovery - Client Deployment.'
+Description: >
+  AKTO Bedrock Discovery - Client Deployment. One Lambda runs two independent
+  pipelines: Bedrock Agent Classic (S3 model-invocation logs) and AgentCore
+  Harness/Runtime (CloudWatch observability traces). The AgentCore half is a
+  no-op if the account hasn't enabled CloudWatch Transaction Search + tracing
+  — the Lambda simply finds zero log groups and the Agent Classic half keeps
+  working normally.
 
 Parameters:
   LogsBucketName:
@@ -27,6 +33,11 @@ Parameters:
     Type: String
     NoEcho: true
     Description: 'AKTO API Key for authentication'
+
+  RuntimeLogGroupPrefix:
+    Type: String
+    Description: '(Optional) CloudWatch log group prefix for per-runtime AgentCore observability logs. Default matches AWS''s own naming convention.'
+    Default: '/aws/bedrock-agentcore/runtimes/'
 
   LambdaCodeVersion:
     Type: String
@@ -79,21 +90,36 @@ Resources:
                   - 'bedrock:GetAgent'
                   - 'bedrock:ListTagsForResource'
                 Resource: '*'
-              # Bedrock AgentCore permissions for harness discovery
+              # Bedrock AgentCore permissions for harness/runtime discovery
               - Effect: Allow
                 Action:
                   - 'bedrock-agentcore:ListHarnesses'
                   - 'bedrock-agentcore:GetHarness'
                   - 'bedrock-agentcore:ListTagsForResource'
                   - 'bedrock-agentcore:ListAgentRuntimes'
+                  - 'bedrock-agentcore:GetAgentRuntime'
                 Resource: '*'
-              # IAM permissions for role inspection (agent execution roles + harness roles)
+              # IAM permissions for role inspection (agent execution roles + harness/runtime roles)
               - Effect: Allow
                 Action:
                   - 'iam:GetRole'
                   - 'iam:ListAttachedRolePolicies'
                   - 'iam:ListRolePolicies'
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              # CloudWatch Logs - read-only (used by the AgentCore Harness/Runtime trace
+              # pipeline only). DescribeLogGroups has no resource-level permission support
+              # in IAM (AWS requires Resource: "*" for it); FilterLogEvents/GetLogEvents do
+              # support scoping, so those stay limited to the observability log group prefix.
+              - Effect: Allow
+                Action:
+                  - 'logs:DescribeLogGroups'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:FilterLogEvents'
+                  - 'logs:GetLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${RuntimeLogGroupPrefix}*'
 
   # Lambda Function
   AktoBedrocklambdaFunction:
@@ -115,9 +141,10 @@ Resources:
           LOGS_BUCKET_NAME: !Ref LogsBucketName
           LOGS_PREFIX: !Ref LogsPrefix
           MARKERS_BUCKET_NAME: !Ref MarkersBucketName
+          RUNTIME_LOG_GROUP_PREFIX: !Ref RuntimeLogGroupPrefix
           BEDROCK_AWS_REGION: !Ref 'AWS::Region'
           AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
-      Description: 'Processes Bedrock model invocation logs and sends to AKTO'
+      Description: 'Processes Bedrock Agent Classic S3 logs and AgentCore Harness/Runtime CloudWatch traces, sending both to AKTO'
 
   # EventBridge Execution Role
   EventBridgeExecutionRole:

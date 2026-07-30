@@ -20,6 +20,10 @@
     "ParameterValue": "your-prod-api-key-here"
   },
   {
+    "ParameterKey": "RuntimeLogGroupPrefix",
+    "ParameterValue": "/aws/bedrock-agentcore/runtimes/"
+  },
+  {
     "ParameterKey": "LambdaCodeVersion",
     "ParameterValue": "v1.0"
   }
