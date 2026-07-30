@@ -102,14 +102,12 @@ Resources:
               # IAM permissions for role inspection (agent execution roles + harness/runtime roles)
               - Effect: Allow
                 Action:
-                  - 'iam:GetRole'
                   - 'iam:ListAttachedRolePolicies'
-                  - 'iam:ListRolePolicies'
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
               # CloudWatch Logs - read-only (used by the AgentCore Harness/Runtime trace
               # pipeline only). DescribeLogGroups has no resource-level permission support
-              # in IAM (AWS requires Resource: "*" for it); FilterLogEvents/GetLogEvents do
-              # support scoping, so those stay limited to the observability log group prefix.
+              # in IAM (AWS requires Resource: "*" for it); FilterLogEvents does support
+              # scoping, so it stays limited to the observability log group prefix.
               - Effect: Allow
                 Action:
                   - 'logs:DescribeLogGroups'
@@ -117,7 +115,6 @@ Resources:
               - Effect: Allow
                 Action:
                   - 'logs:FilterLogEvents'
-                  - 'logs:GetLogEvents'
                 Resource:
                   - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${RuntimeLogGroupPrefix}*'
 

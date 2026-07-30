@@ -72,8 +72,8 @@ Scope:      s3://MarkersBucketName/akto/markers/*
 ### **AWS Services - Limited**
 - **Bedrock:** GetAgent, ListTagsForResource (metadata only)
 - **Bedrock AgentCore:** ListHarnesses, GetHarness, ListAgentRuntimes, GetAgentRuntime, ListTagsForResource (discovery only)
-- **IAM:** GetRole, ListPolicies (read-only)
-- **CloudWatch Logs:** DescribeLogGroups (account-wide listing — AWS doesn't support scoping this one), FilterLogEvents/GetLogEvents (read-only, scoped to the AgentCore observability log group prefix only)
+- **IAM:** ListAttachedRolePolicies (read-only)
+- **CloudWatch Logs:** DescribeLogGroups (account-wide listing — AWS doesn't support scoping this one), FilterLogEvents (read-only, scoped to the AgentCore observability log group prefix only)
 
 ---
 
