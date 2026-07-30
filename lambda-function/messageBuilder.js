@@ -4,6 +4,20 @@
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
 
 /**
+ * Maps a Bedrock log entry's operation to the real Runtime API path suffix it hit.
+ * Falls back to 'invoke' for discovery (synthetic, not a real call) and any unrecognized operation.
+ */
+function operationToPath(operation) {
+    const paths = {
+        Converse: 'converse',
+        ConverseStream: 'converse-stream',
+        InvokeModel: 'invoke',
+        InvokeModelWithResponseStream: 'invoke-with-response-stream'
+    };
+    return paths[operation] || 'invoke';
+}
+
+/**
  * Builds one AKTO-format message, either from a real conversation pair
  * (isConversation=true) or from agent/harness discovery metadata (false).
  * Both shapes share the same envelope (headers/payload/tags/etc.) so this is
@@ -14,28 +28,45 @@ function buildAgentMessage(data, isConversation) {
     const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
 
     const modelId = isConversation ? data.modelId : (data.foundationModel || 'unknown-model');
-    const resourceId = isConversation ? data.agentId : (data.resourceType === 'HARNESS' ? data.harnessId : data.agentId);
-    const resourceName = isConversation ? data.botName : (data.resourceType === 'HARNESS' ? data.harnessName : data.agentName);
+    const resourceId = isConversation
+        ? data.agentId
+        : (data.resourceType === 'HARNESS' ? data.harnessId : data.agentId);
+    const resourceName = isConversation
+        ? data.botName
+        : (data.resourceType === 'HARNESS' ? data.harnessName : data.agentName);
 
-    const requestHeaders = {
-        'Content-Type': 'application/json',
-        'X-Bedrock-Model-Id': modelId,
-        'bedrock-agent-id': resourceId || '',
-        'agent-name': resourceName || '',
-        'bedrock-region': isConversation ? (data.region || AWS_REGION) : AWS_REGION,
-        host: originalHost,
-        'bedrock-operation': isConversation ? (data.operation || 'Unknown') : 'DISCOVERY',
-        'bedrock-identity-arn': data.arn || '',
-        'aws-account-id': isConversation ? (data.accountId || AWS_ACCOUNT_ID) : AWS_ACCOUNT_ID
-    };
-    if (isConversation) {
-        requestHeaders['X-Request-Id'] = data.requestId;
-        requestHeaders['bedrock-input-tokens'] = String(data.inputTokenCount || 0);
-        requestHeaders['bedrock-output-tokens'] = String(data.outputTokenCount || 0);
-    }
+    const requestHeaders = isConversation
+        ? {
+            'Content-Type': 'application/json',
+            'X-Bedrock-Model-Id': modelId,
+            'X-Request-Id': data.requestId,
+            'bedrock-region': data.region || AWS_REGION,
+            'bedrock-operation': data.operation || 'Unknown',
+            'bedrock-identity-arn': data.arn || '',
+            'aws-account-id': data.accountId || AWS_ACCOUNT_ID,
+            host: originalHost
+        }
+        : {
+            'Content-Type': 'application/json',
+            'X-Bedrock-Model-Id': modelId,
+            'bedrock-region': AWS_REGION,
+            'bedrock-operation': 'DISCOVERY',
+            'bedrock-identity-arn': data.arn || '',
+            'aws-account-id': AWS_ACCOUNT_ID,
+            host: originalHost
+        };
 
     const requestPayload = isConversation
-        ? { message: data.userMessage, model: data.modelId, requestId: data.requestId }
+        ? {
+            messages: [
+                {
+                    role: 'user',
+                    content: data.userMessage
+                }
+            ],
+            model: data.modelId,
+            requestId: data.requestId
+        }
         : {
             resourceId,
             resourceName,
@@ -48,7 +79,24 @@ function buildAgentMessage(data, isConversation) {
             executionRoleArn: data.resourceType === 'HARNESS' ? data.executionRoleArn : data.agentResourceRoleArn
         };
 
-    const responsePayload = isConversation ? { message: data.agentResponse, model: data.modelId } : {};
+    const responsePayload = isConversation
+        ? {
+            output: {
+                message: {
+                    role: 'assistant',
+                    content: [
+                        {
+                            text: data.agentResponse
+                        }
+                    ]
+                }
+            },
+            usage: {
+                inputTokens: data.inputTokenCount || 0,
+                outputTokens: data.outputTokenCount || 0
+            }
+        }
+        : {};
 
     const tags = {
         source: 'AWS_BEDROCK',
@@ -56,11 +104,12 @@ function buildAgentMessage(data, isConversation) {
         'account-id': isConversation ? (data.accountId || AWS_ACCOUNT_ID) : AWS_ACCOUNT_ID,
         region: isConversation ? (data.region || AWS_REGION) : AWS_REGION,
         agentType: isConversation
-            ? (data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : 'UNKNOWN'))
-            : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : 'BEDROCK_AGENT'),
+            ? (data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'UNKNOWN')))
+            : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.resourceType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'BEDROCK_AGENT')),
         'bot-name': resourceName || '',
-        'agent-id': (isConversation ? data.logType === 'AGENT' : data.resourceType === 'AGENT') ? (data.agentId || '') : '',
+        'agent-id': (isConversation ? data.logType === 'AGENT' || data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'AGENT' || data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
         'harness-id': (isConversation ? data.logType === 'HARNESS' : data.resourceType === 'HARNESS') ? (data.harnessId || '') : '',
+        'runtime-id': (isConversation ? data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
         model: modelId,
         'bedrock-identity-arn': data.arn || '',
         ...(isConversation
@@ -68,8 +117,10 @@ function buildAgentMessage(data, isConversation) {
             : { 'discovery-type': 'METADATA_ONLY', 'has-conversations': 'false', ...(data.resourceType === 'AGENT' ? data.agentTags : data.harnessTags) })
     };
 
+    const path = `/model/${modelId}/${operationToPath(isConversation ? data.operation : null)}`;
+
     return {
-        path: `/model/${modelId}/invoke`,
+        path,
         original_host: originalHost,
         method: 'POST',
         requestHeaders: JSON.stringify(requestHeaders),
@@ -90,4 +141,4 @@ function buildAgentMessage(data, isConversation) {
     };
 }
 
-module.exports = { buildAgentMessage };
+module.exports = { buildAgentMessage, operationToPath };

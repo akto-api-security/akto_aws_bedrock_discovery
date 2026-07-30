@@ -17,7 +17,7 @@ async function postWithTimeout(body) {
     try {
         const response = await fetch(DATA_INGESTION_ENDPOINT, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-API-KEY': AKTO_API_KEY, 'User-Agent': 'AKTO-Bedrock-Monitor/3.0' },
+            headers: { 'Content-Type': 'application/json', authorization: AKTO_API_KEY, 'User-Agent': 'AKTO-Bedrock-Monitor/3.0' },
             body: JSON.stringify(body),
             signal: controller.signal
         });

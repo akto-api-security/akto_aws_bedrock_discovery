@@ -4,31 +4,25 @@
  */
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
 
-/** AGENT (Bedrock Agents) vs HARNESS (AgentCore) vs UNKNOWN, based on the caller's IAM role ARN. */
-function detectLogType(arn) {
-    if (!arn) return 'UNKNOWN';
-    if (arn.includes('BedrockAgents-')) return 'AGENT';
-    if (arn.includes('AmazonBedrockAgentCoreHarnessDefaultServiceRole-')) return 'HARNESS';
-    return 'UNKNOWN';
-}
-
-/** Pulls the Bedrock Agent ID out of a BedrockAgents-* execution role ARN. */
-function extractAgentID(arn) {
-    const match = arn?.match(/BedrockAgents-([A-Z0-9]+)-[a-f0-9-]+$/);
-    return match ? match[1] : '';
-}
-
-/** Pulls the AgentCore harness role suffix out of its default service-role ARN. */
-function extractHarnessRoleSuffix(arn) {
-    const match = arn?.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
-    return match ? match[1] : '';
-}
-
-/** Pulls plain text out of a Bedrock content-block array (Nova/Claude shapes both use `{ text: ... }`). */
+/** Pulls plain text out of a Bedrock content-block (array format expected from AWS APIs). */
 function extractTextFromContent(content) {
-    if (!Array.isArray(content)) return '';
+    // AWS Bedrock APIs always return content as array: [{text: "..."}, ...]
+    if (!Array.isArray(content)) {
+        console.warn(
+            `⚠️ Content is not array (expected array from AWS Bedrock API): ` +
+            `type=${typeof content}, value=${JSON.stringify(content).substring(0, 100)}`
+        );
+        return '';
+    }
+
+    // Find first item with text property
     const item = content.find((c) => c.text);
-    return item ? item.text : '';
+    if (!item) {
+        console.warn(`⚠️ No text found in content array. Array length: ${content.length}, items: ${JSON.stringify(content).substring(0, 100)}`);
+        return '';
+    }
+
+    return item.text;
 }
 
 /** Strips <function_calls>/<function_results> blocks and unwraps <answer> tags; drops replies shorter than 10 chars. */
@@ -71,23 +65,24 @@ function extractConversationPairs(logEntry) {
             .filter((text) => text && !text.includes('<function_results>') && text.trim().length > 0);
 
         const arn = logEntry.identity?.arn || '';
-        const logType = detectLogType(arn);
-        const harnessRoleSuffix = extractHarnessRoleSuffix(arn);
-        // Note: harnessName/harnessId are resolved from the caches in discovery.js by the
-        // caller (processBedrockLogEntry in s3Logs.js) — this module has no AWS access.
+        // Type detection and resource lookup now handled in s3Logs.js via discovery mappings
         const baseFields = {
             timestamp: logEntry.timestamp,
             requestId: logEntry.requestId,
             modelId: logEntry.modelId,
-            agentId: extractAgentID(arn),
-            harnessRoleSuffix,
             arn,
-            logType,
+            logType: '',
+            agentId: '',
+            harnessId: '',
+            runtimeAgentId: '',
+            harnessRoleSuffix: '',
+            harnessName: '',
             operation: logEntry.operation || 'Unknown',
             accountId: logEntry.accountId || AWS_ACCOUNT_ID,
             region: logEntry.region || AWS_REGION,
             inputTokenCount: logEntry.input?.inputTokenCount || 0,
-            outputTokenCount: logEntry.output?.outputTokenCount || 0
+            outputTokenCount: logEntry.output?.outputTokenCount || 0,
+            awsMetadata: {}
         };
 
         if (finalAssistantResponse && userMessages.length > 0) {
@@ -157,6 +152,5 @@ function extractTraceData(logEntry, botName) {
 }
 
 module.exports = {
-    detectLogType, extractAgentID, extractHarnessRoleSuffix, extractTextFromContent,
-    cleanAgentResponse, removeXMLTags, extractConversationPairs, extractTraceData
+    extractTextFromContent, cleanAgentResponse, removeXMLTags, extractConversationPairs, extractTraceData
 };
