@@ -20,11 +20,25 @@ const tagsCache = {};
 // Role-based mappings for log processing (discovery source is source of truth for type)
 const roleToResourcesMap = {}; // roleName -> [{agentId, agentName, type: 'AGENT', agentArn}, ...]
 
+/** Generic pager: calls sendPage(nextToken) until no token comes back, concatenating pluck(response) from each page. */
+async function listAllPages(sendPage, pluck) {
+    let items = [];
+    let nextToken;
+    do {
+        const response = await sendPage(nextToken);
+        items = items.concat(pluck(response) || []);
+        nextToken = response.nextToken;
+    } while (nextToken);
+    return items;
+}
+
 /** Lists every Bedrock Agent in the account. Returns [] (not a throw) if the API call fails. */
 async function listAllAgents() {
     try {
-        const response = await bedrockAgentClient.send(new ListAgentsCommand({}));
-        return response.agentSummaries || [];
+        return await listAllPages(
+            (nextToken) => bedrockAgentClient.send(new ListAgentsCommand({ nextToken })),
+            (response) => response.agentSummaries
+        );
     } catch (error) {
         console.error(`❌ ListAgents failed (check bedrock:ListAgents permission): ${error.message}`);
         return [];
