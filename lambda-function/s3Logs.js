@@ -94,16 +94,16 @@ async function getOutputBodyJson(logEntry) {
 
 /** Resumes from the manifest checkpoint, or falls back to LOOKBACK_DAYS ago if there's no checkpoint or it's stale. */
 function getLogsStartTime(manifest) {
-    const sevenDaysAgo = new Date(Date.now() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+    const lookbackCutoff = new Date(Date.now() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
     if (manifest?.lastProcessedTimestamp) {
         const lastRun = new Date(manifest.lastProcessedTimestamp);
-        if (lastRun > sevenDaysAgo) {
+        if (lastRun > lookbackCutoff) {
             console.log(`▶️ Resuming from checkpoint: ${manifest.lastProcessedTimestamp}`);
             return lastRun;
         }
-        console.warn(`⚠️ Checkpoint ${manifest.lastProcessedTimestamp} is older than ${LOOKBACK_DAYS} days — resetting to ${sevenDaysAgo.toISOString()}`);
+        console.warn(`⚠️ Checkpoint ${manifest.lastProcessedTimestamp} is older than ${LOOKBACK_DAYS} days — resetting to ${lookbackCutoff.toISOString()}`);
     }
-    return sevenDaysAgo;
+    return lookbackCutoff;
 }
 
 /**

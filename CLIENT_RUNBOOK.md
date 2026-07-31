@@ -248,7 +248,7 @@ Check the AKTO dashboard for new traffic tagged `source: AWS_BEDROCK`.
 
 ## Note
 
-The first run after this update reprocesses the last 7 days of S3 logs (one-time, since
+The first run after this update reprocesses the last 3 days of S3 logs (one-time, since
 there's no manifest yet) and, separately, the last 3 days of AgentCore CloudWatch traces
 (if tracing is enabled). Both are expected, one-time backfills.
 

@@ -23,7 +23,7 @@ const FLUSH_THRESHOLD = 100;          // send+checkpoint once this many messages
 const TIME_SAFETY_MARGIN_MS = 90000;  // stop starting new work with less than this much Lambda time left
 const FETCH_TIMEOUT_MS = 25000;       // abort a stuck HTTP call instead of silently eating the whole invocation
 const MAX_SEND_ATTEMPTS = 3;
-const LOOKBACK_DAYS = 7;
+const LOOKBACK_DAYS = 3;
 
 // AgentCore Harness/Runtime conversation data (separate pipeline, see traceDiscovery.js/
 // logGroupReader.js/traceParser.js) — CloudWatch observability logs instead of S3, so it
