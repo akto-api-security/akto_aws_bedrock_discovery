@@ -257,3 +257,40 @@ there's no manifest yet) and, separately, the last 3 days of AgentCore CloudWatc
 If something breaks, restore the Lambda code from the version you published in Step 3,
 then revert the environment variables/timeout/schedule to their previous values.
 
+## Optional — AgentCore Gateway interception
+
+The code zip you deployed above also contains a real-time interceptor that applies AKTO
+guardrails to AgentCore Gateway MCP tool traffic (block / redact / monitor on
+`tools/call`). It is **inert in this deployment**: the discovery Lambda's handler
+(`index.handler`) never runs it, and the extra files simply sit unused in the zip. Nothing
+you did above touches a gateway.
+
+Enabling it means running two additional Lambdas — the interceptor itself and an attacher
+that finds your gateways and wires it up — so it's deployed through the CloudFormation
+template rather than these CLI steps:
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation/templates/client-aws-cf-template.yaml \
+  --stack-name akto-bedrock \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    EnableGatewayInterception=true \
+    InterceptorDryRun=true \
+    LambdaCodeVersion=v1.1 \
+    LogsBucketName="$LOGS_BUCKET" LogsPrefix="$LOGS_PREFIX" \
+    MarkersBucketName="$MARKERS_BUCKET" \
+    DataIngestionEndpoint="$DATA_INGESTION_ENDPOINT" AktoApiKey="$AKTO_API_KEY"
+```
+
+You are **not** asked for gateway IDs — every gateway in the region is discovered
+automatically, and the whole thing is a no-op if the account has none. Start with
+`InterceptorDryRun=true` to see the attach decisions in the attacher's logs without
+modifying any gateway, then redeploy with `false`.
+
+`EnableGatewayInterception=false` (the alternative) deploys discovery only: no interceptor
+Lambda is created and no gateway is ever read or written.
+
+See `INTERCEPTOR_GUIDE.md` for the attach rules (including what happens when a gateway
+already has its own interceptor), the fail-open behaviour, and how to detach.
+

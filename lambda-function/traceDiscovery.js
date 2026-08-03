@@ -376,5 +376,7 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
 
 module.exports = {
     initializeHarnessCache, discoverNewResources, createStandardMessage,
-    getHarnessName, getHarnessId, backfillExecutionRoleArns, buildRoleNameToResourceMap, buildHarnessNameToResourceMap
+    getHarnessName, getHarnessId, backfillExecutionRoleArns, buildRoleNameToResourceMap, buildHarnessNameToResourceMap,
+    // Reused by gatewayDiscovery.js to map harnesses to the gateways they call.
+    listAllPages, listAllHarnesses, getHarnessMetadata
 };

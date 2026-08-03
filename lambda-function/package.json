@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "package": "npm install && zip -r ../akto-bedrock-processor.zip . -x '*.git*' 'node_modules/.cache/*'",
+    "package": "npm install && zip -r ../akto-bedrock-processor.zip . -x '*.git*' 'node_modules/.cache/*' '*.zip'",
     "deploy": "npm run package && aws lambda update-function-code --function-name akto-bedrock-log-processor --zip-file fileb://../akto-bedrock-processor.zip"
   },
   "keywords": [
@@ -20,9 +20,10 @@
   "license": "MIT",
   "dependencies": {
     "@aws-sdk/client-bedrock-agent": "^3.682.0",
-    "@aws-sdk/client-bedrock-agentcore-control": "^3.682.0",
+    "@aws-sdk/client-bedrock-agentcore-control": "^3.1071.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.682.0",
     "@aws-sdk/client-iam": "^3.682.0",
+    "@aws-sdk/client-lambda": "^3.1071.0",
     "@aws-sdk/client-s3": "^3.682.0"
   },
   "engines": {
