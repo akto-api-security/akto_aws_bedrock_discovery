@@ -135,11 +135,16 @@ async function createStandardMessage(pair) {
 
     let agentTags = {};
     const harnessTags = {};
-    const awsMetadata = {};
+    let awsMetadata = {};
 
     if (pair.logType === 'AGENT' && pair.agentId) {
         agentTags = await fetchTagsCached(`agent-${pair.agentId}`, () => getBedrockAgentTags(pair.agentId));
         agentTags = await addAgentRoleAndPermissions(agentTags, pair.agentId);
+        awsMetadata = {
+            model: pair.modelId,
+            'bedrock-execution-role': agentTags['bedrock-execution-role'] || '',
+            traceData: pair.traceData || {}
+        };
     }
 
     return buildAgentMessage({ ...pair, accountId: pair.accountId || AWS_ACCOUNT_ID, region: pair.region || AWS_REGION, agentTags, harnessTags, awsMetadata }, true);

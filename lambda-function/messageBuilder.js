@@ -94,9 +94,10 @@ function buildAgentMessage(data, isConversation) {
             usage: {
                 inputTokens: data.inputTokenCount || 0,
                 outputTokens: data.outputTokenCount || 0
-            }
+            },
+            awsMetadata: data.awsMetadata || {}
         }
-        : {};
+        : { awsMetadata: { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt } };
 
     const tags = {
         source: 'AWS_BEDROCK',
@@ -137,7 +138,7 @@ function buildAgentMessage(data, isConversation) {
         is_pending: 'false',
         source: 'MIRRORING',
         tag: JSON.stringify(tags),
-        awsMetadata: JSON.stringify(isConversation ? (data.awsMetadata || {}) : { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt })
+        publishToGuardrails: true
     };
 }
 

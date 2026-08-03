@@ -32,6 +32,8 @@ function cleanAgentResponse(rawResponse) {
         const answer = rawResponse.substring(rawResponse.indexOf('<answer>') + 8, rawResponse.indexOf('</answer>')).trim();
         if (answer) return answer;
     }
+    // Raw <thinking> scratch text with no <answer> — an in-progress step, not a real reply.
+    if (rawResponse.includes('<thinking>') || rawResponse.includes('</thinking>')) return '';
     let cleaned = removeXMLTags(rawResponse, 'function_calls');
     cleaned = removeXMLTags(cleaned, 'function_results').trim();
     return cleaned.length >= 10 ? cleaned : '';
@@ -104,15 +106,32 @@ function extractConversationPairs(logEntry) {
     return pairs;
 }
 
-/**
- * Extracts the tool-call execution trace for a conversation pair: looks for
- * toolUse blocks in the assistant message history first, falling back to the
- * output message when the model's stop reason is tool_use.
- */
+/** Pulls an action-type label out of a tool call's input, if its schema has one — direct shape first, then one level into every input key. */
+function extractToolActionType(input) {
+    if (!input || typeof input !== 'object') return 'unknown';
+    if (input.action?.type) return input.action.type;
+    for (const value of Object.values(input)) {
+        if (value?.action?.type) return value.action.type;
+    }
+    return 'unknown';
+}
+
+/** Extracts the tool-call execution trace for a conversation pair, matching each toolUse to its toolResult by toolUseId. */
 function extractTraceData(logEntry, botName) {
     try {
         const messages = logEntry.input?.inputBodyJson?.messages || [];
         const stopReason = logEntry.output?.outputBodyJson?.stopReason;
+
+        const resultsByToolUseId = {};
+        for (const message of messages) {
+            if (message.role !== 'user') continue;
+            for (const block of message.content || []) {
+                const toolResult = block?.toolResult;
+                if (toolResult?.toolUseId) {
+                    resultsByToolUseId[toolResult.toolUseId] = extractTextFromContent(toolResult.content);
+                }
+            }
+        }
 
         let toolCalls = messages
             .filter((m) => m.role === 'assistant')
@@ -129,8 +148,9 @@ function extractTraceData(logEntry, botName) {
 
         toolCalls.forEach((item, i) => {
             const tool = item.toolUse?.name || 'unknown';
-            const action = item.toolUse?.input?.action?.type || 'unknown';
-            executionFlow.push({ step: i + 1, type: 'tool-call', tool, action, toolUseId: item.toolUse?.toolUseId || '' });
+            const action = extractToolActionType(item.toolUse?.input);
+            const toolUseId = item.toolUse?.toolUseId || '';
+            executionFlow.push({ step: i + 1, type: 'tool-call', tool, action, toolUseId, result: resultsByToolUseId[toolUseId] || '' });
             tools.add(tool);
             actions.add(action);
         });
