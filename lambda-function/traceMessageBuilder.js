@@ -66,7 +66,9 @@ function buildAgentMessage(data, isConversation) {
             executionRoleArn: data.executionRoleArn
         };
 
-    const responsePayload = isConversation ? { response: data.agentResponse } : {};
+    const responsePayload = isConversation
+        ? { response: data.agentResponse, awsMetadata: data.awsMetadata || {} }
+        : { awsMetadata: { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt } };
 
     const tags = {
         source: 'AWS_BEDROCK',
@@ -102,7 +104,7 @@ function buildAgentMessage(data, isConversation) {
         is_pending: 'false',
         source: 'MIRRORING',
         tag: JSON.stringify(tags),
-        awsMetadata: JSON.stringify(isConversation ? (data.awsMetadata || {}) : { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt })
+        publishToGuardrails: true
     };
 }
 

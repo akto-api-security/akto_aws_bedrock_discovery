@@ -1,24 +1,13 @@
 /**
- * Parses CloudWatch log records for one AgentCore trace and reconstructs a
- * conversation pair from them. A single log group/stream carries four record
- * shapes multiplexed together (see classifyRecord):
- *   - SPAN: the OTel span (name/kind/startTimeUnixNano at top level). Carries
- *     harness.id, gen_ai.request.model, session.id — never message text.
- *   - STRANDS_AGGREGATE: a whole-trace input/output summary logged by the
- *     Strands Agents framework's tracer (scope.name === "strands.telemetry.tracer"),
- *     body.input.messages/output.messages.
- *   - GENAI_EVENT: one message at a time (eventName starting "gen_ai."),
- *     emitted by generic botocore auto-instrumentation — framework-agnostic,
- *     used when no Strands aggregate is present.
- *   - OTHER: plain OTel logs and EMF metrics — discarded.
- *
- * All four carry the same traceId and resource.attributes (including
- * "cloud.resource_id", the runtime ARN), so identity is resolved by merging
- * across every record in a trace rather than reading a single one.
+ * Parses CloudWatch log records for one AgentCore trace into a conversation pair.
+ * Records come in 4 shapes (see classifyRecord): SPAN, STRANDS_AGGREGATE
+ * (whole-trace summary from the Strands tracer), GENAI_EVENT (per-message,
+ * framework-agnostic), OTHER (discarded). All share one traceId, so identity
+ * and content are resolved by merging across every record in the trace.
  */
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
 
-/** Classifies one parsed CloudWatch Logs record by shape — see file header. */
+/** Classifies one parsed CloudWatch Logs record by shape. */
 function classifyRecord(record) {
     if (typeof record.traceId === 'string' && record.traceId
         && typeof record.spanId === 'string' && record.spanId
@@ -34,7 +23,7 @@ function classifyRecord(record) {
     return 'OTHER';
 }
 
-/** Parses one CloudWatch log event's message as JSON. Returns null for anything unparseable (each JSON line has a plain-text duplicate logged alongside it, so this is routine). */
+/** Parses one CloudWatch log event's message as JSON, or null if unparseable. */
 function parseLogRecord(logEvent) {
     try {
         return JSON.parse(logEvent.message);
@@ -43,20 +32,20 @@ function parseLogRecord(logEvent) {
     }
 }
 
-/** Pulls the runtime ID out of its full ARN (arn:aws:bedrock-agentcore:region:account:runtime/<runtime-id>/runtime-endpoint/<endpoint>). */
+/** Pulls the runtime ID out of its ARN. */
 function extractRuntimeIdFromArn(arn) {
     const match = arn?.match(/:runtime\/([^/]+)\//);
     return match ? match[1] : '';
 }
 
-/** Pulls a harness's own name out of its runtime's service.name (e.g. "harness_wb5n7.DEFAULT" -> "wb5n7") — AgentCore always names a Harness-backed runtime "harness_<harnessName>". */
+/** Pulls a harness's name out of its runtime's service.name ("harness_wb5n7.DEFAULT" -> "wb5n7"). */
 function extractHarnessNameFromServiceName(serviceName) {
     const runtimeName = serviceName?.split('.')[0] || '';
     const match = runtimeName.match(/^harness_(.+)$/);
     return match ? match[1] : '';
 }
 
-/** Pulls identity fields off one record. Uniform across spans and content records; harness.id/gen_ai.request.model are typically only present on spans, which is why resolveTraceIdentity merges across a whole trace. */
+/** Pulls identity fields off one record. */
 function extractIdentityFromRecord(record) {
     const resourceAttrs = record.resource?.attributes || {};
     const attributes = record.attributes || {};
@@ -74,7 +63,7 @@ function extractIdentityFromRecord(record) {
     };
 }
 
-/** Merges identity fields across every record sharing one traceId. First non-empty value per field wins. */
+/** Merges identity fields across every record sharing one traceId — first non-empty value per field wins. */
 function resolveTraceIdentity(records) {
     const merged = { traceId: '', spanId: '', resourceArn: '', runtimeId: '', harnessId: '', serviceName: '', sessionId: '', modelId: '', startTimeUnixNano: null };
     for (const record of records) {
@@ -86,7 +75,7 @@ function resolveTraceIdentity(records) {
     return merged;
 }
 
-/** Reads message text out of one input/output message object. `content` takes several shapes (plain string, content-block array, JSON-encoded-string wrapper, plain-string `.message` field) — all handled here. */
+/** Reads message text out of one input/output message object, across its several possible content shapes. */
 function extractMessageText(message) {
     const content = message?.content;
     if (typeof content === 'string') return content;
@@ -106,13 +95,13 @@ function extractMessageText(message) {
     return '';
 }
 
-/** Extracts text out of a gen_ai event's content-block array (e.g. [{text: "..."}]). */
+/** Extracts text out of a gen_ai event's content-block array. */
 function extractTextFromContentBlocks(content) {
     if (!Array.isArray(content)) return '';
     return content.map((c) => c?.text || '').filter(Boolean).join(' ');
 }
 
-/** Extracts the conversation pair from a Strands whole-trace aggregate: last user message in input.messages, paired with the last assistant message in output.messages. */
+/** Extracts a conversation pair from a Strands whole-trace aggregate. */
 function extractConversationContentFromStrandsAggregate(record) {
     const inputMessages = record.body?.input?.messages || [];
     const outputMessages = record.body?.output?.messages || [];
@@ -124,7 +113,7 @@ function extractConversationContentFromStrandsAggregate(record) {
     };
 }
 
-/** Reconstructs a conversation pair from individual gen_ai.*.message/gen_ai.choice events — the framework-agnostic fallback. Prefers gen_ai.choice over a raw gen_ai.assistant.message when both are present. */
+/** Framework-agnostic fallback: reconstructs a conversation pair from individual gen_ai.* events. */
 function extractConversationContentFromGenAiEvents(records) {
     const userTexts = records.filter((r) => r.eventName === 'gen_ai.user.message').map((r) => extractTextFromContentBlocks(r.body?.content));
     const choiceTexts = records.filter((r) => r.eventName === 'gen_ai.choice').map((r) => extractTextFromContentBlocks(r.body?.message?.content));
@@ -135,33 +124,100 @@ function extractConversationContentFromGenAiEvents(records) {
     };
 }
 
-/** Resolves conversation content for one trace: prefers the last STRANDS_AGGREGATE record (child spans close, and log, before their parent, so the last one reflects the outermost span's whole-trace view). Falls back to GENAI_EVENT reconstruction otherwise. */
+/** Only reliable userMessage source in a multi-round tool-using trace — generic gen_ai.user.message gets repurposed for tool-result feedback by later rounds. */
+function extractUserMessageFromHarnessConversationEvent(records) {
+    const event = records.find((r) => r.eventName === 'gen_ai.HarnessConversationRole.user.message');
+    return event ? extractTextFromContentBlocks(event.body?.content) : '';
+}
+
+/** Resolves conversation content for one trace, preferring the most reliable source per field with fallbacks. */
 function resolveTraceContent(records) {
+    let userMessage = extractUserMessageFromHarnessConversationEvent(records);
+    let agentResponse = '';
+
     const strandsAggregates = records.filter((r) => classifyRecord(r) === 'STRANDS_AGGREGATE');
-    if (strandsAggregates.length > 0) return extractConversationContentFromStrandsAggregate(strandsAggregates[strandsAggregates.length - 1]);
+    if (strandsAggregates.length > 0) {
+        const fromAggregate = extractConversationContentFromStrandsAggregate(strandsAggregates[strandsAggregates.length - 1]);
+        agentResponse = fromAggregate.agentResponse;
+        if (!userMessage) userMessage = fromAggregate.userMessage;
+    }
 
-    const genAiEvents = records.filter((r) => classifyRecord(r) === 'GENAI_EVENT');
-    if (genAiEvents.length > 0) return extractConversationContentFromGenAiEvents(genAiEvents);
+    if (!userMessage || !agentResponse) {
+        const genAiEvents = records.filter((r) => classifyRecord(r) === 'GENAI_EVENT');
+        if (genAiEvents.length > 0) {
+            const fromEvents = extractConversationContentFromGenAiEvents(genAiEvents);
+            if (!userMessage) userMessage = fromEvents.userMessage;
+            if (!agentResponse) agentResponse = fromEvents.agentResponse;
+        }
+    }
 
-    return { userMessage: '', agentResponse: '' };
+    return { userMessage, agentResponse: stripThinkingBlock(agentResponse) };
+}
+
+/** Strips a leading <thinking>...</thinking> block so the dashboard shows a clean final answer, not raw reasoning. */
+function stripThinkingBlock(text) {
+    if (!text) return text;
+    return text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim();
+}
+
+/** Pulls an action-type label out of a tool call's input — checks the direct shape, then one level into every input key (AWS built-in tools nest it under a tool-specific wrapper key). */
+function extractToolActionType(input) {
+    if (!input || typeof input !== 'object') return 'unknown';
+    if (input.action?.type) return input.action.type;
+    for (const value of Object.values(input)) {
+        if (value?.action?.type) return value.action.type;
+    }
+    return 'unknown';
+}
+
+/** Extracts the tool-call execution chain for one trace from its gen_ai.assistant.message/gen_ai.tool.message records. */
+function extractAgentCoreExecutionFlow(records, botName) {
+    const resultsByToolUseId = {};
+    for (const record of records) {
+        if (record.eventName !== 'gen_ai.tool.message') continue;
+        const toolUseId = record.body?.id;
+        if (toolUseId) resultsByToolUseId[toolUseId] = extractTextFromContentBlocks(record.body?.content);
+    }
+
+    const toolCalls = [];
+    for (const record of records) {
+        if (record.eventName !== 'gen_ai.assistant.message') continue;
+        for (const block of record.body?.content || []) {
+            if (block?.toolUse) toolCalls.push(block.toolUse);
+        }
+    }
+    if (toolCalls.length === 0) return { executionFlow: [], toolsSummary: {} };
+
+    const tools = new Set();
+    const actions = new Set();
+    const executionFlow = [{ step: 0, type: 'agent', name: botName, action: 'orchestrate', description: 'Agent orchestrating tool calls' }];
+
+    toolCalls.forEach((toolUse, i) => {
+        const tool = toolUse.name || 'unknown';
+        const action = extractToolActionType(toolUse.input);
+        executionFlow.push({ step: i + 1, type: 'tool-call', tool, action, toolUseId: toolUse.toolUseId || '', result: resultsByToolUseId[toolUse.toolUseId] || '' });
+        tools.add(tool);
+        actions.add(action);
+    });
+
+    return {
+        executionFlow,
+        toolsSummary: {
+            agentOrchestrator: botName,
+            tools: [...tools],
+            actions: [...actions],
+            totalToolCalls: toolCalls.length,
+            executionPattern: `${botName}→${[...tools].join('→')}`
+        }
+    };
 }
 
 /**
- * Adapts one trace's resolved identity+content into the pair shape
- * discovery.js's createStandardMessage expects.
- *
- * harness.id and gen_ai.request.model only exist on the raw span record,
- * which this pipeline doesn't read (see logGroupReader.js). Both are instead
- * derived from data every content record carries: a runtime's service.name
- * gives its harness's name, and that harness's ID, name, role ARN, and
- * configured model are already known from discovery.
- *
- * harnessNameToResourceMap (not roleNameToResourceMap) is used for every
- * Harness-related lookup here because a Harness and the Runtime it
- * auto-provisions commonly share one execution role — a role-name-keyed
- * lookup can return the Runtime's data instead of the Harness's.
+ * Adapts one trace's resolved identity+content into the pair shape createStandardMessage
+ * expects. Uses harnessNameToResourceMap (not roleNameToResourceMap) for Harness lookups
+ * since a Harness and its auto-provisioned Runtime commonly share one execution role.
  */
-function buildConversationPair(identity, content, logGroup, roleNameToResourceMap, harnessNameToResourceMap) {
+function buildConversationPair(identity, content, logGroup, roleNameToResourceMap, harnessNameToResourceMap, records) {
     const runtimeId = identity.runtimeId || logGroup.runtimeId || '';
     let harnessId = identity.harnessId;
     let knownHarness = null;
@@ -214,7 +270,7 @@ function buildConversationPair(identity, content, logGroup, roleNameToResourceMa
         outputTokenCount: 0,
         userMessage: content.userMessage,
         agentResponse: content.agentResponse,
-        traceData: { traceId: identity.traceId, sessionId: identity.sessionId }
+        traceData: { traceId: identity.traceId, sessionId: identity.sessionId, ...extractAgentCoreExecutionFlow(records || [], resourceName) }
     };
 }
 

@@ -76,7 +76,7 @@ async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourc
             const content = resolveTraceContent(records);
             if (!content.userMessage && !content.agentResponse) continue;
             const identity = resolveTraceIdentity(records);
-            const pair = buildConversationPair(identity, content, logGroup, roleNameToResourceMap, harnessNameToResourceMap);
+            const pair = buildConversationPair(identity, content, logGroup, roleNameToResourceMap, harnessNameToResourceMap, records);
             messages.push(await createTraceStandardMessage(pair));
         } catch (error) {
             console.error(`❌ Error building AgentCore message for trace ${traceId}: ${error.message}`);
