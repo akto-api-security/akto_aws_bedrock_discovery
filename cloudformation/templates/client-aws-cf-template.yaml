@@ -38,8 +38,8 @@ Parameters:
     Type: String
     Description: >
       Version of Lambda code to deploy. Check with AKTO team for the latest
-      version. Gateway interception requires v1.6 or later.
-    Default: 'v1.6'
+      version. Gateway interception requires v4.1 or later.
+    Default: 'v4.1'
     AllowedPattern: '^v[0-9]+\.[0-9]+$'
     ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
 

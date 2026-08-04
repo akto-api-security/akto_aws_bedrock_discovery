@@ -173,9 +173,14 @@ function buildUpdateParams(gateway, interceptorConfigurations) {
         gatewayIdentifier: gateway.gatewayId,
         name: gateway.name,
         roleArn: gateway.roleArn,
-        authorizerType: gateway.authorizerType,
-        interceptorConfigurations
+        authorizerType: gateway.authorizerType
     };
+    // AWS rejects an empty list ("Member must have length greater than or equal
+    // to 1"), so clearing every interceptor means omitting the field entirely —
+    // which this full-replace API treats as "no interceptors".
+    if (interceptorConfigurations && interceptorConfigurations.length) {
+        params.interceptorConfigurations = interceptorConfigurations;
+    }
     for (const field of PRESERVED_FIELDS) {
         if (gateway[field] !== undefined && gateway[field] !== null) params[field] = gateway[field];
     }
@@ -197,8 +202,10 @@ async function sendGatewayUpdate(gateway, interceptorConfigurations) {
     try {
         return await bedrockAgentCoreControlClient.send(new UpdateGatewayCommand(params));
     } catch (error) {
-        const rejectsProtocol = 'protocolType' in params
-            && (error?.name === 'ValidationException' || /protocol/i.test(error?.message || ''));
+        // Only when the API actually complains about protocolType — a bare
+        // ValidationException is far more likely to be something else, and
+        // retrying on it produces a misleading log line about the wrong field.
+        const rejectsProtocol = 'protocolType' in params && /protocol/i.test(error?.message || '');
         if (!rejectsProtocol) throw error;
 
         console.warn(`⚠️ ${gateway.gatewayId}: UpdateGateway rejected protocolType (${error.message}) — retrying without it`);
