@@ -296,8 +296,12 @@ async function rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft) {
     const roleList = Object.entries(roleToResourcesMap).map(([role, resources]) =>
         `${role}: ${resources.map(r => `${r.agentName}(${r.type})`).join(', ')}`
     );
-    console.log(`✅ Role map rebuilt: ${Object.keys(roleToResourcesMap).length} role(s) mapped`);
-    console.log(`📋 Role map:\n${roleList.map(r => `  ├─ ${r}`).join('\n')}`);
+    console.log(`✅ Role map rebuilt: ${roleList.length} role(s) mapped`);
+    // Only print the map when there's something in it — an empty header followed by
+    // a blank line reads like a failure when it just means no agents yet.
+    if (roleList.length > 0) {
+        console.log(`📋 Role map:\n${roleList.map((r) => `  ├─ ${r}`).join('\n')}`);
+    }
 }
 
 module.exports = {

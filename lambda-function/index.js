@@ -32,6 +32,36 @@ function logMemory(label) {
 }
 
 /**
+ * Prints the configuration actually in effect. Most "it found nothing" reports come
+ * down to a bucket, prefix, or endpoint being different from what was assumed —
+ * having it in the log removes a round trip. Never prints the API key.
+ */
+function logEffectiveConfig() {
+    let ingestHost = 'unset';
+    try {
+        ingestHost = new URL(config.DATA_INGESTION_ENDPOINT).host;
+    } catch { /* leave as unset — validateConfig will have already failed on a blank value */ }
+
+    console.log('⚙️ Effective configuration:');
+    console.log(`  ├─ region              ${config.AWS_REGION} (account ${config.AWS_ACCOUNT_ID})`);
+    console.log(`  ├─ bedrock logs        s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}`);
+    console.log(`  ├─ checkpoints         s3://${config.MARKERS_BUCKET_NAME}/${config.MARKERS_PREFIX}`);
+    console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}*`);
+    console.log(`  ├─ akto ingest host    ${ingestHost} (api key ${config.AKTO_API_KEY ? 'set' : 'MISSING'})`);
+    console.log(`  └─ lookback            ${config.LOOKBACK_DAYS}d s3 / ${config.TRACE_LOOKBACK_DAYS}d traces`);
+}
+
+/** Wraps a pipeline so its wall-clock cost is visible — the two share one Lambda time budget. */
+async function timed(label, fn) {
+    const startedAt = Date.now();
+    try {
+        return await fn();
+    } finally {
+        console.log(`⏳ ${label} took ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+    }
+}
+
+/**
  * Sends a batch to AKTO, THEN checkpoints the manifest — in that order, so a
  * failed send never advances "last processed" past data that was never
  * actually delivered.
@@ -62,10 +92,19 @@ async function flushTrace(messages, discoveredAgents, logGroupCheckpoints) {
  * traceId first, then identity+content resolved jointly per trace.
  */
 async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap) {
+    // Counted rather than logged per record: a busy log group holds thousands of
+    // spans, and the useful question is "where did they all go", not "what was
+    // record 4,812". One summary line per log group answers that.
+    const stats = { unparseable: 0, other: 0, noTraceId: 0, SPAN: 0, STRANDS_AGGREGATE: 0, GENAI_EVENT: 0, emptyContent: 0, failed: 0 };
+
     const recordsByTraceId = new Map();
     for (const event of events) {
         const record = parseLogRecord(event);
-        if (!record || classifyRecord(record) === 'OTHER' || !record.traceId) continue;
+        if (!record) { stats.unparseable++; continue; }
+        const kind = classifyRecord(record);
+        if (kind === 'OTHER') { stats.other++; continue; }
+        if (!record.traceId) { stats.noTraceId++; continue; }
+        stats[kind]++;
         if (!recordsByTraceId.has(record.traceId)) recordsByTraceId.set(record.traceId, []);
         recordsByTraceId.get(record.traceId).push(record);
     }
@@ -74,13 +113,27 @@ async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourc
     for (const [traceId, records] of recordsByTraceId) {
         try {
             const content = resolveTraceContent(records);
-            if (!content.userMessage && !content.agentResponse) continue;
+            if (!content.userMessage && !content.agentResponse) { stats.emptyContent++; continue; }
             const identity = resolveTraceIdentity(records);
             const pair = buildConversationPair(identity, content, logGroup, roleNameToResourceMap, harnessNameToResourceMap, records);
             messages.push(await createTraceStandardMessage(pair));
         } catch (error) {
+            stats.failed++;
             console.error(`❌ Error building AgentCore message for trace ${traceId}: ${error.message}`);
         }
+    }
+
+    console.log(`🧾 ${logGroup.logGroupName}: ${events.length} event(s) → ${recordsByTraceId.size} trace(s) → ${messages.length} message(s) | ${JSON.stringify(stats)}`);
+
+    // Events arrived but produced nothing — say which stage swallowed them, since
+    // otherwise this looks identical to "no traffic at all".
+    if (events.length > 0 && messages.length === 0) {
+        const reason = stats.emptyContent > 0
+            ? `${stats.emptyContent} trace(s) carried no user/agent message — spans present but conversation content missing`
+            : recordsByTraceId.size === 0
+                ? `no usable records: ${stats.other} unrecognised, ${stats.noTraceId} without a traceId, ${stats.unparseable} unparseable`
+                : `${stats.failed} trace(s) failed to build`;
+        console.warn(`⚠️ ${logGroup.logGroupName}: no messages produced — ${reason}`);
     }
     return messages;
 }
@@ -194,8 +247,9 @@ async function runAgentCorePipeline(timeLeft) {
 
         if (events.length === 0) continue;
 
+        // buildTraceMessagesForLogGroup already logs the full event → trace → message
+        // accounting for this group, so there's nothing to restate here.
         const messages = await buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap);
-        console.log(`✅ ${logGroup.logGroupName}: ${events.length} log event(s) → ${messages.length} message(s)`);
         logGroupCheckpoints[logGroup.logGroupName] = { lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId };
 
         if (messages.length > 0) {
@@ -224,20 +278,37 @@ exports.handler = async (event, context) => {
     logMemory('start');
 
     const timeLeft = () => context.getRemainingTimeInMillis();
+    const startedAt = Date.now();
 
     try {
         config.validateConfig();
+        logEffectiveConfig();
 
-        const bedrockAgentClassic = await runS3Pipeline(timeLeft);
+        const bedrockAgentClassic = await timed('Bedrock Agent Classic pipeline', () => runS3Pipeline(timeLeft));
         logMemory('after S3 pipeline');
 
-        const agentCore = await runAgentCorePipeline(timeLeft);
+        const agentCore = await timed('AgentCore pipeline', () => runAgentCorePipeline(timeLeft));
         logMemory('end');
+
+        // One structured line per run, so CloudWatch Insights can chart throughput
+        // and spot deferrals without parsing prose:
+        //   fields @timestamp, @message | filter @message like /RUN SUMMARY/
+        const summary = {
+            durationMs: Date.now() - startedAt,
+            timeLeftMs: timeLeft(),
+            messagesSent: bedrockAgentClassic.totalSent + agentCore.totalSent,
+            s3: bedrockAgentClassic,
+            agentCore
+        };
+        console.log(`📊 RUN SUMMARY ${JSON.stringify(summary)}`);
+        if (bedrockAgentClassic.filesDeferred > 0 || agentCore.groupsDeferred > 0) {
+            console.warn(`⏱️ Work was deferred to the next run (${bedrockAgentClassic.filesDeferred} file(s), ${agentCore.groupsDeferred} log group(s)) — expected while catching up on a backlog, but persistent deferrals mean the schedule can't keep pace`);
+        }
 
         return { statusCode: 200, body: JSON.stringify({ bedrockAgentClassic, agentCore }) };
 
     } catch (error) {
-        console.error(`❌ Handler failed: ${error.message}`);
+        console.error(`❌ Handler failed after ${((Date.now() - startedAt) / 1000).toFixed(1)}s: ${error.message}`);
         console.error(error.stack);
         return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
     }
