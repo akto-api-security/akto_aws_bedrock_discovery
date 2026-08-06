@@ -47,6 +47,15 @@ const EXCLUDE_GATEWAY_IDS = parseIdList(process.env.EXCLUDE_GATEWAY_IDS);
 // Logs every attach decision without calling UpdateGateway — use before the
 // first real run against a client account.
 const INTERCEPTOR_DRY_RUN = String(process.env.INTERCEPTOR_DRY_RUN || '').trim().toLowerCase() === 'true';
+// Gateways get their own marker folder, like the S3 and trace pipelines, so their
+// discovery bookkeeping never contends with either checkpoint.
+const GATEWAY_MARKERS_PREFIX = `${MARKERS_PREFIX}agentcore-gateways/`;
+const GATEWAY_MANIFEST_KEY = `${GATEWAY_MARKERS_PREFIX}manifest.json`;
+// Lambda caps all environment variables at 4KB combined. The published map only
+// carries gateways whose name can't be derived from their ID (normally none), so
+// this is an exception budget rather than a per-gateway cost — but it is measured
+// in real bytes so a few long names can't silently break the write.
+const GATEWAY_NAME_MAP_MAX_BYTES = 3000;
 
 /** Splits a comma-separated env var into a trimmed, non-empty list. */
 function parseIdList(value) {
@@ -67,6 +76,7 @@ module.exports = {
     SEND_BATCH_SIZE, FLUSH_THRESHOLD, TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, LOOKBACK_DAYS,
     RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH, TRACE_LOOKBACK_DAYS, TRACE_MARKERS_PREFIX, TRACE_MANIFEST_KEY,
     INTERCEPTOR_LAMBDA_ARN, INTERCEPTION_POINTS, INCLUDE_GATEWAY_IDS, EXCLUDE_GATEWAY_IDS, INTERCEPTOR_DRY_RUN,
+    GATEWAY_MARKERS_PREFIX, GATEWAY_MANIFEST_KEY, GATEWAY_NAME_MAP_MAX_BYTES,
     validateConfig,
     bedrockAgentClient: new BedrockAgentClient({ region: AWS_REGION }),
     bedrockAgentCoreControlClient: new BedrockAgentCoreControlClient({ region: AWS_REGION }),

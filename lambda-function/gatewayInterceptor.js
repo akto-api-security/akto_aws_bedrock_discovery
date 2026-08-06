@@ -18,12 +18,23 @@
  * sweep.
  */
 const { UpdateGatewayCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
-const { AddPermissionCommand, RemovePermissionCommand } = require('@aws-sdk/client-lambda');
+const {
+    AddPermissionCommand, RemovePermissionCommand,
+    GetFunctionConfigurationCommand, UpdateFunctionConfigurationCommand
+} = require('@aws-sdk/client-lambda');
 const {
     bedrockAgentCoreControlClient, lambdaClient, INTERCEPTION_POINTS,
-    INCLUDE_GATEWAY_IDS, EXCLUDE_GATEWAY_IDS
+    INCLUDE_GATEWAY_IDS, EXCLUDE_GATEWAY_IDS, GATEWAY_NAME_MAP_MAX_BYTES
 } = require('./config');
-const { listAllGateways, getGatewayDetail, buildHarnessGatewayMap, readAttachedInterceptors } = require('./gatewayDiscovery');
+const {
+    listAllGateways, getGatewayDetail, buildHarnessGatewayMap, readAttachedInterceptors, buildGatewayProfile
+} = require('./gatewayDiscovery');
+const { buildGatewayDiscoveryMessage } = require('./gatewayMessageBuilder');
+const {
+    getGatewayManifest, updateGatewayManifest, fingerprintProfile, needsAnnouncement, buildManifestEntry
+} = require('./gatewayManifest');
+const { sendToDataIngestionService } = require('./aktoClient');
+const { deriveGatewayName } = require('./gatewayNaming');
 
 // The gateway hands us request headers so guardrails can see them; they're
 // stripped of credentials before anything leaves for AKTO (interceptorPayload.js).
@@ -215,6 +226,126 @@ async function sendGatewayUpdate(gateway, interceptorConfigurations) {
 }
 
 /**
+ * Announces protected gateways to AKTO as discovered inventory, the same way agents
+ * and harnesses are announced, and checkpoints what was sent.
+ *
+ * Runs after the attach sweep rather than inside it: a slow or unreachable AKTO must
+ * never delay or fail attachment. Only gateways we actually protect are announced.
+ *
+ * Re-announces when a gateway's fingerprint moves (new target, changed authorizer,
+ * interception points gained or lost) so the inventory doesn't go stale, and skips
+ * everything unchanged so a 10-minute sweep stays quiet.
+ */
+async function announceGateways(gateways, { harnessMap = {}, dryRun = false } = {}) {
+    const summary = { announced: 0, unchanged: 0, failed: 0 };
+    if (gateways.length === 0) return summary;
+
+    const manifest = await getGatewayManifest();
+    const discovered = { ...(manifest.discoveredGateways || {}) };
+    const messages = [];
+    const pending = [];
+
+    for (const gateway of gateways) {
+        try {
+            const profile = await buildGatewayProfile(gateway, { harnessMap });
+            const fingerprint = fingerprintProfile(profile);
+            const previous = discovered[profile.gatewayId];
+            const { announce, reason } = needsAnnouncement(previous, fingerprint);
+
+            if (!announce) {
+                summary.unchanged++;
+                continue;
+            }
+            console.log(`🔔 ${profile.gatewayId} (${profile.name}): ${reason} — will announce to AKTO as ${profile.host}`);
+            if (dryRun) {
+                summary.announced++;
+                continue;
+            }
+            messages.push(buildGatewayDiscoveryMessage(profile));
+            pending.push({ profile, fingerprint, previous });
+        } catch (error) {
+            summary.failed++;
+            console.error(`❌ ${gateway.gatewayId}: could not build discovery profile — ${error.message}`);
+        }
+    }
+
+    if (messages.length === 0) {
+        if (summary.unchanged > 0) console.log(`✅ ${summary.unchanged} gateway(s) already announced and unchanged — nothing to send`);
+        return summary;
+    }
+
+    try {
+        // Checkpoint only after AKTO accepts, so a failed send is retried next sweep
+        // rather than being silently marked as announced.
+        await sendToDataIngestionService(messages);
+        for (const { profile, fingerprint, previous } of pending) {
+            discovered[profile.gatewayId] = buildManifestEntry(profile, fingerprint, previous);
+        }
+        summary.announced += pending.length;
+        await updateGatewayManifest(discovered);
+        console.log(`🎉 Gateway discovery: ${summary.announced} announced, ${summary.unchanged} unchanged, ${summary.failed} failed`);
+    } catch (error) {
+        summary.failed += pending.length;
+        console.error(`❌ Gateway discovery send failed (will retry next sweep, nothing checkpointed): ${error.message}`);
+    }
+    return summary;
+}
+
+/**
+ * Publishes a compact gatewayId → name map onto the interceptor function's
+ * environment, so live traffic can be tagged with the gateway *name* without the
+ * interceptor making an AWS call. It resolves its own gateway ID from the Host
+ * header; only the name needs supplying.
+ *
+ * Merges into the existing environment rather than replacing it — UpdateFunctionConfiguration
+ * overwrites the whole variable set, and blanking the AKTO endpoint would silently
+ * disable guardrails. Skips the write entirely when the map hasn't changed.
+ */
+async function publishGatewayNameMap(interceptorArn, gateways) {
+    if (!interceptorArn || gateways.length === 0) return false;
+
+    // Only gateways whose name the interceptor cannot work out for itself. For the
+    // standard "<name>-<suffix>" ID form that's none, so this map stays empty no
+    // matter how many gateways the account has — which is what keeps Lambda's 4KB
+    // environment limit from becoming a ceiling on gateway count.
+    const exceptions = gateways.filter((g) => g.gatewayId && g.name && g.name !== deriveGatewayName(g.gatewayId));
+
+    // Pack by real byte cost rather than a guessed entry count: a handful of very
+    // long names would otherwise sail past any fixed limit and fail the write.
+    const map = {};
+    let dropped = 0;
+    for (const gateway of exceptions) {
+        const candidate = JSON.stringify({ ...map, [gateway.gatewayId]: gateway.name });
+        if (Buffer.byteLength(candidate, 'utf8') > GATEWAY_NAME_MAP_MAX_BYTES) { dropped++; continue; }
+        map[gateway.gatewayId] = gateway.name;
+    }
+    if (dropped > 0) {
+        console.warn(`⚠️ ${dropped} gateway name(s) did not fit the environment budget — those gateways will be tagged with their derived name or ID instead`);
+    }
+    if (exceptions.length > 0) {
+        console.log(`ℹ️ ${exceptions.length} gateway name(s) can't be derived from their ID and are published explicitly; the other ${gateways.length - exceptions.length} derive theirs`);
+    }
+    const desired = JSON.stringify(map);
+
+    try {
+        const current = await lambdaClient.send(new GetFunctionConfigurationCommand({ FunctionName: interceptorArn }));
+        const variables = { ...(current.Environment?.Variables || {}) };
+        if (variables.GATEWAY_NAME_MAP === desired) return false;
+
+        await lambdaClient.send(new UpdateFunctionConfigurationCommand({
+            FunctionName: interceptorArn,
+            Environment: { Variables: { ...variables, GATEWAY_NAME_MAP: desired } }
+        }));
+        console.log(`🏷️ Published ${Object.keys(map).length} gateway name override(s) to the interceptor for traffic tagging`);
+        return true;
+    } catch (error) {
+        // Non-fatal: without the map, live traffic is tagged with the gateway ID.
+        console.error(`⚠️ Could not publish gateway names to the interceptor (traffic will be tagged with gateway IDs): ${error.message}`);
+        return false;
+    }
+}
+
+/**
  * Sweeps every gateway in the region and brings its interceptor config in line.
  * Safe to run repeatedly — that's the point, since it's what picks up gateways
  * created after deployment and repairs manual removals.
@@ -223,8 +354,11 @@ async function reconcileInterceptorAttachments({ interceptorArn, timeLeft, timeM
     const summary = {
         gatewaysFound: 0, attached: 0, alreadyAttached: 0, partiallyAttached: 0,
         skippedFiltered: 0, skippedNotReady: 0, skippedConflict: 0, skippedNoPermission: 0,
-        failed: 0, deferred: 0, dryRun
+        failed: 0, deferred: 0, announced: 0, announceUnchanged: 0, announceFailed: 0, dryRun
     };
+    // Gateways we end up protecting — announced to AKTO after the sweep. Includes
+    // already-attached ones so existing deployments are backfilled on upgrade.
+    const protectedGateways = [];
 
     if (!interceptorArn) {
         console.log('⏭️ No INTERCEPTOR_LAMBDA_ARN configured — gateway interception disabled, nothing to do');
@@ -300,6 +434,7 @@ async function reconcileInterceptorAttachments({ interceptorArn, timeLeft, timeM
                 console.log(`✅ ${gatewayId} (${gateway.name}): already attached on ${plan.points.join('+')}${plan.partial ? ' (partial — other points held by another interceptor)' : ''} — no update needed`);
                 summary.alreadyAttached++;
                 if (plan.partial) summary.partiallyAttached++;
+                protectedGateways.push(gateway);
                 continue;
             }
 
@@ -322,11 +457,22 @@ async function reconcileInterceptorAttachments({ interceptorArn, timeLeft, timeM
             console.log(`✅ ${gatewayId} (${gateway.name}): interceptor attached on ${plan.points.join('+')}${plan.partial ? ' (partial)' : ''} — ${callerLabel}`);
             summary.attached++;
             if (plan.partial) summary.partiallyAttached++;
+            // Announce with the config we just wrote, so the discovery message reports
+            // the interceptor as attached rather than the pre-attach state we read.
+            protectedGateways.push({ ...gateway, interceptorConfigurations: plan.interceptorConfigurations });
         } catch (error) {
             console.error(`❌ ${gatewayId}: attachment failed, skipping — ${error.message}`);
             summary.failed++;
         }
     }
+
+    // Names first, so live traffic can be tagged with them; then the discovery hits.
+    if (!dryRun) await publishGatewayNameMap(interceptorArn, protectedGateways);
+
+    const discovery = await announceGateways(protectedGateways, { harnessMap, dryRun });
+    summary.announced = discovery.announced;
+    summary.announceUnchanged = discovery.unchanged;
+    summary.announceFailed = discovery.failed;
 
     console.log(`🎉 Gateway sweep done: ${JSON.stringify(summary)}`);
     return summary;
@@ -395,5 +541,6 @@ async function detachAllInterceptors({ interceptorArn, dryRun = false } = {}) {
 
 module.exports = {
     reconcileInterceptorAttachments, detachAllInterceptors, planAttachment,
+    announceGateways, publishGatewayNameMap,
     buildUpdateParams, ensureInvokePermission, removeInvokePermission, statementId
 };

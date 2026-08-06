@@ -6,7 +6,37 @@
  * in as requestPayload/responsePayload strings under a synthetic POST /mcp.
  */
 const { STATUS_CODES } = require('http');
-const { AKTO_CONNECTOR, AKTO_ACCOUNT_ID, CONTEXT_SOURCE, SENSITIVE_HEADERS } = require('./interceptorConfig');
+const {
+    AKTO_CONNECTOR, AKTO_ACCOUNT_ID, CONTEXT_SOURCE, SENSITIVE_HEADERS,
+    AWS_REGION, AWS_ACCOUNT_ID, GATEWAY_NAME_MAP
+} = require('./interceptorConfig');
+const { deriveGatewayName, extractGatewayIdFromHost } = require('./gatewayNaming');
+
+/**
+ * Resolves which gateway this call came through, from the Host header.
+ *
+ * Name resolution is three-tier, cheapest and most reliable first:
+ *   1. the map the attacher published — authoritative, but only carries exceptions
+ *   2. derived from the gateway ID — correct for the standard "<name>-<suffix>" form,
+ *      which is why the map stays tiny regardless of how many gateways exist
+ *   3. the raw ID — never empty, never wrong-looking
+ *
+ * Note that the AKTO collection does NOT depend on any of this: the Host header is
+ * forwarded verbatim and AKTO groups by it. If AWS changes its hostname format, the
+ * worst case is thinner tags, not misgrouped or unguarded traffic.
+ */
+function resolveGatewayIdentity(headers) {
+    const hostKey = Object.keys(headers || {}).find((k) => k.toLowerCase() === 'host');
+    const host = hostKey ? String(headers[hostKey]).split(':')[0] : '';
+    const { gatewayId, confidence } = extractGatewayIdFromHost(host);
+    if (!gatewayId) return { host, gatewayId: '', gatewayName: '', confidence };
+    return {
+        host,
+        gatewayId,
+        gatewayName: GATEWAY_NAME_MAP[gatewayId] || deriveGatewayName(gatewayId),
+        confidence
+    };
+}
 
 /** True for a JSON-RPC 2.0 body — i.e. MCP traffic rather than a plain gen-AI call. */
 function isMcpBody(body) {
@@ -47,15 +77,34 @@ function statusPhrase(code) {
     return STATUS_CODES[code] || '';
 }
 
-/** Tags drive which AKTO collection this shows up under. */
-function buildTags(isMcp) {
-    return isMcp
-        ? { 'mcp-server': 'MCP Server', service: AKTO_CONNECTOR }
-        : { 'gen-ai': 'Gen AI', service: AKTO_CONNECTOR };
+/**
+ * Tags for a live call. The identity half (source / agentType / bot-name / gateway-id)
+ * mirrors what gatewayMessageBuilder.js puts on the discovery message, so the gateway
+ * AKTO discovered and the traffic flowing through it are recognisably the same thing.
+ */
+function buildTags(isMcp, identity = {}) {
+    const kind = isMcp ? { 'mcp-server': 'MCP Server' } : { 'gen-ai': 'Gen AI' };
+    const tags = {
+        source: 'AWS_BEDROCK',
+        ...kind,
+        service: AKTO_CONNECTOR,
+        agentType: 'AGENTCORE_GATEWAY',
+        'bot-name': identity.gatewayName || identity.gatewayId || '',
+        'gateway-id': identity.gatewayId || '',
+        'account-id': AWS_ACCOUNT_ID,
+        region: AWS_REGION
+    };
+    for (const [key, value] of Object.entries(tags)) {
+        if (value === '') delete tags[key];
+    }
+    return tags;
 }
 
 function buildIngestPayload({ requestPayload, responsePayload, requestHeaders, responseHeaders, statusCode, isMcp }) {
-    const tags = buildTags(isMcp);
+    // Resolve before ensureHost, so identity comes from the gateway's real Host header
+    // rather than the synthetic fallback.
+    const identity = resolveGatewayIdentity(requestHeaders);
+    const tags = buildTags(isMcp, identity);
     const code = statusCode === null || statusCode === undefined ? 200 : statusCode;
     const headers = ensureHost(requestHeaders, isMcp);
     return {
@@ -80,4 +129,4 @@ function buildIngestPayload({ requestPayload, responsePayload, requestHeaders, r
     };
 }
 
-module.exports = { buildIngestPayload, buildTags, cleanHeaders, ensureHost, clientIp, statusPhrase, isMcpBody };
+module.exports = { buildIngestPayload, buildTags, cleanHeaders, ensureHost, clientIp, statusPhrase, isMcpBody, resolveGatewayIdentity };

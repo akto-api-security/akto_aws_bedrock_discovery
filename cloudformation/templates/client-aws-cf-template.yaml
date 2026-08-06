@@ -254,6 +254,8 @@ Resources:
         Variables:
           DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
           AKTO_API_KEY: !Ref AktoApiKey
+          BEDROCK_AWS_REGION: !Ref 'AWS::Region'
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
       Description: 'AKTO AgentCore Gateway interceptor - real-time guardrails on MCP tools/call traffic (fails open)'
 
   # ===========================================================================
@@ -307,13 +309,40 @@ Resources:
                     'iam:PassedToService': 'bedrock-agentcore.amazonaws.com'
               # Lets each discovered gateway invoke the interceptor, via a
               # resource policy on our own function — the client's gateway role
-              # is never modified. Scoped to the interceptor function only.
+              # is never modified. GetFunctionConfiguration/UpdateFunctionConfiguration
+              # publish the gatewayId->name map the interceptor uses to tag traffic.
+              # All scoped to the interceptor function only.
               - Effect: Allow
                 Action:
                   - 'lambda:AddPermission'
                   - 'lambda:RemovePermission'
                   - 'lambda:GetPolicy'
+                  - 'lambda:GetFunctionConfiguration'
+                  - 'lambda:UpdateFunctionConfiguration'
                 Resource: !GetAtt AktoInterceptorFunction.Arn
+              # Gateway metadata for discovery messages: the customer's own tags on
+              # the gateway, and each target's backend configuration.
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:ListTagsForResource'
+                  - 'bedrock-agentcore:GetGatewayTarget'
+                Resource: '*'
+              # Attached policy names on the gateway's execution role — the same
+              # role enrichment agents and harnesses already get.
+              - Effect: Allow
+                Action:
+                  - 'iam:ListAttachedRolePolicies'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              # Gateway discovery checkpoint, so a gateway is announced to AKTO once
+              # rather than on every sweep. Confined to AKTO's own marker prefix.
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${MarkersBucketName}'
+                  - !Sub 'arn:aws:s3:::${MarkersBucketName}/akto/markers/*'
 
   AktoGatewayAttacherFunction:
     Type: AWS::Lambda::Function
@@ -331,9 +360,12 @@ Resources:
       Environment:
         Variables:
           INTERCEPTOR_LAMBDA_ARN: !GetAtt AktoInterceptorFunction.Arn
+          DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
+          AKTO_API_KEY: !Ref AktoApiKey
+          MARKERS_BUCKET_NAME: !Ref MarkersBucketName
           BEDROCK_AWS_REGION: !Ref 'AWS::Region'
           AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
-      Description: 'Auto-detects AgentCore Gateways and keeps the AKTO interceptor attached to them (idempotent reconcile)'
+      Description: 'Auto-detects AgentCore Gateways, announces them to AKTO as discovered inventory, and keeps the interceptor attached'
 
   # Lets the shared discovery schedule invoke the attacher too, so gateways
   # created after deployment get picked up and manual removals self-heal.

@@ -50,6 +50,32 @@ const AKTO_ACCOUNT_ID = process.env.AKTO_ACCOUNT_ID || '1000000';
 const CONTEXT_SOURCE = 'AGENTIC';
 const INTERCEPTOR_OUTPUT_VERSION = '1.0';
 
+// Used to tag live traffic the same way discovery tags the gateway, so both land on
+// the same AKTO collection with the same identity.
+const AWS_REGION = process.env.BEDROCK_AWS_REGION || process.env.AWS_REGION || '';
+const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '';
+
+/**
+ * gatewayId → gateway name, published by the attacher (gatewayInterceptor.js).
+ * The interceptor resolves its own gateway ID from the Host header, but the name is
+ * only obtainable from the control plane — and this function stays deliberately free
+ * of the AWS SDK, so the attacher hands it over via the environment instead.
+ * Absent or malformed, traffic is tagged with the gateway ID.
+ */
+function parseGatewayNameMap() {
+    const raw = (process.env.GATEWAY_NAME_MAP || '').trim();
+    if (!raw) return {};
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+        console.error('⚠️ GATEWAY_NAME_MAP is not valid JSON — traffic will be tagged with gateway IDs');
+        return {};
+    }
+}
+
+const GATEWAY_NAME_MAP = parseGatewayNameMap();
+
 // Stripped before anything is shipped to AKTO — these carry the caller's
 // credentials, and the guardrail decision never needs them.
 const SENSITIVE_HEADERS = new Set([
@@ -58,5 +84,6 @@ const SENSITIVE_HEADERS = new Set([
 
 module.exports = {
     HTTP_PROXY_ENDPOINT, AKTO_API_KEY, GUARDED_METHODS, GUARDRAIL_TIMEOUT_MS,
-    AKTO_CONNECTOR, AKTO_ACCOUNT_ID, CONTEXT_SOURCE, INTERCEPTOR_OUTPUT_VERSION, SENSITIVE_HEADERS
+    AKTO_CONNECTOR, AKTO_ACCOUNT_ID, CONTEXT_SOURCE, INTERCEPTOR_OUTPUT_VERSION, SENSITIVE_HEADERS,
+    AWS_REGION, AWS_ACCOUNT_ID, GATEWAY_NAME_MAP
 };

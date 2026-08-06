@@ -7,8 +7,12 @@
  * empty result rather than throwing, so a permissions gap or an unsupported
  * region degrades to "no gateways found" instead of failing the invocation.
  */
-const { ListGatewaysCommand, GetGatewayCommand, ListGatewayTargetsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
-const { bedrockAgentCoreControlClient } = require('./config');
+const {
+    ListGatewaysCommand, GetGatewayCommand, ListGatewayTargetsCommand,
+    GetGatewayTargetCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand
+} = require('@aws-sdk/client-bedrock-agentcore-control');
+const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
+const { bedrockAgentCoreControlClient, iamClient, AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
 const { listAllPages, listAllHarnesses, getHarnessMetadata } = require('./traceDiscovery');
 
 const gatewayDetailCache = {};
@@ -156,7 +160,152 @@ async function summarizeGateway(gatewayArn) {
     return out;
 }
 
+/** The customer's own AWS tags on the gateway — same treatment agents and harnesses get. */
+async function getGatewayTags(gatewayArn) {
+    if (!gatewayArn) return {};
+    try {
+        return (await bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: gatewayArn }))).tags || {};
+    } catch (error) {
+        console.error(`⚠️ Tag fetch failed for gateway ${gatewayArn}: ${error.message}`);
+        return {};
+    }
+}
+
+/**
+ * Per-target detail — the backend this gateway actually fronts. The summary from
+ * ListGatewayTargets omits the target configuration, which is where the backend
+ * endpoint and credential provider live, so each target costs one GetGatewayTarget.
+ */
+async function getGatewayTargetDetail(gatewayId, targetId) {
+    try {
+        return await bedrockAgentCoreControlClient.send(new GetGatewayTargetCommand({
+            gatewayIdentifier: gatewayId, targetId
+        }));
+    } catch (error) {
+        console.error(`⚠️ GetGatewayTarget failed for ${gatewayId}/${targetId}: ${error.message}`);
+        return null;
+    }
+}
+
+/** Attached policy names on the gateway's execution role. Mirrors the agent/harness role enrichment. */
+async function getGatewayRolePolicies(roleArn) {
+    const roleName = roleArn ? String(roleArn).split('/').pop() : '';
+    if (!roleName) return '';
+    try {
+        const response = await iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
+        return (response.AttachedPolicies || []).map((p) => p.PolicyName).join(',');
+    } catch (error) {
+        console.error(`⚠️ Policy list failed for gateway role ${roleName}: ${error.message}`);
+        return '';
+    }
+}
+
+/** Host portion of a gateway URL — the value AKTO groups traffic by, so discovery must match live traffic. */
+function gatewayHostFromUrl(gatewayUrl, gatewayId) {
+    try {
+        return new URL(gatewayUrl).host;
+    } catch {
+        // Synthesised from the documented URL shape when the gateway has no URL yet.
+        return `${gatewayId}.gateway.bedrock-agentcore.${AWS_REGION}.amazonaws.com`;
+    }
+}
+
+/**
+ * Everything worth knowing about one gateway, flattened into tag-friendly strings —
+ * the gateway equivalent of the metadata agents and harnesses already ship. Every
+ * lookup is best-effort: a missing permission costs one attribute, not the profile.
+ */
+async function buildGatewayProfile(gateway, { harnessMap = {} } = {}) {
+    const gatewayId = gateway.gatewayId;
+    const host = gatewayHostFromUrl(gateway.gatewayUrl, gatewayId);
+
+    const [awsTags, rolePolicies, targets] = await Promise.all([
+        getGatewayTags(gateway.gatewayArn),
+        getGatewayRolePolicies(gateway.roleArn),
+        listGatewayTargets(gatewayId)
+    ]);
+
+    // Backend endpoints are the most security-relevant thing about a gateway: they
+    // are where tool calls actually land.
+    const targetDetails = [];
+    for (const target of targets) {
+        const detail = await getGatewayTargetDetail(gatewayId, target.targetId);
+        const config = detail?.targetConfiguration?.mcp || {};
+        const kind = Object.keys(config)[0] || Object.keys(detail?.targetConfiguration || {})[0] || 'unknown';
+        targetDetails.push({
+            name: detail?.name || target.name || target.targetId,
+            id: target.targetId,
+            status: detail?.status || target.status || '',
+            kind,
+            endpoint: config?.openApiSchema?.s3?.uri || config?.mcpServer?.endpoint || config?.lambda?.arn || '',
+            credentialProvider: (detail?.credentialProviderConfigurations || [])
+                .map((c) => c.credentialProviderType).filter(Boolean).join(',')
+        });
+    }
+
+    const { arns: interceptorArns, points } = readAttachedInterceptors(gateway);
+    const jwt = gateway.authorizerConfiguration?.customJWTAuthorizer || {};
+    const callers = harnessMap[gatewayId] || [];
+
+    // Only non-empty values are emitted, so a sparse gateway yields a sparse profile
+    // rather than a wall of empty strings.
+    const attributes = {
+        'gateway-id': gatewayId,
+        'gateway-arn': gateway.gatewayArn || '',
+        'gateway-url': gateway.gatewayUrl || '',
+        'gateway-status': String(gateway.status || ''),
+        'gateway-protocol': gateway.protocolType || '',
+        'gateway-role': gateway.roleArn || '',
+        'gateway-role-policies': rolePolicies,
+        'gateway-created-at': gateway.createdAt ? new Date(gateway.createdAt).toISOString() : '',
+        'gateway-updated-at': gateway.updatedAt ? new Date(gateway.updatedAt).toISOString() : '',
+        'auth-type': gateway.authorizerType || '',
+        'auth-discovery-url': jwt.discoveryUrl || '',
+        'auth-allowed-clients': (jwt.allowedClients || []).join(','),
+        'kms-key': gateway.kmsKeyArn || '',
+        'exception-level': gateway.exceptionLevel || '',
+        'policy-engine': gateway.policyEngineConfiguration ? 'true' : '',
+        waf: gateway.wafConfiguration?.webAclArn || gateway.webAclArn || '',
+        'workload-identity': gateway.workloadIdentityDetails?.workloadIdentityArn || '',
+        'mcp-instructions': gateway.protocolConfiguration?.mcp?.instructions ? 'set' : '',
+        'mcp-search-type': gateway.protocolConfiguration?.mcp?.searchType || '',
+        'interceptor-attached': interceptorArns.length ? 'true' : 'false',
+        'interceptor-lambda-arns': interceptorArns.join(','),
+        'interception-points': [...points].sort().join(','),
+        targets: targetDetails.map((t) => t.name).join(','),
+        'target-count': String(targetDetails.length),
+        'target-kinds': [...new Set(targetDetails.map((t) => t.kind))].filter(Boolean).join(','),
+        'target-endpoints': targetDetails.map((t) => t.endpoint).filter(Boolean).join(','),
+        'target-credential-providers': [...new Set(targetDetails.flatMap((t) => t.credentialProvider.split(',')))].filter(Boolean).join(','),
+        'called-by-harnesses': callers.map((c) => c.harnessName).join(','),
+        'called-by-harness-ids': callers.map((c) => c.harnessId).join(',')
+    };
+    for (const [key, value] of Object.entries(attributes)) {
+        if (value === '' || value === undefined || value === null) delete attributes[key];
+    }
+
+    return {
+        gatewayId,
+        gatewayArn: gateway.gatewayArn || '',
+        name: gateway.name || gatewayId,
+        host,
+        url: gateway.gatewayUrl || '',
+        status: String(gateway.status || ''),
+        createdAt: gateway.createdAt ? new Date(gateway.createdAt).toISOString() : '',
+        updatedAt: gateway.updatedAt ? new Date(gateway.updatedAt).toISOString() : '',
+        roleArn: gateway.roleArn || '',
+        region: AWS_REGION,
+        accountId: AWS_ACCOUNT_ID,
+        targets: targetDetails,
+        callers,
+        awsTags,
+        attributes
+    };
+}
+
 module.exports = {
     listAllGateways, getGatewayDetail, listGatewayTargets, buildHarnessGatewayMap,
-    summarizeGateway, readAttachedInterceptors, extractGatewayIdFromArn
+    summarizeGateway, readAttachedInterceptors, extractGatewayIdFromArn,
+    getGatewayTags, getGatewayTargetDetail, getGatewayRolePolicies,
+    buildGatewayProfile, gatewayHostFromUrl
 };
