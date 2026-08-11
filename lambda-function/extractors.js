@@ -48,12 +48,6 @@ function removeXMLTags(text, tag) {
  * Extracts the one exchange this log entry actually represents: the assistant's
  * response (from the output field) paired with the most recent user message.
  *
- * Deliberately does NOT walk the earlier turns in `messages[]`. Every Bedrock call
- * carries the whole conversation so far, so re-emitting the history would send each
- * turn once per subsequent call — an N-turn chat becoming N(N+1)/2 messages. On real
- * client logs that was 2755 messages for 132 exchanges, with one question sent 68
- * times. Those earlier turns already arrived via their own log entries.
- *
  * Returns an array (0 or 1 pairs) because callers iterate it.
  */
 function extractConversationPairs(logEntry) {

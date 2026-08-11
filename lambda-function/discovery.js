@@ -143,9 +143,6 @@ async function fetchAgentName(agentId) {
  * fetches and enriches agent tags, then hands everything to buildAgentMessage.
  */
 async function createStandardMessage(pair) {
-    // Only an agent's name needs looking up. Anything else already carries the right
-    // identity from s3Logs.js (the harness/runtime name), so don't blank it — the
-    // old unconditional assignment silently wiped those names.
     if (pair.logType === 'AGENT') pair.botName = await fetchAgentName(pair.agentId);
 
     let agentTags = {};
@@ -269,10 +266,6 @@ function findResourceByArn(stsArn) {
     }
 
     /*
-     * Fallback, reached only when a role is shared and the map alone can't decide.
-     *
-     *   arn:aws:sts::123:assumed-role/<role>/BedrockAgents-KYDT5XZQZW-30a9f552-…
-     *                                 └ shared ┘ └ agentId ┘ └ InvokeAgent requestID ┘
      *
      * Bedrock mints a fresh session name per invocation and stamps the invoked
      * agent's ID into it, so four agents on one role produce four distinct session

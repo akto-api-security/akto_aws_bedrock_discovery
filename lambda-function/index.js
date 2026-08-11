@@ -61,15 +61,6 @@ async function timed(label, fn) {
     }
 }
 
-/**
- * Records how far the run got, independent of whether anything was sent.
- *
- * Split out from flush() deliberately. Recording progress used to be trapped
- * inside the send path, so a run that legitimately found nothing to send also
- * recorded nothing — and re-read exactly the same files on every subsequent
- * invocation, forever. Reading files and delivering messages are separate facts
- * and now have separate calls.
- */
 async function checkpoint(discoveredAgents, filesProcessed, lastTimestamp, failedFiles) {
     await updateManifest(filesProcessed, discoveredAgents, lastTimestamp, failedFiles);
 }
@@ -106,9 +97,6 @@ async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeL
  * traceId first, then identity+content resolved jointly per trace.
  */
 async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap) {
-    // Counted rather than logged per record: a busy log group holds thousands of
-    // spans, and the useful question is "where did they all go", not "what was
-    // record 4,812". One summary line per log group answers that.
     const stats = { unparseable: 0, other: 0, noTraceId: 0, SPAN: 0, STRANDS_AGGREGATE: 0, GENAI_EVENT: 0, emptyContent: 0, failed: 0 };
 
     const recordsByTraceId = new Map();
@@ -168,9 +156,6 @@ async function runS3Pipeline(timeLeft) {
     const discoveryMessages = await discoverAllNewAgents(discoveredAgents, timeLeft);
     console.log(`✅ Discovery: ${discoveryMessages.length} new resource(s) found`);
 
-    // Flush discovery on its own, immediately — don't let it ride behind log-file
-    // processing in the same batch. Discovery is independent of logs (it only
-    // needs Bedrock's ListAgents API).
     if (discoveryMessages.length > 0) {
         totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp, [], timeLeft);
     }

@@ -63,9 +63,7 @@ function buildAgentMessage(data, isConversation) {
                     role: 'user',
                     content: data.userMessage
                 }
-            ],
-            model: data.modelId,
-            requestId: data.requestId
+            ]
         }
         : {
             resourceId,

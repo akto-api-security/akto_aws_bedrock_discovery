@@ -28,16 +28,6 @@ async function getManifest() {
 
 const MAX_FAILED_FILES = 50;
 
-/**
- * roleName → the agents that use it, derived from discoveredAgents so the two can
- * never disagree.
- *
- * This is the lookup the log pipeline performs on every entry: a Bedrock log
- * carries the caller's role, not the agent. Having it in the manifest answers
- * "which agent owns this role?" — and, just as usefully, shows when one role is
- * shared by several agents, which is the case the log pipeline can't resolve
- * without a session-name hint.
- */
 function buildRoleToAgentsIndex(discoveredAgents) {
     const index = {};
     for (const entry of Object.values(discoveredAgents || {})) {
@@ -52,22 +42,6 @@ function buildRoleToAgentsIndex(discoveredAgents) {
     return index;
 }
 
-/**
- * Writes the manifest back to S3. Never throws — a failed checkpoint write
- * shouldn't crash a run that already successfully sent data to AKTO. The
- * tradeoff is that chunk may get reprocessed next run, which is a safe
- * direction to fail in (possible duplicate) versus silently losing data.
- *
- * The checkpoint is monotonic: it re-reads what's already stored and never
- * writes an older timestamp. Two runs can overlap (EventBridge fires on a timer,
- * regardless of whether the last run finished), and without this a slower run
- * finishing second would drag the checkpoint backwards and cause every file
- * between the two positions to be reprocessed.
- *
- * lastProcessedTimestamp is always the LastModified of a file we actually read —
- * never wall-clock time. Checkpointing to "now" would skip any file written
- * moments earlier but not yet listed.
- */
 async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTimestamp, failedFiles = []) {
     try {
         const existing = await getManifest();

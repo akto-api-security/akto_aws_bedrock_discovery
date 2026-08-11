@@ -42,8 +42,6 @@ const SCHEDULE_INTERVAL_MS = Number(process.env.SCHEDULE_INTERVAL_MS || 600000);
  * EventBridge fires on a timer regardless of whether the previous invocation is
  * still running, and Lambda runs overlapping invocations concurrently — two runs
  * would then read the same checkpoint, process the same files and send duplicates.
- * Finishing inside the interval removes that by construction, without needing
- * reserved concurrency (an account setting we can't rely on in a client account).
  *
  * The Lambda timeout stays as a crash net; this is the normal exit path.
  */

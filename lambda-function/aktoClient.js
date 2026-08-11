@@ -3,11 +3,6 @@
  * with a hard per-request timeout, retry-with-backoff, and awareness of how much
  * time the invocation has left.
  *
- * Delivery is always awaited. Firing a request without waiting is tempting when a
- * run is running out of time, but Lambda freezes the container the moment the
- * handler returns — an un-awaited POST may never reach the wire, and the checkpoint
- * that follows would then claim files were delivered when they weren't. So instead
- * of skipping the wait, this stops *starting* work it can't finish.
  */
 const {
     DATA_INGESTION_ENDPOINT, AKTO_API_KEY, SEND_BATCH_SIZE, MAX_BATCH_BYTES,
@@ -28,10 +23,6 @@ function endpointHost() {
 /**
  * Groups messages into batches bounded by BOTH count and serialized size.
  *
- * The size bound matters because these payloads carry whole conversations: ten
- * large ones can exceed the request limit, and an oversized POST fails the entire
- * batch rather than one message. A single message over the cap is sent on its own —
- * it can't be split, and dropping it silently would be worse.
  */
 function buildBatches(messages) {
     const batches = [];
