@@ -45,9 +45,16 @@ function removeXMLTags(text, tag) {
 }
 
 /**
- * Extracts every user/assistant conversation pair found in one log entry: the
- * final assistant response (from the output field) paired with the most recent
- * user message, plus any earlier user→assistant pairs from the message history.
+ * Extracts the one exchange this log entry actually represents: the assistant's
+ * response (from the output field) paired with the most recent user message.
+ *
+ * Deliberately does NOT walk the earlier turns in `messages[]`. Every Bedrock call
+ * carries the whole conversation so far, so re-emitting the history would send each
+ * turn once per subsequent call — an N-turn chat becoming N(N+1)/2 messages. On real
+ * client logs that was 2755 messages for 132 exchanges, with one question sent 68
+ * times. Those earlier turns already arrived via their own log entries.
+ *
+ * Returns an array (0 or 1 pairs) because callers iterate it.
  */
 function extractConversationPairs(logEntry) {
     const pairs = [];
@@ -88,17 +95,14 @@ function extractConversationPairs(logEntry) {
         };
 
         if (finalAssistantResponse && userMessages.length > 0) {
-            pairs.push({ ...baseFields, userMessage: userMessages[userMessages.length - 1], agentResponse: finalAssistantResponse });
-        }
-
-        for (let i = 0; i < messages.length - 1; i++) {
-            if (messages[i].role !== 'user' || messages[i + 1].role !== 'assistant') continue;
-            const userText = extractTextFromContent(messages[i].content);
-            if (!userText || userText.includes('<function_results>') || !userText.trim()) continue;
-            const cleaned = cleanAgentResponse(extractTextFromContent(messages[i + 1].content));
-            if (!cleaned) continue;
-            if (pairs.some((p) => p.userMessage === userText && p.agentResponse === cleaned)) continue;
-            pairs.push({ ...baseFields, userMessage: userText, agentResponse: cleaned });
+            pairs.push({
+                ...baseFields,
+                userMessage: userMessages[userMessages.length - 1],
+                agentResponse: finalAssistantResponse,
+                // How much history this call carried — useful for spotting long
+                // conversations without re-sending their turns.
+                conversationTurns: messages.length
+            });
         }
     } catch (error) {
         console.error(`❌ Error extracting conversation pairs: ${error.message}`);

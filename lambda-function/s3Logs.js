@@ -11,6 +11,16 @@ const { fetchAgentName, createStandardMessage, findResourceByArn } = require('./
 
 const gunzipAsync = promisify(gunzip);
 
+const logStats = {
+    agentCalls: 0,              // resolved to a discovered Bedrock Agent — ingested
+    nonAgentCalls: 0,           // an app or person calling a model directly — not ingested
+    noIdentity: 0,              // no usable identity ARN at all
+    noConversation: 0,          // parsed fine, but carried no complete exchange
+    unparseableLines: 0
+};
+function resetLogStats() { for (const key of Object.keys(logStats)) logStats[key] = 0; }
+function getLogStats() { return { ...logStats }; }
+
 /**
  * Parses an S3 path (s3://bucket/key) into bucket and key components.
  * Returns {bucket, key} or null if invalid.
@@ -115,6 +125,10 @@ async function getUnprocessedLogFiles(manifest) {
     const startTime = getLogsStartTime(manifest);
     let allFiles = [];
     let continuationToken;
+    let pages = 0;
+
+
+    console.log(`🪣 Listing s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} for .gz logs newer than ${startTime.toISOString()}`);
 
     do {
         const response = await s3Client.send(new ListObjectsV2Command({
@@ -125,6 +139,7 @@ async function getUnprocessedLogFiles(manifest) {
         }));
         allFiles.push(...(response.Contents || []));
         continuationToken = response.NextContinuationToken;
+        pages++;
     } while (continuationToken);
 
     const logFiles = allFiles
@@ -132,7 +147,20 @@ async function getUnprocessedLogFiles(manifest) {
         .sort((a, b) => new Date(a.LastModified) - new Date(b.LastModified));
 
     const unprocessed = logFiles.filter((file) => new Date(file.LastModified) > startTime);
-    console.log(`📊 ${allFiles.length} total objects, ${logFiles.length} .gz log files, ${unprocessed.length} newer than checkpoint`);
+    console.log(`📊 ${allFiles.length} object(s) across ${pages} page(s), ${logFiles.length} .gz log file(s), ${unprocessed.length} newer than checkpoint`);
+
+    // Turn each "nothing to do" case into a specific, actionable reason.
+    if (allFiles.length === 0) {
+        console.warn(`⚠️ Nothing at s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} — check LOGS_PREFIX matches where Bedrock actually delivers, and that model invocation logging is enabled for this account/region`);
+    } else if (logFiles.length === 0) {
+        const sample = allFiles.slice(0, 3).map((f) => f.Key).join(', ');
+        console.warn(`⚠️ Objects exist under the prefix but none are .gz Bedrock logs. First key(s): ${sample} — LOGS_PREFIX may be pointing at the wrong level`);
+    } else if (unprocessed.length === 0) {
+        const newest = logFiles[logFiles.length - 1];
+        console.log(`✅ Up to date — newest log file is ${newest.Key} (${new Date(newest.LastModified).toISOString()}), at or before the checkpoint`);
+    } else {
+        console.log(`📄 Oldest unprocessed: ${unprocessed[0].Key} (${new Date(unprocessed[0].LastModified).toISOString()})`);
+    }
     return unprocessed;
 }
 
@@ -149,6 +177,7 @@ async function processLogFile(bucket, key) {
         try {
             messages.push(...await processBedrockLogEntry(JSON.parse(line)));
         } catch (parseError) {
+            logStats.unparseableLines++;
             console.warn(`⚠️ Skipping unparseable log line in ${key}: ${parseError.message}`);
         }
     }
@@ -160,10 +189,13 @@ async function processLogFile(bucket, key) {
 async function processBedrockLogEntry(logEntry) {
     const messages = [];
     try {
-        // Resolve resource from ARN using discovery mappings
+        // Resolve resource from ARN using discovery mappings. Only traffic that maps
+        // to a discovered agent is ingested — a model invoked directly by an
+        // application or a person is out of scope for this pipeline and is skipped.
         const resource = findResourceByArn(logEntry.identity?.arn);
         if (!resource) {
-            console.warn(`⚠️ Skipping log entry - cannot determine resource from ARN`);
+            if (logEntry.identity?.arn) logStats.nonAgentCalls++;
+            else logStats.noIdentity++;
             return messages;
         }
 
@@ -175,7 +207,10 @@ async function processBedrockLogEntry(logEntry) {
         if (resolvedInputBody) logEntry.input = { ...logEntry.input, inputBodyJson: resolvedInputBody };
         if (resolvedOutputBody) logEntry.output = { ...logEntry.output, outputBodyJson: resolvedOutputBody };
 
+        if (resource.type === 'AGENT') logStats.agentCalls++;
+
         const pairs = extractConversationPairs(logEntry);
+        if (pairs.length === 0) logStats.noConversation++;
         for (const pair of pairs) {
             // Populate from discovered resource
             pair.logType = resource.type;
@@ -201,4 +236,4 @@ async function processBedrockLogEntry(logEntry) {
     return messages;
 }
 
-module.exports = { getUnprocessedLogFiles, processLogFile };
+module.exports = { getUnprocessedLogFiles, processLogFile, resetLogStats, getLogStats };
