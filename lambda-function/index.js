@@ -212,8 +212,8 @@ async function runS3Pipeline(timeLeft) {
 
     const stats = { ...getLogStats(), ...getIdentityStats() };
     console.log(`🎉 Bedrock Agent Classic done. Files processed: ${filesDone}, failed: ${filesFailed}, deferred: ${filesDeferred}, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
-    console.log(`📇 Traffic seen: ${stats.agentCalls} agent call(s) ingested, ${stats.nonAgentCalls} non-agent call(s) skipped, ${stats.noConversation} entr(ies) with no complete exchange, ${stats.noIdentity} without a usable identity, ${stats.unparseableLines} unparseable line(s)`);
-    console.log(`🔗 Identity resolved: ${stats.resolvedByRole} by execution role, ${stats.resolvedBySession} by session name (shared role), ${stats.ambiguousSkips} skipped as ambiguous`);
+    console.log(`📇 Traffic seen: ${stats.agentCalls} agent call(s) ingested, ${stats.nonAgentIngested} direct model call(s) ingested, ${stats.nonAgentCalls} dropped, ${stats.noConversation} entr(ies) with no complete exchange, ${stats.noIdentity} without a usable identity, ${stats.unparseableLines} unparseable line(s)`);
+    console.log(`🔗 Identity resolved: ${stats.resolvedByRole} by execution role, ${stats.resolvedBySession} by session name (shared role), ${stats.nonAgentCallers} as direct-model callers, ${stats.ambiguousSkips} skipped as ambiguous, ${stats.noPrincipal} with an unrecognised ARN`);
     if (filesFailed > 0) {
         console.warn(`⚠️ ${filesFailed} file(s) were skipped permanently and are listed in manifest.failedFiles — inspect them if data looks missing`);
     }
@@ -347,6 +347,37 @@ exports.handler = async (event, context) => {
         console.log(`🔀 S3 handed over after ${(handoverAt / 1000).toFixed(0)}s of its ${(config.S3_BUDGET_MS / 1000).toFixed(0)}s share — AgentCore now has ${(Math.max(0, config.RUN_BUDGET_MS - handoverAt) / 1000).toFixed(0)}s`);
 
         const agentCore = await timed('AgentCore pipeline', () => runAgentCorePipeline(timeLeft));
+        logMemory('after AgentCore pipeline');
+
+        /*
+         * Give the rest of the budget back to S3 if it still has a backlog.
+         *
+         * The share is a floor for AgentCore, not a ceiling on S3, and without this
+         * the floor becomes a ceiling in one common case: an account with only
+         * Bedrock Agent Classic data. AgentCore finds no log groups and returns in
+         * milliseconds, so S3 would stop at half the budget and leave the other half
+         * unspent with files still waiting. This resumes from the checkpoint the
+         * first pass just wrote, so no file is read twice.
+         */
+        let s3SecondPass = null;
+        if (bedrockAgentClassic.filesDeferred > 0 && timeLeft() > config.TIME_SAFETY_MARGIN_MS) {
+            console.log(`♻️ AgentCore finished with ${(timeLeft() / 1000).toFixed(0)}s left and S3 has ${bedrockAgentClassic.filesDeferred} file(s) deferred — returning the remaining budget to S3`);
+            s3SecondPass = await timed('Bedrock Agent Classic pipeline (second pass)', () => runS3Pipeline(timeLeft));
+            // One combined view: totals add up, and "deferred" is whatever the second
+            // pass ended with, since it superseded the first pass's remainder.
+            bedrockAgentClassic.filesDone += s3SecondPass.filesDone;
+            bedrockAgentClassic.filesFailed += s3SecondPass.filesFailed;
+            bedrockAgentClassic.totalSent += s3SecondPass.totalSent;
+            bedrockAgentClassic.filesDeferred = s3SecondPass.filesDeferred;
+            // runS3Pipeline resets the traffic counters on entry, so the second pass's
+            // stats cover only its own files. Sum them, or the run summary would report
+            // whichever pass happened to finish last and undercount the other.
+            for (const [key, value] of Object.entries(s3SecondPass.traffic || {})) {
+                bedrockAgentClassic.traffic[key] = (bedrockAgentClassic.traffic[key] || 0) + value;
+            }
+            bedrockAgentClassic.secondPass = { filesDone: s3SecondPass.filesDone, totalSent: s3SecondPass.totalSent };
+            console.log(`♻️ Second pass added ${s3SecondPass.filesDone} file(s) and ${s3SecondPass.totalSent} message(s) — ${bedrockAgentClassic.filesDeferred} still deferred`);
+        }
         logMemory('end');
 
         // One structured line per run, so CloudWatch Insights can chart throughput
@@ -359,15 +390,15 @@ exports.handler = async (event, context) => {
             s3HandoverMs: handoverAt,
             pipelineOrder: 's3-then-agentcore',
             // Which limit ended the run — the schedule-derived budget (expected on a
-            // backlog), the Lambda clock (means the budget is set too high), or one
-            // pipeline's own share running out while the run as a whole still had
-            // time (raise S3_BUDGET_SHARE if that keeps happening with an idle
-            // AgentCore). 'work-complete' is reserved for runs that deferred nothing.
+            // backlog) or the Lambda clock (means the budget is set too high).
+            // 'work-complete' is reserved for runs that deferred nothing: with the
+            // second S3 pass returning leftover time, anything still deferred means
+            // the budget genuinely ran out rather than a share getting in the way.
             stoppedBy: stoppedByBudget()
                 ? 'run-budget'
                 : lambdaTimeLeft() < config.TIME_SAFETY_MARGIN_MS
                     ? 'lambda-timeout'
-                    : (bedrockAgentClassic.filesDeferred > 0 || agentCore.groupsDeferred > 0) ? 'pipeline-share' : 'work-complete',
+                    : (bedrockAgentClassic.filesDeferred > 0 || agentCore.groupsDeferred > 0) ? 'deferred-work-remaining' : 'work-complete',
             lambdaTimeLeftMs: lambdaTimeLeft(),
             messagesSent: bedrockAgentClassic.totalSent + agentCore.totalSent,
             s3: bedrockAgentClassic,

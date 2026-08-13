@@ -18,7 +18,14 @@ const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID;
 const MARKERS_PREFIX = 'akto/markers/';
 const MANIFEST_KEY = `${MARKERS_PREFIX}bedrock-logs/manifest.json`;
 
-const SEND_BATCH_SIZE = 10;           // max messages per AKTO POST — 10× fewer round trips than sending individually
+/**
+ * Messages per AKTO POST.
+ *
+ * 1 by default: the downstream broker rejects anything over 1MB, and one message per
+ * request is the only setting under which a POST body cannot exceed a single message.
+ * Raise it (10 is comfortable once traces are scoped) to trade round trips for size.
+ */
+const SEND_BATCH_SIZE = Number(process.env.SEND_BATCH_SIZE || 1);
 // A batch is also capped by size: ten long conversations can be large, and an
 // oversized POST fails the whole batch rather than one message.
 const MAX_BATCH_BYTES = 5 * 1024 * 1024;   // 5 MB
@@ -58,6 +65,23 @@ const RUN_BUDGET_MS = Number(process.env.RUN_BUDGET_MS || Math.floor(SCHEDULE_IN
 const S3_BUDGET_SHARE = Number(process.env.S3_BUDGET_SHARE || 0.5);
 const S3_BUDGET_MS = Math.floor(RUN_BUDGET_MS * S3_BUDGET_SHARE);   // 4 minutes of the 8
 
+/**
+ * Whether model invocations that belong to no agent — an application or a person
+ * calling Bedrock directly — are ingested and attributed to the calling principal
+ * (bot-name = the role or user name) rather than skipped.
+ *
+ * On by default: in real accounts this is the bulk of Gen-AI traffic and it is worth
+ * seeing. Set to 'false' to fall back to agent-only ingestion without a redeploy.
+ */
+const INGEST_NON_AGENT_TRAFFIC = String(process.env.INGEST_NON_AGENT_TRAFFIC || 'true').toLowerCase() !== 'false';
+
+/**
+ * Ceiling on one message's traceData. Tool results are truncated (longest first) past
+ * this, so a single long-running agent conversation can never build a message the
+ * broker will refuse. Well under the 1MB limit, leaving room for the rest of the message.
+ */
+const MAX_TRACE_BYTES = Number(process.env.MAX_TRACE_BYTES || 64 * 1024);
+
 const FETCH_TIMEOUT_MS = 25000;       // abort a stuck HTTP call instead of silently eating the whole invocation
 const MAX_SEND_ATTEMPTS = 3;
 const LOOKBACK_DAYS = 3;
@@ -82,8 +106,8 @@ function validateConfig() {
 module.exports = {
     DATA_INGESTION_ENDPOINT, AKTO_API_KEY, LOGS_BUCKET_NAME, LOGS_PREFIX, MARKERS_BUCKET_NAME,
     AWS_REGION, AWS_ACCOUNT_ID, MARKERS_PREFIX, MANIFEST_KEY,
-    SEND_BATCH_SIZE, MAX_BATCH_BYTES, SEND_DEADLINE_MARGIN_MS, FLUSH_THRESHOLD, TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, LOOKBACK_DAYS,
-    SCHEDULE_INTERVAL_MS, RUN_BUDGET_MS, S3_BUDGET_SHARE, S3_BUDGET_MS,
+    SEND_BATCH_SIZE, MAX_BATCH_BYTES, MAX_TRACE_BYTES, SEND_DEADLINE_MARGIN_MS, FLUSH_THRESHOLD, TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, LOOKBACK_DAYS,
+    SCHEDULE_INTERVAL_MS, RUN_BUDGET_MS, S3_BUDGET_SHARE, S3_BUDGET_MS, INGEST_NON_AGENT_TRAFFIC,
     RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH, TRACE_LOOKBACK_DAYS, TRACE_MARKERS_PREFIX, TRACE_MANIFEST_KEY,
     validateConfig,
     bedrockAgentClient: new BedrockAgentClient({ region: AWS_REGION }),

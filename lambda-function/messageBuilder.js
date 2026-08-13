@@ -102,8 +102,10 @@ function buildAgentMessage(data, isConversation) {
         'gen-ai': 'Gen AI',
         'account-id': isConversation ? (data.accountId || AWS_ACCOUNT_ID) : AWS_ACCOUNT_ID,
         region: isConversation ? (data.region || AWS_REGION) : AWS_REGION,
+        // NON_AGENT is a model invoked directly by an application or a person — real
+        // Gen-AI traffic with no agent behind it, named after the calling principal.
         agentType: isConversation
-            ? (data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'UNKNOWN')))
+            ? (data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : (data.logType === 'NON_AGENT' ? 'BEDROCK_MODEL' : 'UNKNOWN'))))
             : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.resourceType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'BEDROCK_AGENT')),
         'bot-name': resourceName || '',
         'agent-id': (isConversation ? data.logType === 'AGENT' || data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'AGENT' || data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
@@ -112,7 +114,14 @@ function buildAgentMessage(data, isConversation) {
         model: modelId,
         'bedrock-identity-arn': data.arn || '',
         ...(isConversation
-            ? { operation: data.operation || 'Unknown', 'input-tokens': String(data.inputTokenCount || 0), 'output-tokens': String(data.outputTokenCount || 0), ...(data.logType === 'AGENT' ? data.agentTags : data.harnessTags) }
+            ? {
+                operation: data.operation || 'Unknown',
+                'input-tokens': String(data.inputTokenCount || 0),
+                'output-tokens': String(data.outputTokenCount || 0),
+                // Only meaningful for direct model traffic: what kind of principal called.
+                ...(data.logType === 'NON_AGENT' ? { 'caller-kind': data.callerKind || 'UNKNOWN' } : {}),
+                ...(data.logType === 'AGENT' ? data.agentTags : data.harnessTags)
+            }
             : { 'discovery-type': 'METADATA_ONLY', 'has-conversations': 'false', ...(data.resourceType === 'AGENT' ? data.agentTags : data.harnessTags) })
     };
 

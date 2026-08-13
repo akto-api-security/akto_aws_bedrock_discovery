@@ -13,7 +13,8 @@ const gunzipAsync = promisify(gunzip);
 
 const logStats = {
     agentCalls: 0,              // resolved to a discovered Bedrock Agent — ingested
-    nonAgentCalls: 0,           // an app or person calling a model directly — not ingested
+    nonAgentIngested: 0,        // an app or person calling a model directly — ingested, named after the caller
+    nonAgentCalls: 0,           // dropped: shared role the session couldn't narrow, or ingestion turned off
     noIdentity: 0,              // no usable identity ARN at all
     noConversation: 0,          // parsed fine, but carried no complete exchange
     unparseableLines: 0
@@ -142,12 +143,29 @@ async function getUnprocessedLogFiles(manifest) {
         pages++;
     } while (continuationToken);
 
+    /*
+     * Bedrock writes large request/response bodies as separate objects under a
+     * `data/` folder in this same prefix, and the log entry that owns one points at
+     * it with inputBodyS3Path. Those bodies are NOT log entries — they carry no
+     * identity, timestamp or model — so reading them as log files costs a GET, a
+     * gunzip and a parse to produce nothing, and inflates the "no usable identity"
+     * count with things that were never identities.
+     *
+     * They are still fully read, just through their owning entry (getInputBodyJson),
+     * which is the only path that has the context to turn them into a message.
+     */
+    const isBodyObject = (key) => key.includes('/data/');
+    const bodyObjects = allFiles.filter((file) => file.Key.endsWith('.gz') && isBodyObject(file.Key)).length;
+
     const logFiles = allFiles
-        .filter((file) => file.Key.endsWith('.gz') && file.Size > 0)
+        .filter((file) => file.Key.endsWith('.gz') && file.Size > 0 && !isBodyObject(file.Key))
         .sort((a, b) => new Date(a.LastModified) - new Date(b.LastModified));
 
     const unprocessed = logFiles.filter((file) => new Date(file.LastModified) > startTime);
     console.log(`📊 ${allFiles.length} object(s) across ${pages} page(s), ${logFiles.length} .gz log file(s), ${unprocessed.length} newer than checkpoint`);
+    if (bodyObjects > 0) {
+        console.log(`📦 ${bodyObjects} large-payload body object(s) under data/ skipped in the listing — they are fetched via inputBodyS3Path by the entries that own them`);
+    }
 
     // Turn each "nothing to do" case into a specific, actionable reason.
     if (allFiles.length === 0) {
@@ -194,6 +212,8 @@ async function processBedrockLogEntry(logEntry) {
         // application or a person is out of scope for this pipeline and is skipped.
         const resource = findResourceByArn(logEntry.identity?.arn);
         if (!resource) {
+            // Either no identity at all, or a shared role the session couldn't narrow.
+            // Everything else — including traffic no agent owns — comes back resolved.
             if (logEntry.identity?.arn) logStats.nonAgentCalls++;
             else logStats.noIdentity++;
             return messages;
@@ -208,6 +228,7 @@ async function processBedrockLogEntry(logEntry) {
         if (resolvedOutputBody) logEntry.output = { ...logEntry.output, outputBodyJson: resolvedOutputBody };
 
         if (resource.type === 'AGENT') logStats.agentCalls++;
+        else if (resource.type === 'NON_AGENT') logStats.nonAgentIngested++;
 
         const pairs = extractConversationPairs(logEntry);
         if (pairs.length === 0) logStats.noConversation++;
@@ -216,7 +237,14 @@ async function processBedrockLogEntry(logEntry) {
             pair.logType = resource.type;
             if (resource.type === 'AGENT') {
                 pair.agentId = resource.agentId;
-                pair.botName = await fetchAgentName(resource.agentId);
+                // Name and execution role both come from the role map (i.e. the
+                // manifest), so neither costs a GetAgent call.
+                pair.botName = await fetchAgentName(resource.agentId, resource.agentName);
+                pair.executionRoleArn = resource.executionRoleArn || '';
+            } else if (resource.type === 'NON_AGENT') {
+                // Direct model invocation: attributed to the calling principal.
+                pair.botName = resource.callerName;
+                pair.callerKind = resource.callerKind;
             } else if (resource.type === 'HARNESS') {
                 pair.harnessId = resource.harnessId;
                 pair.harnessName = resource.harnessName;

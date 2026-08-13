@@ -11,7 +11,7 @@
  */
 const { GetAgentCommand, ListAgentsCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, bedrockAgentClient, iamClient } = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_NON_AGENT_TRAFFIC, bedrockAgentClient, iamClient } = require('./config');
 const { buildAgentMessage } = require('./messageBuilder');
 
 const agentNameCache = {};
@@ -28,8 +28,9 @@ const reportedAmbiguousRoles = new Set();
 const identityStats = {
     resolvedByRole: 0,          // role maps to exactly one agent — the normal path
     resolvedBySession: 0,       // shared role, narrowed by the agent ID in the session name
-    ambiguousSkips: 0,          // shared role the session name couldn't narrow
-    nonAgentSkips: 0            // role belongs to no agent at all
+    ambiguousSkips: 0,          // shared role the session name couldn't narrow — the only drop
+    nonAgentCallers: 0,         // principal owns no agent: direct model traffic
+    noPrincipal: 0              // ARN shape we couldn't name a principal in
 };
 
 /** Generic pager: calls sendPage(nextToken) until no token comes back, concatenating pluck(response) from each page. */
@@ -86,11 +87,23 @@ async function getBedrockAgentTags(agentId) {
     }
 }
 
-/** Adds the agent's execution role ARN + its attached policy names to a tag set. */
-async function addAgentRoleAndPermissions(tags, agentId) {
+/**
+ * Adds the agent's execution role ARN + its attached policy names to a tag set.
+ *
+ * `knownRoleArn` is the role already carried by the role map (which is rebuilt from
+ * the manifest). When it's present — the normal case — this makes no Bedrock call at
+ * all. GetAgent is the fallback for legacy manifest entries that predate the role
+ * being persisted, and it is the single most throttled call in this function, so it
+ * is worth avoiding rather than merely caching: a busy run used to issue one per
+ * message and trip TooManyRequests.
+ */
+async function addAgentRoleAndPermissions(tags, agentId, knownRoleArn) {
     try {
-        const agentDetails = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
-        const roleArn = agentDetails.agent?.agentResourceRoleArn || agentDetails.agent?.executionRoleArn || '';
+        let roleArn = knownRoleArn || '';
+        if (!roleArn) {
+            const agentDetails = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
+            roleArn = agentDetails.agent?.agentResourceRoleArn || agentDetails.agent?.executionRoleArn || '';
+        }
         if (!roleArn) {
             console.warn(`⚠️ No execution role found for agent ${agentId}`);
             return tags;
@@ -123,9 +136,20 @@ function extractRoleNameFromArn(roleArn) {
     return roleArn ? roleArn.split('/').pop() : '';
 }
 
-/** Resolves an agent's display name from its ID, cached across the invocation. */
-async function fetchAgentName(agentId) {
+/**
+ * Resolves an agent's display name from its ID, cached across the invocation.
+ *
+ * `knownName` short-circuits the lookup entirely — callers that already resolved the
+ * agent (from the role map, which comes from the manifest) pass it so no Bedrock call
+ * is made. It's also seeded into the cache so any later caller for the same agent is
+ * answered locally.
+ */
+async function fetchAgentName(agentId, knownName) {
     if (!agentId) return '';
+    if (knownName) {
+        agentNameCache[agentId] = knownName;
+        return knownName;
+    }
     if (agentNameCache[agentId]) return agentNameCache[agentId];
     try {
         const details = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
@@ -143,20 +167,31 @@ async function fetchAgentName(agentId) {
  * fetches and enriches agent tags, then hands everything to buildAgentMessage.
  */
 async function createStandardMessage(pair) {
-    if (pair.logType === 'AGENT') pair.botName = await fetchAgentName(pair.agentId);
+    // Only an agent's name needs looking up, and `pair.botName` is normally already
+    // set from the role map, so this resolves locally. Anything else already carries
+    // the right identity from s3Logs.js — don't blank it.
+    if (pair.logType === 'AGENT') pair.botName = await fetchAgentName(pair.agentId, pair.botName);
 
     let agentTags = {};
     const harnessTags = {};
     let awsMetadata = {};
 
     if (pair.logType === 'AGENT' && pair.agentId) {
-        agentTags = await fetchTagsCached(`agent-${pair.agentId}`, () => getBedrockAgentTags(pair.agentId));
-        agentTags = await addAgentRoleAndPermissions(agentTags, pair.agentId);
+        // One cache entry for the whole enriched set (tags + execution role + policies).
+        // Caching only the raw tags — as this used to — left the role enrichment to run
+        // per message, and with it a GetAgent call per message.
+        agentTags = await fetchTagsCached(`agent-enriched-${pair.agentId}`, async () => {
+            const tags = await fetchTagsCached(`agent-${pair.agentId}`, () => getBedrockAgentTags(pair.agentId));
+            return addAgentRoleAndPermissions(tags, pair.agentId, pair.executionRoleArn);
+        });
         awsMetadata = {
             model: pair.modelId,
             'bedrock-execution-role': agentTags['bedrock-execution-role'] || '',
             traceData: pair.traceData || {}
         };
+    } else if (pair.logType === 'NON_AGENT') {
+        // No agent to describe, so no Bedrock or IAM call is made on this path at all.
+        awsMetadata = { model: pair.modelId, 'caller-arn': pair.arn || '', traceData: pair.traceData || {} };
     }
 
     return buildAgentMessage({ ...pair, accountId: pair.accountId || AWS_ACCOUNT_ID, region: pair.region || AWS_REGION, agentTags, harnessTags, awsMetadata }, true);
@@ -223,39 +258,80 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
 }
 
 /**
- * Finds the agent a log entry belongs to, from its STS ARN.
+ * Names the principal behind any Bedrock identity ARN.
+ *
+ * Model-invocation logs carry more than assumed roles — an application using a
+ * Bedrock API key shows up as an IAM user, for example. Every shape resolves to
+ * something nameable so direct model traffic can still be attributed to its caller.
+ *
+ *   assumed-role/aria-usertask-role/<session>  → { name: 'aria-usertask-role', kind: 'IAM_ROLE' }
+ *   user/BedrockAPIKey-cxsw                    → { name: 'BedrockAPIKey-cxsw',  kind: 'IAM_USER' }
+ */
+function parsePrincipal(arn) {
+    const assumed = arn.match(/assumed-role\/([^/]+)(?:\/(.*))?$/);
+    if (assumed) return { name: assumed[1], kind: 'IAM_ROLE', session: assumed[2] || '' };
+
+    const user = arn.match(/:user\/(?:.*\/)?([^/]+)$/);
+    if (user) return { name: user[1], kind: 'IAM_USER', session: '' };
+
+    const role = arn.match(/:role\/(?:.*\/)?([^/]+)$/);
+    if (role) return { name: role[1], kind: 'IAM_ROLE', session: '' };
+
+    if (/:root$/.test(arn)) return { name: 'root', kind: 'AWS_ROOT', session: '' };
+
+    // Last resort, and only for something that is actually an ARN: an unrecognised
+    // principal type still has a nameable tail (federated-user/bob). Anything that
+    // isn't an ARN gets no name — inventing a bot-name out of a malformed string
+    // would put junk in the dashboard under the guise of a caller.
+    if (/^arn:/.test(String(arn))) {
+        const tail = String(arn).split('/').pop();
+        if (tail && tail !== String(arn)) return { name: tail, kind: 'UNKNOWN', session: '' };
+    }
+    return { name: '', kind: 'UNKNOWN', session: '' };
+}
+
+/**
+ * Finds who a log entry belongs to, from its identity ARN.
  *
  * The execution role is the primary key: nearly every agent has its own, so the
  * role map answers this outright. The session name is consulted only as a fallback,
- * for the one case the role can't settle — several agents sharing a role.
+ * for the one case the role can't settle — several agents sharing a role. Anything
+ * no agent owns is returned as a NON_AGENT caller (an application or a person
+ * calling a model directly), named after the principal in the ARN.
  *
- * Returns null when the traffic isn't an agent's, or when a shared role can't be
- * narrowed to a single agent.
+ * Returns null only when a shared role can't be narrowed to a single agent —
+ * mislabelling known agent traffic as non-agent would be worse than dropping it.
  */
 function findResourceByArn(stsArn) {
     if (!stsArn) return null;
 
-    const roleNameMatch = stsArn.match(/assumed-role\/([^/]+)/);
-    if (!roleNameMatch) {
-        console.warn(`⚠️ Could not extract role name from ARN: ${stsArn}`);
+    const principal = parsePrincipal(stsArn);
+    if (!principal.name) {
+        if (!reportedNonAgentRoles.has(stsArn)) {
+            reportedNonAgentRoles.add(stsArn);
+            console.warn(`⚠️ Could not identify a principal in ARN: ${stsArn}`);
+        }
+        identityStats.noPrincipal++;
         return null;
     }
-    const roleName = roleNameMatch[1];
-    const sessionName = (stsArn.match(/assumed-role\/[^/]+\/(.+)$/) || [])[1] || '';
-    const resources = roleToResourcesMap[roleName];
+    const roleName = principal.name;
+    const sessionName = principal.session;
+    const resources = principal.kind === 'IAM_ROLE' ? roleToResourcesMap[roleName] : null;
 
-    // No agent owns this role, so this traffic came from an application or a person
-    // calling a model directly — out of scope for this pipeline, and skipped.
-    // Logged once per distinct role rather than once per log entry: a busy account
-    // has thousands of such entries and only a handful of roles. The session name is
-    // included because that is what identifies the caller.
+    // No agent owns this principal, so the traffic came from an application or a
+    // person calling a model directly. It is still real Gen-AI traffic, so it is
+    // ingested and attributed to the caller rather than dropped.
+    // Reported once per distinct principal: a busy account has thousands of such
+    // entries and only a handful of callers.
     if (!resources || resources.length === 0) {
-        identityStats.nonAgentSkips++;
+        identityStats.nonAgentCallers++;
         if (!reportedNonAgentRoles.has(roleName)) {
             reportedNonAgentRoles.add(roleName);
-            console.log(`ℹ️ '${roleName}' is not an agent execution role — its traffic is not agent traffic and is skipped (caller: ${sessionName || 'unknown session'})`);
+            const verb = INGEST_NON_AGENT_TRAFFIC ? 'ingesting it as direct model traffic' : 'skipping it (INGEST_NON_AGENT_TRAFFIC is off)';
+            console.log(`ℹ️ '${roleName}' (${principal.kind}) is not an agent execution role — ${verb}${sessionName ? ` (session: ${sessionName})` : ''}`);
         }
-        return null;
+        if (!INGEST_NON_AGENT_TRAFFIC) return null;
+        return { type: 'NON_AGENT', callerName: roleName, callerKind: principal.kind };
     }
 
     // Exactly one agent on this role — the role alone is enough, and the session
@@ -347,7 +423,10 @@ async function rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft) {
             agentId: entry.resourceId,
             agentName: entry.resourceName,
             type: 'AGENT',
-            agentArn: agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${entry.resourceId}`
+            agentArn: agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${entry.resourceId}`,
+            // Carried so message building never has to call GetAgent for them again.
+            roleName,
+            executionRoleArn: executionRoleArn || `arn:aws:iam::${AWS_ACCOUNT_ID}:role/${roleName}`
         });
     }
     if (backfilled > 0) console.log(`🔧 Backfilled the execution role for ${backfilled} agent(s) — persisted, so this won't repeat`);
@@ -376,5 +455,5 @@ function getIdentityStats() { return { ...identityStats }; }
 
 module.exports = {
     resetRunLogState, getIdentityStats, rebuildRoleMapFromDiscoveredAgents, discoverAllNewAgents, createStandardMessage,
-    fetchAgentName, findResourceByArn
+    fetchAgentName, findResourceByArn, parsePrincipal
 };

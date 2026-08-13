@@ -2,7 +2,7 @@
  * Pure functions that turn a raw Bedrock model-invocation log entry into
  * AKTO-shaped conversation pairs. No AWS calls, no shared state.
  */
-const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, MAX_TRACE_BYTES } = require('./config');
 
 /** Pulls plain text out of a Bedrock content-block (array format expected from AWS APIs). */
 function extractTextFromContent(content) {
@@ -114,10 +114,79 @@ function extractToolActionType(input) {
     return 'unknown';
 }
 
-/** Extracts the tool-call execution trace for a conversation pair, matching each toolUse to its toolResult by toolUseId. */
-function extractTraceData(logEntry, botName) {
+/**
+ * Index of the last user message that is a real question rather than a tool result.
+ *
+ * That message is the one extractConversationPairs emits, so everything after it is
+ * the work done to answer it — which is exactly the trace this log entry should
+ * report. Returns -1 when there is no such message, in which case the caller keeps
+ * the whole array rather than guessing.
+ */
+function lastRealUserIndex(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i];
+        if (message.role !== 'user') continue;
+        const blocks = Array.isArray(message.content) ? message.content : [];
+        const hasText = blocks.some((b) => b && b.text !== undefined);
+        const isToolResult = blocks.some((b) => b && b.toolResult);
+        if (hasText && !isToolResult) return i;
+    }
+    return -1;
+}
+
+/**
+ * Caps one trace so a single pathological conversation can never produce a message
+ * too large for the downstream broker. Tool *results* are the bulk of the bytes, so
+ * they are truncated (longest first) before anything structural is dropped: which
+ * tools ran, in what order, is worth more than the full text of what they returned.
+ */
+function capTraceData(trace, maxBytes) {
+    const size = (v) => Buffer.byteLength(JSON.stringify(v), 'utf8');
+    if (size(trace) <= maxBytes) return trace;
+
+    const steps = [...(trace.executionFlow || [])];
+    // Longest results first — one huge result is the usual cause.
+    const order = steps
+        .map((s, i) => ({ i, len: String(s.result || '').length }))
+        .sort((a, b) => b.len - a.len);
+
+    for (const { i } of order) {
+        if (size(trace) <= maxBytes) break;
+        const result = String(steps[i].result || '');
+        if (result.length <= 200) continue;
+        steps[i] = { ...steps[i], result: `${result.slice(0, 200)}…[truncated ${result.length - 200} chars]`, resultTruncated: true };
+        trace = { ...trace, executionFlow: steps };
+    }
+
+    // Still too big — the step list itself is the problem, so keep the summary and
+    // the first steps rather than emit something the broker will reject outright.
+    if (size(trace) > maxBytes) {
+        const kept = [];
+        for (const step of steps) {
+            kept.push(step);
+            if (size({ ...trace, executionFlow: kept }) > maxBytes) { kept.pop(); break; }
+        }
+        trace = { ...trace, executionFlow: kept, executionFlowTruncated: { kept: kept.length, total: steps.length } };
+    }
+    return trace;
+}
+
+/**
+ * Extracts the tool-call execution trace for a conversation pair, matching each
+ * toolUse to its toolResult by toolUseId.
+ *
+ * Scoped to the exchange being reported, not the whole conversation. Bedrock resends
+ * the entire history on every call, so walking all of it made message N carry the
+ * tool results of turns 1…N — the same duplication extractConversationPairs already
+ * removes for the conversation itself. On real client logs that was 88% of the
+ * payload and grew without bound as a session went on. Each turn's tools still reach
+ * AKTO exactly once, on the message for the turn they ran in.
+ */
+function extractTraceData(logEntry, botName, maxBytes = MAX_TRACE_BYTES) {
     try {
-        const messages = logEntry.input?.inputBodyJson?.messages || [];
+        const allMessages = logEntry.input?.inputBodyJson?.messages || [];
+        const from = lastRealUserIndex(allMessages);
+        const messages = from >= 0 ? allMessages.slice(from + 1) : allMessages;
         const stopReason = logEntry.output?.outputBodyJson?.stopReason;
 
         const resultsByToolUseId = {};
@@ -153,7 +222,7 @@ function extractTraceData(logEntry, botName) {
             actions.add(action);
         });
 
-        return {
+        return capTraceData({
             executionFlow,
             toolsSummary: {
                 agentOrchestrator: botName,
@@ -162,7 +231,7 @@ function extractTraceData(logEntry, botName) {
                 totalToolCalls: toolCalls.length,
                 executionPattern: `${botName}→${[...tools].join('→')}`
             }
-        };
+        }, maxBytes);
     } catch (error) {
         console.warn(`⚠️ Trace extraction failed: ${error.message}`);
         return { executionFlow: [], toolsSummary: {} };
@@ -170,5 +239,6 @@ function extractTraceData(logEntry, botName) {
 }
 
 module.exports = {
-    extractTextFromContent, cleanAgentResponse, removeXMLTags, extractConversationPairs, extractTraceData
+    extractTextFromContent, cleanAgentResponse, removeXMLTags, extractConversationPairs, extractTraceData,
+    lastRealUserIndex, capTraceData
 };
