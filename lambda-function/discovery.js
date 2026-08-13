@@ -11,7 +11,7 @@
  */
 const { GetAgentCommand, ListAgentsCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_NON_AGENT_TRAFFIC, bedrockAgentClient, iamClient } = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_SERVICE_AGENT_TRAFFIC, bedrockAgentClient, iamClient } = require('./config');
 const { buildAgentMessage } = require('./messageBuilder');
 
 const agentNameCache = {};
@@ -21,7 +21,7 @@ const tagsCache = {};
 // roleName -> [{agentId, agentName, type: 'AGENT', agentArn}, ...]
 const roleToResourcesMap = {};
 // Distinct roles/agents already reported this run — keeps the log to one line each.
-const reportedNonAgentRoles = new Set();
+const reportedServiceAgentRoles = new Set();
 const reportedAmbiguousRoles = new Set();
 
 /** How each log entry's identity was resolved — reported once per run, not per entry. */
@@ -29,7 +29,7 @@ const identityStats = {
     resolvedByRole: 0,          // role maps to exactly one agent — the normal path
     resolvedBySession: 0,       // shared role, narrowed by the agent ID in the session name
     ambiguousSkips: 0,          // shared role the session name couldn't narrow — the only drop
-    nonAgentCallers: 0,         // principal owns no agent: direct model traffic
+    serviceAgentCallers: 0,         // principal owns no agent: direct model traffic
     noPrincipal: 0              // ARN shape we couldn't name a principal in
 };
 
@@ -189,12 +189,54 @@ async function createStandardMessage(pair) {
             'bedrock-execution-role': agentTags['bedrock-execution-role'] || '',
             traceData: pair.traceData || {}
         };
-    } else if (pair.logType === 'NON_AGENT') {
-        // No agent to describe, so no Bedrock or IAM call is made on this path at all.
-        awsMetadata = { model: pair.modelId, 'caller-arn': pair.arn || '', traceData: pair.traceData || {} };
+    } else if (pair.logType === 'SERVICE_AGENT') {
+        // There's no Bedrock Agent resource to query here (GetAgent/ListTagsForResource
+        // would just fail), but the caller's own IAM role is real — its attached
+        // policies are fetched directly, giving this the same execution-role/policy tag
+        // shape a real agent's role enrichment produces. Only IAM roles have policies
+        // fetchable this way; an IAM_USER caller gets the execution-role name with no
+        // policy lookup rather than a call to the wrong API.
+        const roleName = pair.botName;
+        agentTags = await fetchTagsCached(`caller-enriched-${roleName}`, async () => ({
+            'bedrock-execution-role-arn': `arn:aws:iam::${pair.accountId || AWS_ACCOUNT_ID}:role/${roleName}`,
+            'bedrock-execution-role': roleName,
+            'bedrock-role-policies': pair.callerKind === 'IAM_ROLE' ? await getRolePolicies(roleName) : ''
+        }));
+        awsMetadata = {
+            model: pair.modelId,
+            'bedrock-execution-role': roleName,
+            traceData: pair.traceData || {}
+        };
     }
 
     return buildAgentMessage({ ...pair, accountId: pair.accountId || AWS_ACCOUNT_ID, region: pair.region || AWS_REGION, agentTags, harnessTags, awsMetadata }, true);
+}
+
+/**
+ * One-time metadata-only message for a SERVICE_AGENT caller's first-seen log entry —
+ * the same role a real agent's discovery message plays for discoverAllNewAgents,
+ * but sourced from the log entry itself rather than a ListAgents-style API, since
+ * there's no AWS API that enumerates "applications that have called a model directly".
+ * Without this, a caller never gets anything but conversation messages, which may be
+ * why it never surfaces as a discovered resource on the AKTO side.
+ *
+ * Passes resourceType 'AGENT' (not 'SERVICE_AGENT') so this reads on the AKTO side exactly
+ * like a real agent's discovery message — the caller has no Bedrock Agent resource
+ * behind it, but nothing about that distinction needs to leave this Lambda.
+ */
+function buildServiceAgentDiscoveryMessage(resource, logEntry) {
+    return buildAgentMessage({
+        resourceType: 'AGENT',
+        agentId: resource.callerName,
+        agentName: resource.callerName,
+        description: `Direct model caller (${resource.callerKind || 'UNKNOWN'})`,
+        agentStatus: 'ACTIVE',
+        foundationModel: logEntry.modelId || 'unknown-model',
+        agentResourceRoleArn: `arn:aws:iam::${AWS_ACCOUNT_ID}:role/${resource.callerName}`,
+        createdAt: logEntry.timestamp,
+        updatedAt: logEntry.timestamp,
+        arn: logEntry.identity?.arn || ''
+    }, false);
 }
 
 /**
@@ -296,7 +338,7 @@ function parsePrincipal(arn) {
  * The execution role is the primary key: nearly every agent has its own, so the
  * role map answers this outright. The session name is consulted only as a fallback,
  * for the one case the role can't settle — several agents sharing a role. Anything
- * no agent owns is returned as a NON_AGENT caller (an application or a person
+ * no agent owns is returned as a SERVICE_AGENT caller (an application or a person
  * calling a model directly), named after the principal in the ARN.
  *
  * Returns null only when a shared role can't be narrowed to a single agent —
@@ -307,8 +349,8 @@ function findResourceByArn(stsArn) {
 
     const principal = parsePrincipal(stsArn);
     if (!principal.name) {
-        if (!reportedNonAgentRoles.has(stsArn)) {
-            reportedNonAgentRoles.add(stsArn);
+        if (!reportedServiceAgentRoles.has(stsArn)) {
+            reportedServiceAgentRoles.add(stsArn);
             console.warn(`⚠️ Could not identify a principal in ARN: ${stsArn}`);
         }
         identityStats.noPrincipal++;
@@ -324,14 +366,14 @@ function findResourceByArn(stsArn) {
     // Reported once per distinct principal: a busy account has thousands of such
     // entries and only a handful of callers.
     if (!resources || resources.length === 0) {
-        identityStats.nonAgentCallers++;
-        if (!reportedNonAgentRoles.has(roleName)) {
-            reportedNonAgentRoles.add(roleName);
-            const verb = INGEST_NON_AGENT_TRAFFIC ? 'ingesting it as direct model traffic' : 'skipping it (INGEST_NON_AGENT_TRAFFIC is off)';
+        identityStats.serviceAgentCallers++;
+        if (!reportedServiceAgentRoles.has(roleName)) {
+            reportedServiceAgentRoles.add(roleName);
+            const verb = INGEST_SERVICE_AGENT_TRAFFIC ? 'ingesting it as direct model traffic' : 'skipping it (INGEST_SERVICE_AGENT_TRAFFIC is off)';
             console.log(`ℹ️ '${roleName}' (${principal.kind}) is not an agent execution role — ${verb}${sessionName ? ` (session: ${sessionName})` : ''}`);
         }
-        if (!INGEST_NON_AGENT_TRAFFIC) return null;
-        return { type: 'NON_AGENT', callerName: roleName, callerKind: principal.kind };
+        if (!INGEST_SERVICE_AGENT_TRAFFIC) return null;
+        return { type: 'SERVICE_AGENT', callerName: roleName, callerKind: principal.kind };
     }
 
     // Exactly one agent on this role — the role alone is enough, and the session
@@ -445,7 +487,7 @@ async function rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft) {
 
 /** Clears per-run log de-duplication so a warm container doesn't stay silent. */
 function resetRunLogState() {
-    reportedNonAgentRoles.clear();
+    reportedServiceAgentRoles.clear();
     reportedAmbiguousRoles.clear();
     for (const key of Object.keys(identityStats)) identityStats[key] = 0;
 }
@@ -455,5 +497,5 @@ function getIdentityStats() { return { ...identityStats }; }
 
 module.exports = {
     resetRunLogState, getIdentityStats, rebuildRoleMapFromDiscoveredAgents, discoverAllNewAgents, createStandardMessage,
-    fetchAgentName, findResourceByArn, parsePrincipal
+    fetchAgentName, findResourceByArn, parsePrincipal, buildServiceAgentDiscoveryMessage
 };

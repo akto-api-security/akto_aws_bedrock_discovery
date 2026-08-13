@@ -178,7 +178,7 @@ async function runS3Pipeline(timeLeft) {
 
         const fileTs = new Date(file.LastModified).toISOString();
         try {
-            const messages = await processLogFile(config.LOGS_BUCKET_NAME, file.Key);
+            const messages = await processLogFile(config.LOGS_BUCKET_NAME, file.Key, discoveredAgents);
             pending.push(...messages);
             filesDone++;
         } catch (error) {
@@ -212,8 +212,8 @@ async function runS3Pipeline(timeLeft) {
 
     const stats = { ...getLogStats(), ...getIdentityStats() };
     console.log(`🎉 Bedrock Agent Classic done. Files processed: ${filesDone}, failed: ${filesFailed}, deferred: ${filesDeferred}, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
-    console.log(`📇 Traffic seen: ${stats.agentCalls} agent call(s) ingested, ${stats.nonAgentIngested} direct model call(s) ingested, ${stats.nonAgentCalls} dropped, ${stats.noConversation} entr(ies) with no complete exchange, ${stats.noIdentity} without a usable identity, ${stats.unparseableLines} unparseable line(s)`);
-    console.log(`🔗 Identity resolved: ${stats.resolvedByRole} by execution role, ${stats.resolvedBySession} by session name (shared role), ${stats.nonAgentCallers} as direct-model callers, ${stats.ambiguousSkips} skipped as ambiguous, ${stats.noPrincipal} with an unrecognised ARN`);
+    console.log(`📇 Traffic seen: ${stats.agentCalls} agent call(s) ingested, ${stats.serviceAgentIngested} direct model call(s) ingested, ${stats.serviceAgentCalls} dropped, ${stats.noConversation} entr(ies) with no complete exchange, ${stats.noIdentity} without a usable identity, ${stats.unparseableLines} unparseable line(s)`);
+    console.log(`🔗 Identity resolved: ${stats.resolvedByRole} by execution role, ${stats.resolvedBySession} by session name (shared role), ${stats.serviceAgentCallers} as direct-model callers, ${stats.ambiguousSkips} skipped as ambiguous, ${stats.noPrincipal} with an unrecognised ARN`);
     if (filesFailed > 0) {
         console.warn(`⚠️ ${filesFailed} file(s) were skipped permanently and are listed in manifest.failedFiles — inspect them if data looks missing`);
     }

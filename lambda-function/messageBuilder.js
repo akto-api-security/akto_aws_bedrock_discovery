@@ -102,13 +102,24 @@ function buildAgentMessage(data, isConversation) {
         'gen-ai': 'Gen AI',
         'account-id': isConversation ? (data.accountId || AWS_ACCOUNT_ID) : AWS_ACCOUNT_ID,
         region: isConversation ? (data.region || AWS_REGION) : AWS_REGION,
-        // NON_AGENT is a model invoked directly by an application or a person — real
-        // Gen-AI traffic with no agent behind it, named after the calling principal.
+        // SERVICE_AGENT (a model invoked directly by an application or a person, with no
+        // Bedrock Agent resource behind it) is deliberately tagged identically to a
+        // real agent on the conversation (isConversation=true) side — same agentType,
+        // same tag shape — so it surfaces on the AKTO dashboard as a genuine discovered
+        // agent rather than a separate category. Its one-time discovery message
+        // (buildServiceAgentDiscoveryMessage, discovery.js) already passes resourceType
+        // 'AGENT' outright, so the discovery/false branch below never sees 'SERVICE_AGENT'
+        // at all — logType 'SERVICE_AGENT' exists only so createStandardMessage knows to
+        // skip the Bedrock Agent API calls that would fail for a caller with no such
+        // resource; it never leaks into what's sent to AKTO.
         agentType: isConversation
-            ? (data.logType === 'AGENT' ? 'BEDROCK_AGENT' : (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : (data.logType === 'NON_AGENT' ? 'BEDROCK_MODEL' : 'UNKNOWN'))))
+            ? (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : (data.logType === 'AGENT' || data.logType === 'SERVICE_AGENT' ? 'BEDROCK_AGENT' : 'UNKNOWN')))
             : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.resourceType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'BEDROCK_AGENT')),
         'bot-name': resourceName || '',
-        'agent-id': (isConversation ? data.logType === 'AGENT' || data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'AGENT' || data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
+        // SERVICE_AGENT has no AWS resource ID of its own — the calling principal's name
+        // (already in resourceId/resourceName) fills this slot instead, so a caller
+        // still has a stable, non-empty identity tag to be grouped/deduped on.
+        'agent-id': (isConversation ? data.logType === 'AGENT' || data.logType === 'STANDALONE_RUNTIME' || data.logType === 'SERVICE_AGENT' : data.resourceType === 'AGENT' || data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
         'harness-id': (isConversation ? data.logType === 'HARNESS' : data.resourceType === 'HARNESS') ? (data.harnessId || '') : '',
         'runtime-id': (isConversation ? data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
         model: modelId,
@@ -119,8 +130,12 @@ function buildAgentMessage(data, isConversation) {
                 'input-tokens': String(data.inputTokenCount || 0),
                 'output-tokens': String(data.outputTokenCount || 0),
                 // Only meaningful for direct model traffic: what kind of principal called.
-                ...(data.logType === 'NON_AGENT' ? { 'caller-kind': data.callerKind || 'UNKNOWN' } : {}),
-                ...(data.logType === 'AGENT' ? data.agentTags : data.harnessTags)
+                ...(data.logType === 'SERVICE_AGENT' ? { 'caller-kind': data.callerKind || 'UNKNOWN' } : {}),
+                // SERVICE_AGENT's agentTags carries real execution-role/policy tags fetched
+                // straight off IAM (discovery.js) — same tag names an AGENT gets, just
+                // sourced without ever calling the (nonexistent-for-this-caller) Bedrock
+                // Agent API.
+                ...(data.logType === 'AGENT' || data.logType === 'SERVICE_AGENT' ? data.agentTags : data.harnessTags)
             }
             : { 'discovery-type': 'METADATA_ONLY', 'has-conversations': 'false', ...(data.resourceType === 'AGENT' ? data.agentTags : data.harnessTags) })
     };

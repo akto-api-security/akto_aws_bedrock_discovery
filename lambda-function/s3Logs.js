@@ -7,14 +7,14 @@ const { gunzip } = require('zlib');
 const { promisify } = require('util');
 const { s3Client, LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS } = require('./config');
 const { extractConversationPairs, extractTraceData } = require('./extractors');
-const { fetchAgentName, createStandardMessage, findResourceByArn } = require('./discovery');
+const { fetchAgentName, createStandardMessage, findResourceByArn, buildServiceAgentDiscoveryMessage } = require('./discovery');
 
 const gunzipAsync = promisify(gunzip);
 
 const logStats = {
     agentCalls: 0,              // resolved to a discovered Bedrock Agent — ingested
-    nonAgentIngested: 0,        // an app or person calling a model directly — ingested, named after the caller
-    nonAgentCalls: 0,           // dropped: shared role the session couldn't narrow, or ingestion turned off
+    serviceAgentIngested: 0,        // an app or person calling a model directly — ingested, named after the caller
+    serviceAgentCalls: 0,           // dropped: shared role the session couldn't narrow, or ingestion turned off
     noIdentity: 0,              // no usable identity ARN at all
     noConversation: 0,          // parsed fine, but carried no complete exchange
     unparseableLines: 0
@@ -182,8 +182,13 @@ async function getUnprocessedLogFiles(manifest) {
     return unprocessed;
 }
 
-/** Downloads, gunzips, and extracts AKTO messages from every log entry in one S3 object. */
-async function processLogFile(bucket, key) {
+/**
+ * Downloads, gunzips, and extracts AKTO messages from every log entry in one S3 object.
+ * `discoveredAgents` is passed through so a first-seen SERVICE_AGENT caller (no ListAgents-
+ * style API exists to discover those upfront) gets its one-time discovery message the
+ * moment its first log entry is read, and is recorded so it isn't sent again.
+ */
+async function processLogFile(bucket, key, discoveredAgents) {
     const s3Object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const chunks = [];
     for await (const chunk of s3Object.Body) chunks.push(chunk);
@@ -193,7 +198,7 @@ async function processLogFile(bucket, key) {
     const messages = [];
     for (const line of lines) {
         try {
-            messages.push(...await processBedrockLogEntry(JSON.parse(line)));
+            messages.push(...await processBedrockLogEntry(JSON.parse(line), discoveredAgents));
         } catch (parseError) {
             logStats.unparseableLines++;
             console.warn(`⚠️ Skipping unparseable log line in ${key}: ${parseError.message}`);
@@ -204,7 +209,7 @@ async function processLogFile(bucket, key) {
 }
 
 /** Turns one raw Bedrock log-entry JSON line into zero or more AKTO messages. */
-async function processBedrockLogEntry(logEntry) {
+async function processBedrockLogEntry(logEntry, discoveredAgents) {
     const messages = [];
     try {
         // Resolve resource from ARN using discovery mappings. Only traffic that maps
@@ -214,7 +219,7 @@ async function processBedrockLogEntry(logEntry) {
         if (!resource) {
             // Either no identity at all, or a shared role the session couldn't narrow.
             // Everything else — including traffic no agent owns — comes back resolved.
-            if (logEntry.identity?.arn) logStats.nonAgentCalls++;
+            if (logEntry.identity?.arn) logStats.serviceAgentCalls++;
             else logStats.noIdentity++;
             return messages;
         }
@@ -228,7 +233,7 @@ async function processBedrockLogEntry(logEntry) {
         if (resolvedOutputBody) logEntry.output = { ...logEntry.output, outputBodyJson: resolvedOutputBody };
 
         if (resource.type === 'AGENT') logStats.agentCalls++;
-        else if (resource.type === 'NON_AGENT') logStats.nonAgentIngested++;
+        else if (resource.type === 'SERVICE_AGENT') logStats.serviceAgentIngested++;
 
         const pairs = extractConversationPairs(logEntry);
         if (pairs.length === 0) logStats.noConversation++;
@@ -241,10 +246,29 @@ async function processBedrockLogEntry(logEntry) {
                 // manifest), so neither costs a GetAgent call.
                 pair.botName = await fetchAgentName(resource.agentId, resource.agentName);
                 pair.executionRoleArn = resource.executionRoleArn || '';
-            } else if (resource.type === 'NON_AGENT') {
-                // Direct model invocation: attributed to the calling principal.
+            } else if (resource.type === 'SERVICE_AGENT') {
+                // Direct model invocation: attributed to the calling principal. Reuses
+                // the agent-id tag slot — a caller has no AWS resource ID of its own,
+                // but still needs a stable, non-empty identity to be discovered/grouped by.
+                pair.agentId = resource.callerName;
                 pair.botName = resource.callerName;
                 pair.callerKind = resource.callerKind;
+
+                // No ListAgents-equivalent API enumerates callers upfront, so this is the
+                // only place a SERVICE_AGENT caller can be recognized as first-seen — persisted
+                // into discoveredAgents (same manifest-backed map real agents use) so the
+                // discovery message goes out exactly once per caller, not once per log entry.
+                const serviceAgentKey = `serviceagent-${resource.callerName}`;
+                if (discoveredAgents && !discoveredAgents[serviceAgentKey]) {
+                    messages.push(buildServiceAgentDiscoveryMessage(resource, logEntry));
+                    discoveredAgents[serviceAgentKey] = {
+                        resourceId: resource.callerName,
+                        resourceType: 'SERVICE_AGENT',
+                        resourceName: resource.callerName,
+                        callerKind: resource.callerKind,
+                        discoveredAt: new Date().toISOString()
+                    };
+                }
             } else if (resource.type === 'HARNESS') {
                 pair.harnessId = resource.harnessId;
                 pair.harnessName = resource.harnessName;

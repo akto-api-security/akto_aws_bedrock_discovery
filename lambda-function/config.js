@@ -73,7 +73,7 @@ const S3_BUDGET_MS = Math.floor(RUN_BUDGET_MS * S3_BUDGET_SHARE);   // 4 minutes
  * On by default: in real accounts this is the bulk of Gen-AI traffic and it is worth
  * seeing. Set to 'false' to fall back to agent-only ingestion without a redeploy.
  */
-const INGEST_NON_AGENT_TRAFFIC = String(process.env.INGEST_NON_AGENT_TRAFFIC || 'true').toLowerCase() !== 'false';
+const INGEST_SERVICE_AGENT_TRAFFIC = String(process.env.INGEST_SERVICE_AGENT_TRAFFIC || 'true').toLowerCase() !== 'false';
 
 /**
  * Ceiling on one message's traceData. Tool results are truncated (longest first) past
@@ -107,7 +107,7 @@ module.exports = {
     DATA_INGESTION_ENDPOINT, AKTO_API_KEY, LOGS_BUCKET_NAME, LOGS_PREFIX, MARKERS_BUCKET_NAME,
     AWS_REGION, AWS_ACCOUNT_ID, MARKERS_PREFIX, MANIFEST_KEY,
     SEND_BATCH_SIZE, MAX_BATCH_BYTES, MAX_TRACE_BYTES, SEND_DEADLINE_MARGIN_MS, FLUSH_THRESHOLD, TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, LOOKBACK_DAYS,
-    SCHEDULE_INTERVAL_MS, RUN_BUDGET_MS, S3_BUDGET_SHARE, S3_BUDGET_MS, INGEST_NON_AGENT_TRAFFIC,
+    SCHEDULE_INTERVAL_MS, RUN_BUDGET_MS, S3_BUDGET_SHARE, S3_BUDGET_MS, INGEST_SERVICE_AGENT_TRAFFIC,
     RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH, TRACE_LOOKBACK_DAYS, TRACE_MARKERS_PREFIX, TRACE_MANIFEST_KEY,
     validateConfig,
     bedrockAgentClient: new BedrockAgentClient({ region: AWS_REGION }),
