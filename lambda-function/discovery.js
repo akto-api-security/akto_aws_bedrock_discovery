@@ -497,5 +497,9 @@ function getIdentityStats() { return { ...identityStats }; }
 
 module.exports = {
     resetRunLogState, getIdentityStats, rebuildRoleMapFromDiscoveredAgents, discoverAllNewAgents, createStandardMessage,
-    fetchAgentName, findResourceByArn, parsePrincipal, buildServiceAgentDiscoveryMessage
+    fetchAgentName, findResourceByArn, parsePrincipal, buildServiceAgentDiscoveryMessage,
+    // Shared with the Quick Suite pipeline: a Quick agent has no execution role, but an
+    // IAM-federated Quick user resolves to one, and its attached policies are fetched
+    // through this exact function (and its per-run cache) rather than a second copy.
+    getRolePolicies, extractRoleNameFromArn
 };
