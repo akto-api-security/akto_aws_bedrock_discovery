@@ -22,7 +22,7 @@ const { s3Client, MARKERS_BUCKET_NAME, QUICK_MANIFEST_KEY } = require('./config'
 
 const MAX_FAILED_FILES = 50;
 
-const EMPTY = { discoveredAgents: {}, actionConnectors: {}, quickUsers: {}, lastProcessedTimestamp: null, failedFiles: [] };
+const EMPTY = { discoveredAgents: {}, actionConnectors: {}, quickUsers: {}, lastProcessedTimestamp: null, failedFiles: [], failedMessages: [] };
 
 /** Reads the manifest from S3. Returns the empty shape on first run or any read error — never null, never throws. */
 async function getQuickManifest() {
@@ -49,7 +49,7 @@ async function getQuickManifest() {
  * reprocessed next run, which is the safe direction to fail in (possible duplicate)
  * versus silently losing data.
  */
-async function updateQuickManifest({ discoveredAgents, actionConnectors, quickUsers, lastProcessedTimestamp, filesProcessed = 0, failedFiles = [] }) {
+async function updateQuickManifest({ discoveredAgents, actionConnectors, quickUsers, lastProcessedTimestamp, filesProcessed = 0, failedFiles = [], failedMessages = [] }) {
     try {
         const existing = await getQuickManifest();
         const previous = existing.lastProcessedTimestamp;
@@ -74,8 +74,20 @@ async function updateQuickManifest({ discoveredAgents, actionConnectors, quickUs
             if (mergedFailures.length >= MAX_FAILED_FILES) break;
         }
 
+        // Same shape and capping as failedFiles: messages AKTO refused permanently. They
+        // are never retried, so this is the only durable record that they were dropped —
+        // the checkpoint has already moved past them by the time this is written.
+        const mergedRejects = [];
+        const seenIds = new Set();
+        for (const reject of [...failedMessages, ...(existing.failedMessages || [])]) {
+            if (!reject?.requestId || seenIds.has(reject.requestId)) continue;
+            seenIds.add(reject.requestId);
+            mergedRejects.push(reject);
+            if (mergedRejects.length >= MAX_FAILED_FILES) break;
+        }
+
         const manifest = {
-            version: '1.0',
+            version: '1.1',
             lastProcessedTimestamp: checkpoint || new Date().toISOString(),
             lastManifestUpdate: new Date().toISOString(),
             filesProcessedCount: filesProcessed,
@@ -83,7 +95,8 @@ async function updateQuickManifest({ discoveredAgents, actionConnectors, quickUs
             discoveredAgents: discoveredAgents || {},
             actionConnectors: actionConnectors || {},
             quickUsers: quickUsers || {},
-            ...(mergedFailures.length > 0 && { failedFiles: mergedFailures })
+            ...(mergedFailures.length > 0 && { failedFiles: mergedFailures }),
+            ...(mergedRejects.length > 0 && { failedMessages: mergedRejects })
         };
         await s3Client.send(new PutObjectCommand({
             Bucket: MARKERS_BUCKET_NAME,
@@ -92,7 +105,7 @@ async function updateQuickManifest({ discoveredAgents, actionConnectors, quickUs
             ContentType: 'application/json'
         }));
         const moved = previous !== manifest.lastProcessedTimestamp;
-        console.log(`✅ Quick manifest checkpointed: lastProcessedTimestamp=${manifest.lastProcessedTimestamp}${moved ? '' : ' (unchanged)'}, ${manifest.agentCount} known agent(s), ${Object.keys(manifest.actionConnectors).length} connector(s), ${Object.keys(manifest.quickUsers).length} user(s)${mergedFailures.length ? `, ${mergedFailures.length} failed file(s) recorded` : ''}`);
+        console.log(`✅ Quick manifest checkpointed: lastProcessedTimestamp=${manifest.lastProcessedTimestamp}${moved ? '' : ' (unchanged)'}, ${manifest.agentCount} known agent(s), ${Object.keys(manifest.actionConnectors).length} connector(s), ${Object.keys(manifest.quickUsers).length} user(s)${mergedFailures.length ? `, ${mergedFailures.length} failed file(s) recorded` : ''}${mergedRejects.length ? `, ${mergedRejects.length} rejected message(s) recorded` : ''}`);
     } catch (error) {
         console.error(`❌ Error checkpointing Quick manifest: ${error.message}`);
     }

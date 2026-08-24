@@ -42,7 +42,7 @@ function buildRoleToAgentsIndex(discoveredAgents) {
     return index;
 }
 
-async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTimestamp, failedFiles = []) {
+async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTimestamp, failedFiles = [], failedMessages = []) {
     try {
         const existing = await getManifest();
         const previous = existing.lastProcessedTimestamp;
@@ -64,6 +64,18 @@ async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTim
             if (mergedFailures.length >= MAX_FAILED_FILES) break;
         }
 
+        // Same shape as failedFiles: newest first, deduped, capped. These are messages
+        // AKTO refused permanently — they are never retried, so this is the only record
+        // of them once the logs age out.
+        const mergedRejects = [];
+        const seenIds = new Set();
+        for (const reject of [...failedMessages, ...(existing.failedMessages || [])]) {
+            if (!reject?.requestId || seenIds.has(reject.requestId)) continue;
+            seenIds.add(reject.requestId);
+            mergedRejects.push(reject);
+            if (mergedRejects.length >= MAX_FAILED_FILES) break;
+        }
+
         const roleToAgents = buildRoleToAgentsIndex(discoveredAgents);
         const ambiguous = Object.entries(roleToAgents).filter(([, agents]) => agents.length > 1);
         if (ambiguous.length > 0) {
@@ -81,7 +93,8 @@ async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTim
             roleCount: Object.keys(roleToAgents).length,
             roleToAgents,
             discoveredAgents: discoveredAgents || {},
-            ...(mergedFailures.length > 0 && { failedFiles: mergedFailures })
+            ...(mergedFailures.length > 0 && { failedFiles: mergedFailures }),
+            ...(mergedRejects.length > 0 && { failedMessages: mergedRejects })
         };
         await s3Client.send(new PutObjectCommand({
             Bucket: MARKERS_BUCKET_NAME,
