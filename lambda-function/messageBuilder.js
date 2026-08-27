@@ -2,6 +2,7 @@
  * The single place that knows AKTO's wire format for a mirrored HTTP message.
  */
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
+const { actorIp } = require('./identityActor');
 
 /**
  * Maps a Bedrock log entry's operation to the real Runtime API path suffix it hit.
@@ -150,7 +151,7 @@ function buildAgentMessage(data, isConversation) {
         responseHeaders: JSON.stringify({ 'Content-Type': 'application/json', ...(isConversation && { 'X-Request-Id': data.requestId }) }),
         requestPayload: JSON.stringify(requestPayload),
         responsePayload: JSON.stringify(responsePayload),
-        ip: '0.0.0.0',
+        ip: actorIp(data.arn),
         time: timestamp.toString(),
         statusCode: '200',
         type: 'HTTP',

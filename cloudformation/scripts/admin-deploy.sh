@@ -7,7 +7,7 @@
   REGIONS=("us-east-1" "us-west-2" "eu-west-1" "ap-south-1" "ap-northeast-1" "ap-southeast-1")
 
   echo "📦 Building Lambda package..."
-  cd ../lambda-function && npm install && zip -r ../akto-bedrock-processor.zip . -x "*.git*" "node_modules/.cache/*" && cd ../cloudformation
+  cd ../lambda-function && npm install && zip -r ../akto-bedrock-processor.zip . -x "*.git*" "test/*" "node_modules/.cache/*" && cd ../cloudformation
   echo "✅ Built"
 
   echo "📤 Uploading to all regions..."

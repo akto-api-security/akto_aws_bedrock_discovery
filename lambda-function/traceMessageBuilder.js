@@ -4,6 +4,7 @@
  * Classic isn't discovered or traced here (see lambda-function/ for that).
  */
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
+const { actorIp } = require('./identityActor');
 
 /** Normalizes discovery-message identity across HARNESS/RUNTIME, which use different field names for the same concept. */
 function resolveDiscoveryIdentity(data) {
@@ -94,7 +95,7 @@ function buildAgentMessage(data, isConversation) {
         responseHeaders: JSON.stringify({ 'Content-Type': 'application/json', ...(isConversation && { 'X-Request-Id': data.requestId }) }),
         requestPayload: JSON.stringify(requestPayload),
         responsePayload: JSON.stringify(responsePayload),
-        ip: '0.0.0.0',
+        ip: actorIp(data.arn),
         time: timestamp.toString(),
         statusCode: '200',
         type: 'HTTP',

@@ -63,7 +63,7 @@ echo ""
 echo "📦 Building Lambda package..."
 cd lambda-function
 npm install
-zip -r ../akto-bedrock-processor.zip . -x "*.git*" "node_modules/.cache/*"
+zip -r ../akto-bedrock-processor.zip . -x "*.git*" "test/*" "node_modules/.cache/*"
 cd ..
 echo "✅ Lambda package created"
 
