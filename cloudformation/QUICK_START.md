@@ -220,13 +220,119 @@ Go to CloudFormation → Stacks → Select your stack → View events
 ```
 cloudformation/
 ├── templates/
-│   └── main-template.yaml          ← The blueprint (don't modify)
+│   ├── main-template.yaml          ← The blueprint (don't modify)
+│   ├── client-aws-cf-template.yaml ← Single account deployment
+│   ├── client-aws-cf-stackset-template.yaml  ← Multi-account (StackSet)
+│   └── akto-markers-bucket.yaml    ← Central checkpoint bucket (StackSet only)
 ├── parameters/
 │   ├── dev-parameters.json         ← Edit this for dev
 │   └── prod-parameters.json        ← Edit this for prod
 ├── scripts/
 │   └── deploy.sh                   ← Run this to deploy
 ├── QUICK_START.md                  ← This file
+```
+
+## Multi-Account Deployment (StackSet)
+
+Everything above deploys into **one** AWS account. To cover every account in an
+organization, deploy `client-aws-cf-stackset-template.yaml` as a StackSet instead. One
+Lambda then runs per account and region, and all of them checkpoint into a single bucket
+in the management account, each under its own `<account-id>/<region>/` prefix.
+
+Single-account deployments are unaffected — `client-aws-cf-template.yaml` is unchanged and
+keeps behaving exactly as it does today.
+
+### Step 1: Create the central markers bucket
+
+Deploy **once**, as an ordinary stack, in the management account:
+
+```bash
+aws cloudformation create-stack \
+  --stack-name akto-markers-bucket \
+  --template-body file://templates/akto-markers-bucket.yaml \
+  --parameters ParameterKey=OrgId,ParameterValue=o-abcd1234ef
+```
+
+Find your organization id with:
+
+```bash
+aws organizations describe-organization --query Organization.Id --output text
+```
+
+Then take the bucket name from the stack output:
+
+```bash
+aws cloudformation describe-stacks --stack-name akto-markers-bucket \
+  --query "Stacks[0].Outputs[?OutputKey=='MarkersBucketName'].OutputValue" --output text
+```
+
+The bucket policy restricts every account to reading and writing only under its own
+account id, so no account can see or overwrite another's checkpoint. It is set to
+`Retain`, so deleting the stack does not delete the checkpoints — losing them would make
+every account replay its full lookback window and re-send conversations AKTO already has.
+
+### Step 2: Create the StackSet
+
+Service-managed, so AWS creates the roles and new accounts are picked up automatically:
+
+```bash
+aws cloudformation create-stack-set \
+  --stack-set-name akto-bedrock-processor \
+  --template-body file://templates/client-aws-cf-stackset-template.yaml \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+      ParameterKey=MarkersBucketName,ParameterValue=<from step 1> \
+      ParameterKey=DataIngestionEndpoint,ParameterValue=https://your-akto:9095/api/ingestData \
+      ParameterKey=AktoApiKey,ParameterValue=<your key> \
+      ParameterKey=LambdaCodeVersion,ParameterValue=v3.6
+```
+
+### Step 3: Deploy to your OUs
+
+```bash
+aws cloudformation create-stack-instances \
+  --stack-set-name akto-bedrock-processor \
+  --deployment-targets OrganizationalUnitIds=ou-abcd-11111111 \
+  --regions us-east-1
+```
+
+### Is Bedrock logging already enabled?
+
+`BedrockLoggingMode` decides what happens in accounts that are not yet logging:
+
+| | |
+|---|---|
+| `discover` (default) | Reads the bucket off each account's existing configuration. Bucket names may differ per account. Nothing is ever created or modified. |
+| `create` | Where an account has **no** logging configured at all, creates a bucket and turns S3 logging on. Requires `BedrockBucketBaseName`. |
+
+`create` is safe on a mixed fleet. An account already logging to S3 is read as-is, and an
+account logging only to CloudWatch is **skipped and left untouched** — Bedrock keeps one
+logging configuration per account, so adding an S3 destination would delete their
+CloudWatch one. Those accounts are named in the logs and need S3 logging enabled by hand.
+
+### Before you deploy
+
+The Lambda code must exist in **every region you target** — Lambda requires the code
+bucket be in the function's own region:
+
+```bash
+aws s3 ls s3://lambda-code-akto-us-east-1/v3.6/akto-bedrock-processor.zip
+```
+
+### Checking it worked
+
+```bash
+aws s3 ls s3://<markers-bucket>/ --recursive | head
+```
+
+Expect one prefix per account and region:
+
+```
+111122223333/us-east-1/bedrock-logs/manifest.json
+111122223333/us-east-1/agentcore-tracing/manifest.json
+444455556666/eu-west-1/bedrock-logs/manifest.json
 ```
 
 ## Next Steps

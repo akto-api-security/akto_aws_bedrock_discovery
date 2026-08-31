@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AKTO Bedrock Discovery - StackSet deployment. Deployed as a service-managed StackSet
+  from the Organization management account, it places one Lambda per account and region
+  running two independent pipelines: Bedrock Agent Classic (S3 model-invocation logs) and
+  AgentCore Harness/Runtime (CloudWatch observability traces).
+
+  No logs bucket name is configured: the Lambda reads it from each account's own Bedrock
+  model invocation logging configuration, so accounts may use completely different bucket
+  names. Checkpoints go to one central markers bucket in the management account, under
+  <account-id>/<region>/.
+
+  Deploy akto-markers-bucket.yaml as a plain stack in the management account FIRST, and
+  pass its output as MarkersBucketName.
+
+  For a single-account deployment use client-aws-cf-template.yaml instead - this template
+  is only for multi-account StackSets.
+
+Parameters:
+  MarkersBucketName:
+    Type: String
+    Description: >
+      Name of the CENTRAL markers bucket, taken from the MarkersBucketName output of the
+      akto-markers-bucket.yaml stack. Every processor writes its checkpoints there under
+      <account-id>/<region>/, so one place holds the org-wide view of discovered agents,
+      harnesses, runtimes and last-processed timestamps.
+    AllowedPattern: '^[a-z0-9\-\.]{3,63}$'
+    ConstraintDescription: 'Must be the central markers bucket name'
+
+  DataIngestionEndpoint:
+    Type: String
+    Description: 'AKTO Data Ingestion API endpoint URL (e.g. https://your-akto-instance.com:9095/api/ingestData)'
+
+  AktoApiKey:
+    Type: String
+    NoEcho: true
+    Description: 'AKTO API Key for authentication'
+
+  BedrockLoggingMode:
+    Type: String
+    Description: >
+      Is Bedrock model invocation logging ALREADY enabled in these accounts?
+        discover - YES, or you will enable it yourself. The Lambda reads the bucket off
+                   the existing configuration. Bucket names may differ per account and
+                   you supply no bucket name at all. Nothing is ever modified.
+        create   - NO. Where an account has NO logging configured at all, the Lambda
+                   creates the bucket and turns S3 logging on, asking for text data only.
+      'create' is safe on a mixed fleet. An account already logging to S3 is read as-is,
+      and an account logging only to CloudWatch is left completely untouched and reported
+      as skipped - never converted, because Bedrock keeps one configuration per account
+      and writing an S3 destination into it would delete the CloudWatch one.
+    Default: 'discover'
+    AllowedValues: ['discover', 'create']
+
+  BedrockBucketBaseName:
+    Type: String
+    Description: >
+      Required only when BedrockLoggingMode is 'create'. Base name for the bucket the
+      Lambda creates; the account id AND region are appended, because S3 bucket names are
+      global and one account can run Bedrock in more than one region.
+      'akto-bedrock-logs' becomes akto-bedrock-logs-041877753357-us-east-1.
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9\-\.]{3,40}$'
+    ConstraintDescription: 'Must be a valid S3 bucket name prefix, or blank in discover mode'
+
+  LogsBucketName:
+    Type: String
+    Description: >
+      (Optional) Overrides discovery with an exact bucket name. Only useful when every
+      targeted account genuinely shares one bucket - a StackSet sends this single value to
+      every account, so leave it blank in almost all cases.
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9\-\.]{3,63}$'
+    ConstraintDescription: 'Must be a valid S3 bucket name, or blank to discover per account'
+
+  LogsPrefix:
+    Type: String
+    Description: '(Optional) S3 prefix for Bedrock logs, used only alongside LogsBucketName. Discovery derives this per account.'
+    Default: 'AWSLogs/'
+
+  RuntimeLogGroupPrefix:
+    Type: String
+    Description: '(Optional) CloudWatch log group prefix for per-runtime AgentCore observability logs. Default matches AWS''s own naming convention.'
+    Default: '/aws/bedrock-agentcore/runtimes/'
+
+  LambdaCodeVersion:
+    Type: String
+    Description: 'Version prefix in lambda-code-akto-<region> holding akto-bedrock-processor.zip (e.g. v3.6). The object must exist at that prefix, in EVERY targeted region, before deploying.'
+    Default: 'v1.0'
+    AllowedPattern: '^v[0-9]+\.[0-9]+$'
+    ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
+
+Conditions:
+  # 'create' grants the permissions needed to make a bucket and enable logging. In
+  # 'discover' mode they are withheld entirely and the Lambda can only read.
+  BedrockCreatesLogging: !Equals [!Ref BedrockLoggingMode, 'create']
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Region is part of the name because IAM roles are GLOBAL per account: without it,
+      # deploying this StackSet to a second region in the same account fails with
+      # "role already exists".
+      RoleName: !Sub 'akto-bedrock-processor-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AktoBedrockProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Central markers bucket in the management account. Scoped to this account's
+              # own prefix, so a processor can never read or overwrite another account's
+              # checkpoint even though every account shares the bucket.
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${MarkersBucketName}/${AWS::AccountId}/*'
+              - Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: !Sub 'arn:aws:s3:::${MarkersBucketName}'
+                Condition:
+                  StringLike:
+                    's3:prefix': !Sub '${AWS::AccountId}/*'
+
+              # Bedrock logs. The bucket is discovered at runtime and its name is unknown
+              # at deploy time, so this is scoped by KEY rather than by bucket: Bedrock
+              # always writes under AWSLogs/<account-id>/, so the Lambda can read its own
+              # account's log objects in whichever bucket the configuration points at, and
+              # nothing else.
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::*/AWSLogs/${AWS::AccountId}/*'
+              - Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: 'arn:aws:s3:::*'
+                Condition:
+                  StringLike:
+                    's3:prefix': 'AWSLogs/*'
+
+              # Read-only logging lookup: this is how the logs bucket is discovered, so the
+              # operator never supplies a bucket name. Granted in both modes.
+              - Effect: Allow
+                Action: 'bedrock:GetModelInvocationLoggingConfiguration'
+                Resource: '*'
+
+              # Bedrock permissions for agent discovery and metadata
+              - Effect: Allow
+                Action:
+                  - 'bedrock:ListAgents'
+                  - 'bedrock:GetAgent'
+                  - 'bedrock:ListTagsForResource'
+                Resource: '*'
+
+              # Bedrock AgentCore permissions for harness/runtime discovery
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:ListHarnesses'
+                  - 'bedrock-agentcore:GetHarness'
+                  - 'bedrock-agentcore:ListTagsForResource'
+                  - 'bedrock-agentcore:ListAgentRuntimes'
+                  - 'bedrock-agentcore:GetAgentRuntime'
+                Resource: '*'
+
+              # IAM permissions for role inspection (agent execution roles + harness/runtime roles)
+              - Effect: Allow
+                Action:
+                  - 'iam:ListAttachedRolePolicies'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+
+              # CloudWatch Logs - read-only (used by the AgentCore Harness/Runtime trace
+              # pipeline only). DescribeLogGroups has no resource-level permission support
+              # in IAM (AWS requires Resource: "*" for it); FilterLogEvents does support
+              # scoping, so it stays limited to the observability log group prefix.
+              - Effect: Allow
+                Action:
+                  - 'logs:DescribeLogGroups'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:FilterLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${RuntimeLogGroupPrefix}*'
+
+              # 'create' mode only: make the bucket and turn model invocation logging on.
+              # Withheld entirely in 'discover' mode, where the Lambda never mutates
+              # anything.
+              - !If
+                - BedrockCreatesLogging
+                - Effect: Allow
+                  Action:
+                    - 's3:CreateBucket'
+                    - 's3:PutBucketPolicy'
+                    - 's3:GetBucketPolicy'
+                  Resource: !Sub 'arn:aws:s3:::${BedrockBucketBaseName}-${AWS::AccountId}-*'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - BedrockCreatesLogging
+                - Effect: Allow
+                  Action: 'bedrock:PutModelInvocationLoggingConfiguration'
+                  Resource: '*'
+                - !Ref 'AWS::NoValue'
+
+  AktoBedrockProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'akto-bedrock-processor-${AWS::AccountId}-${AWS::Region}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
+        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
+      Environment:
+        Variables:
+          DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
+          AKTO_API_KEY: !Ref AktoApiKey
+          MARKERS_BUCKET_NAME: !Ref MarkersBucketName
+          # This is what moves checkpoints to <account-id>/<region>/ and switches the logs
+          # bucket from configured to discovered. The single-account template never sets
+          # it, which is what keeps existing deployments byte-identical.
+          DEPLOYMENT_MODE: 'stackset'
+          BEDROCK_LOGGING_MODE: !Ref BedrockLoggingMode
+          BEDROCK_BUCKET_BASE_NAME: !Ref BedrockBucketBaseName
+          LOGS_BUCKET_NAME: !Ref LogsBucketName
+          LOGS_PREFIX: !Ref LogsPrefix
+          RUNTIME_LOG_GROUP_PREFIX: !Ref RuntimeLogGroupPrefix
+          BEDROCK_AWS_REGION: !Ref 'AWS::Region'
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+      Description: 'Processes Bedrock Agent Classic S3 logs and AgentCore Harness/Runtime CloudWatch traces, sending both to AKTO'
+
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AllowLambdaInvocation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt AktoBedrockProcessorFunction.Arn
+
+  BedrockLogProcessingScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'akto-bedrock-schedule-${AWS::AccountId}-${AWS::Region}'
+      # Keep in step with SCHEDULE_INTERVAL_MS in config.js, which derives the run budget
+      # from it so a run always finishes before the next trigger fires.
+      ScheduleExpression: 'rate(10 minutes)'
+      State: ENABLED
+      Description: 'Triggers AKTO Bedrock log processor Lambda function on schedule'
+      Targets:
+        - Arn: !GetAtt AktoBedrockProcessorFunction.Arn
+          Id: AktoBedrockProcessorTarget
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AktoBedrockProcessorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BedrockLogProcessingScheduleRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: 'Name of the processor Lambda'
+    Value: !Ref AktoBedrockProcessorFunction
+
+  LambdaFunctionArn:
+    Description: 'ARN of the processor Lambda'
+    Value: !GetAtt AktoBedrockProcessorFunction.Arn
+
+  LoggingMode:
+    Description: 'How this account obtains its Bedrock model invocation logs'
+    Value: !If
+      - BedrockCreatesLogging
+      - !Sub 'CREATE - if nothing is configured, provisions ${BedrockBucketBaseName}-${AWS::AccountId}-${AWS::Region} and enables logging. Accounts already logging to S3 are read as-is; accounts logging only to CloudWatch are skipped, untouched.'
+      - 'DISCOVER - reads the bucket off the existing configuration; nothing is created or modified'
+
+  MarkersLocation:
+    Description: 'Where this account and region writes its checkpoints'
+    Value: !Sub 's3://${MarkersBucketName}/${AWS::AccountId}/${AWS::Region}/'

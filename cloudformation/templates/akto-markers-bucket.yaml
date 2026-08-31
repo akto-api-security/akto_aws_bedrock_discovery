@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AKTO central markers bucket. Deploy this ONCE as a plain stack in the account that
+  should hold the checkpoints (normally the Organization management account) BEFORE
+  creating the processor StackSet.
+
+  Every processor Lambda, in every member account and region, writes its manifests here
+  under <account-id>/<region>/. That gives one place to see which agents, harnesses and
+  runtimes were discovered org-wide, and one place to read each account's last-processed
+  timestamp.
+
+  Keys never collide because each account+region owns its own prefix, and the bucket
+  policy below restricts every principal to writing only under its own account id.
+
+Parameters:
+  OrgId:
+    Type: String
+    Description: >
+      AWS Organizations id (e.g. o-abcd1234ef). Only principals in this organization may
+      read or write the bucket. Find it with: aws organizations describe-organization
+      --query Organization.Id --output text
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+    ConstraintDescription: 'Must be an AWS Organizations id like o-abcd1234ef'
+
+  BucketName:
+    Type: String
+    Description: >
+      (Optional) Exact bucket name. Leave blank for akto-markers-<this-account-id>,
+      which is unique because S3 bucket names are global.
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9\-\.]{3,63}$'
+    ConstraintDescription: 'Must be a valid S3 bucket name, or blank'
+
+Conditions:
+  HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+
+Resources:
+  MarkersBucket:
+    Type: AWS::S3::Bucket
+    # Retained deliberately: these objects are the ingestion checkpoints. Deleting the
+    # stack must not delete them, or every account replays its whole lookback window
+    # and re-sends conversations AKTO has already stored.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If [HasBucketName, !Ref BucketName, !Sub 'akto-markers-${AWS::AccountId}']
+      # Without this, an object written by a member account stays OWNED by that member
+      # account, and this account cannot read the contents of its own bucket - the
+      # classic cross-account S3 trap. BucketOwnerEnforced makes the bucket owner own
+      # every object regardless of who uploaded it.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # SSE-S3 rather than a customer-managed KMS key on purpose: a CMK would need its
+      # own key policy carrying the same org condition, and every member account write
+      # would fail until that was right too.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  MarkersBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MarkersBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # One statement covers every account in the organization - no per-account
+          # entries to maintain as accounts are added or removed.
+          #
+          # ${aws:PrincipalAccount} in the resource path is what stops account A from
+          # reading or overwriting account B's checkpoint: each principal can only touch
+          # keys under its own account id.
+          - Sid: AllowOrgAccountsToManageOwnPrefix
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Resource: !Sub '${MarkersBucket.Arn}/${!aws:PrincipalAccount}/*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrgId
+          # ListBucket is granted at the bucket level because S3 has no per-prefix list
+          # permission without a prefix condition; scoped to the caller's own prefix.
+          - Sid: AllowOrgAccountsToListOwnPrefix
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:ListBucket'
+            Resource: !GetAtt MarkersBucket.Arn
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrgId
+              StringLike:
+                s3:prefix: '${aws:PrincipalAccount}/*'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt MarkersBucket.Arn
+              - !Sub '${MarkersBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+Outputs:
+  MarkersBucketName:
+    Description: 'Paste this into the processor StackSet MarkersBucketName parameter'
+    Value: !Ref MarkersBucket
+
+  ManifestPathExample:
+    Description: 'Where each account+region writes its checkpoints'
+    Value: !Sub 's3://${MarkersBucket}/<account-id>/<region>/bedrock-logs/manifest.json (and .../agentcore-tracing/manifest.json)'

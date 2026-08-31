@@ -118,23 +118,28 @@ function getLogsStartTime(manifest) {
 }
 
 /**
- * Lists every .gz Bedrock log file under LOGS_PREFIX newer than the checkpoint,
+ * Lists every .gz Bedrock log file under the prefix newer than the checkpoint,
  * sorted oldest-first so processing (and the manifest timestamp it advances) is
  * chronological. Paginates through the full bucket listing via ContinuationToken.
+ *
+ * Bucket and prefix are arguments rather than module constants because under a StackSet
+ * they are discovered per account at runtime — one parameter value cannot name a
+ * different bucket in every account. They default to the configured values, which is the
+ * single-stack path and behaves exactly as before.
  */
-async function getUnprocessedLogFiles(manifest) {
+async function getUnprocessedLogFiles(manifest, bucket = LOGS_BUCKET_NAME, prefix = LOGS_PREFIX) {
     const startTime = getLogsStartTime(manifest);
     let allFiles = [];
     let continuationToken;
     let pages = 0;
 
 
-    console.log(`🪣 Listing s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} for .gz logs newer than ${startTime.toISOString()}`);
+    console.log(`🪣 Listing s3://${bucket}/${prefix} for .gz logs newer than ${startTime.toISOString()}`);
 
     do {
         const response = await s3Client.send(new ListObjectsV2Command({
-            Bucket: LOGS_BUCKET_NAME,
-            Prefix: LOGS_PREFIX,
+            Bucket: bucket,
+            Prefix: prefix,
             ContinuationToken: continuationToken,
             MaxKeys: 1000
         }));
@@ -169,10 +174,10 @@ async function getUnprocessedLogFiles(manifest) {
 
     // Turn each "nothing to do" case into a specific, actionable reason.
     if (allFiles.length === 0) {
-        console.warn(`⚠️ Nothing at s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} — check LOGS_PREFIX matches where Bedrock actually delivers, and that model invocation logging is enabled for this account/region`);
+        console.warn(`⚠️ Nothing at s3://${bucket}/${prefix} — check the prefix matches where Bedrock actually delivers, and that model invocation logging is enabled for this account/region`);
     } else if (logFiles.length === 0) {
         const sample = allFiles.slice(0, 3).map((f) => f.Key).join(', ');
-        console.warn(`⚠️ Objects exist under the prefix but none are .gz Bedrock logs. First key(s): ${sample} — LOGS_PREFIX may be pointing at the wrong level`);
+        console.warn(`⚠️ Objects exist under the prefix but none are .gz Bedrock logs. First key(s): ${sample} — the prefix may be pointing at the wrong level`);
     } else if (unprocessed.length === 0) {
         const newest = logFiles[logFiles.length - 1];
         console.log(`✅ Up to date — newest log file is ${newest.Key} (${new Date(newest.LastModified).toISOString()}), at or before the checkpoint`);

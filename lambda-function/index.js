@@ -12,6 +12,7 @@
 const config = require('./config');
 const { getManifest, updateManifest } = require('./manifest');
 const { getUnprocessedLogFiles, processLogFile, resetLogStats, getLogStats } = require('./s3Logs');
+const { resolveBedrockLogLocation } = require('./bedrockDelivery');
 const { discoverAllNewAgents, rebuildRoleMapFromDiscoveredAgents, resetRunLogState, getIdentityStats } = require('./discovery');
 const { sendToDataIngestionService } = require('./aktoClient');
 
@@ -42,9 +43,16 @@ function logEffectiveConfig() {
         ingestHost = new URL(config.DATA_INGESTION_ENDPOINT).host;
     } catch { /* leave as unset — validateConfig will have already failed on a blank value */ }
 
+    // The bucket is printed once it has been resolved, not here: in stackset mode it is
+    // discovered from this account's own logging configuration and is not known yet.
+    const logsSource = config.LOGS_BUCKET_NAME
+        ? `s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}`
+        : `discovered per account (${config.BEDROCK_LOGGING_MODE} mode)`;
+
     console.log('⚙️ Effective configuration:');
+    console.log(`  ├─ deployment          ${config.DEPLOYMENT_MODE}`);
     console.log(`  ├─ region              ${config.AWS_REGION} (account ${config.AWS_ACCOUNT_ID})`);
-    console.log(`  ├─ bedrock logs        s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}`);
+    console.log(`  ├─ bedrock logs        ${logsSource}`);
     console.log(`  ├─ checkpoints         s3://${config.MARKERS_BUCKET_NAME}/${config.MARKERS_PREFIX}`);
     console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}*`);
     console.log(`  ├─ akto ingest host    ${ingestHost} (api key ${config.AKTO_API_KEY ? 'set' : 'MISSING'})`);
@@ -144,8 +152,16 @@ async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourc
     return messages;
 }
 
-/** Bedrock Agent Classic: S3 model-invocation logs → AKTO. Unchanged from before the AgentCore merge. */
-async function runS3Pipeline(timeLeft, sendTimeLeft) {
+/**
+ * Bedrock Agent Classic: S3 model-invocation logs → AKTO.
+ *
+ * `logLocation` is where this account's logs live, resolved once per run by
+ * bedrockDelivery.js. When it carries { skip }, this account has no S3 model invocation
+ * logging and there are no files to read — but agent DISCOVERY still runs, because it
+ * reads the Bedrock Agent control plane rather than the logs and is just as useful in an
+ * account whose conversations are not being captured.
+ */
+async function runS3Pipeline(timeLeft, sendTimeLeft, logLocation) {
     resetLogStats();
     resetRunLogState();
     const manifest = await getManifest();
@@ -167,7 +183,12 @@ async function runS3Pipeline(timeLeft, sendTimeLeft) {
         totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp, [], sendTimeLeft, failedMessages);
     }
 
-    const unprocessedFiles = await getUnprocessedLogFiles(manifest);
+    const logsBucket = logLocation?.bucket || config.LOGS_BUCKET_NAME;
+    const logsPrefix = logLocation?.prefix || config.LOGS_PREFIX;
+
+    const unprocessedFiles = logLocation?.skip
+        ? []
+        : await getUnprocessedLogFiles(manifest, logsBucket, logsPrefix);
     console.log(`📁 ${unprocessedFiles.length} unprocessed log file(s)`);
 
     let pending = [];
@@ -185,7 +206,7 @@ async function runS3Pipeline(timeLeft, sendTimeLeft) {
 
         const fileTs = new Date(file.LastModified).toISOString();
         try {
-            const messages = await processLogFile(config.LOGS_BUCKET_NAME, file.Key, discoveredAgents);
+            const messages = await processLogFile(logsBucket, file.Key, discoveredAgents);
             pending.push(...messages);
             filesDone++;
         } catch (error) {
@@ -360,7 +381,24 @@ exports.handler = async (event, context) => {
         console.log(`  └─ run budget          ${(config.RUN_BUDGET_MS / 1000).toFixed(0)}s of work (schedule is ${(config.SCHEDULE_INTERVAL_MS / 60000).toFixed(0)}min; finishing inside it keeps runs from overlapping)`);
         console.log(`  └─ budget split        S3 holds up to ${(config.S3_BUDGET_MS / 1000).toFixed(0)}s (${Math.round(config.S3_BUDGET_SHARE * 100)}%), AgentCore gets the rest plus anything S3 leaves`);
 
-        const bedrockAgentClassic = await timed('Bedrock Agent Classic pipeline', () => runS3Pipeline(sliceTimeLeft(config.S3_BUDGET_MS), sendTimeLeft));
+        /*
+         * Resolved once, before either pipeline, and reused by the second pass — the
+         * lookup costs an API call and, in 'create' mode, can provision a bucket, neither
+         * of which should happen twice in one run.
+         *
+         * A skip is a normal outcome across a fleet, not a failure: the account keeps its
+         * agent discovery and its AgentCore traces, and only conversation capture from S3
+         * is unavailable. Saying so plainly here is what stops it looking like an account
+         * with no traffic.
+         */
+        const logLocation = await resolveBedrockLogLocation();
+        if (logLocation.skip) {
+            console.warn(`⚠️ Skipping S3 log processing for account ${config.AWS_ACCOUNT_ID} (${config.AWS_REGION}): ${logLocation.reason}`);
+        } else if (logLocation.justCreated) {
+            console.log('ℹ️ Logging was just enabled — this run finds no files yet; the next scheduled run picks up what Bedrock writes in the meantime');
+        }
+
+        const bedrockAgentClassic = await timed('Bedrock Agent Classic pipeline', () => runS3Pipeline(sliceTimeLeft(config.S3_BUDGET_MS), sendTimeLeft, logLocation));
         logMemory('after S3 pipeline');
 
         // Whatever S3 didn't use rolls over rather than being forfeited, so a run with
@@ -384,7 +422,7 @@ exports.handler = async (event, context) => {
         let s3SecondPass = null;
         if (bedrockAgentClassic.filesDeferred > 0 && timeLeft() > config.TIME_SAFETY_MARGIN_MS) {
             console.log(`♻️ AgentCore finished with ${(timeLeft() / 1000).toFixed(0)}s left and S3 has ${bedrockAgentClassic.filesDeferred} file(s) deferred — returning the remaining budget to S3`);
-            s3SecondPass = await timed('Bedrock Agent Classic pipeline (second pass)', () => runS3Pipeline(timeLeft, sendTimeLeft));
+            s3SecondPass = await timed('Bedrock Agent Classic pipeline (second pass)', () => runS3Pipeline(timeLeft, sendTimeLeft, logLocation));
             // One combined view: totals add up, and "deferred" is whatever the second
             // pass ended with, since it superseded the first pass's remainder.
             bedrockAgentClassic.filesDone += s3SecondPass.filesDone;
