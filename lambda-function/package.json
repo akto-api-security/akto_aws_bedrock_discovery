@@ -1,17 +1,19 @@
 {
-  "name": "akto-bedrock-log-processor",
+  "name": "akto-quick-processor",
   "version": "1.0.0",
-  "description": "AKTO Bedrock Log Processor - Client-side Lambda function for processing AWS Bedrock conversation logs",
+  "description": "AKTO Amazon Quick collector - discovers Quick agents and MCP connectors and ingests chat conversations",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "package": "npm install && zip -r ../akto-bedrock-processor.zip . -x '*.git*' 'node_modules/.cache/*'",
-    "deploy": "npm run package && aws lambda update-function-code --function-name akto-bedrock-log-processor --zip-file fileb://../akto-bedrock-processor.zip"
+    "package": "npm ci && zip -r ../akto-quick-processor.zip . -x '*.git*' 'node_modules/.cache/*'",
+    "deploy": "npm run package && aws lambda update-function-code --function-name akto-quick-processor --zip-file fileb://../akto-quick-processor.zip"
   },
   "keywords": [
     "aws",
     "lambda",
-    "bedrock",
+    "amazon-quick",
+    "quicksight",
+    "mcp",
     "akto",
     "monitoring",
     "s3"
@@ -19,8 +21,6 @@
   "author": "AKTO",
   "license": "MIT",
   "dependencies": {
-    "@aws-sdk/client-bedrock-agent": "^3.682.0",
-    "@aws-sdk/client-bedrock-agentcore-control": "^3.682.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.682.0",
     "@aws-sdk/client-iam": "^3.682.0",
     "@aws-sdk/client-quicksight": "^3.1111.0",

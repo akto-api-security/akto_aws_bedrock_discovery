@@ -1,157 +1,80 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  AKTO Bedrock Discovery - Client Deployment. One Lambda runs three independent
-  pipelines: Bedrock Agent Classic (S3 model-invocation logs), AgentCore
-  Harness/Runtime (CloudWatch observability traces), and Amazon Quick Suite
-  (vended CHAT_LOGS in S3). Each half is a no-op when its source isn't
-  configured: AgentCore finds zero log groups if the account hasn't enabled
-  CloudWatch Transaction Search + tracing, and Quick Suite is skipped entirely
-  unless QuickLogsPrefix is set. The other pipelines keep working normally.
+  AKTO Amazon Quick processor. Deployed as a StackSet from the Organization management
+  account, it places one Lambda per account and region that discovers Amazon Quick agents
+  and MCP connectors and ingests their chat conversations into AKTO.
+
+  No bucket name is configured anywhere: in 'discover' mode the Lambda reads the bucket
+  straight off the account's existing CHAT_LOGS delivery, and in 'create' mode it
+  provisions the bucket and the delivery itself. Checkpoints go to one central markers
+  bucket in the management account, under <account-id>/<region>/.
+
+  Deploy akto-markers-bucket.yaml as a plain stack in the management account FIRST, and
+  pass its output as MarkersBucketName.
 
 Parameters:
-  EnableBedrockClassic:
-    Type: String
-    Description: >
-      Enable the Bedrock Agent Classic pipeline (reads model-invocation logs from S3).
-      Set to false if this account does not use Bedrock Agents - the bedrock:* and
-      Bedrock-logs-bucket permissions are then not granted at all.
-    Default: 'true'
-    AllowedValues: ['true', 'false']
-
-  EnableAgentCore:
-    Type: String
-    Description: >
-      Enable the AgentCore Harness/Runtime pipeline (reads CloudWatch observability
-      traces). Set to false if this account does not use AgentCore - the
-      bedrock-agentcore:* and logs:DescribeLogGroups/FilterLogEvents permissions are
-      then not granted at all.
-    Default: 'true'
-    AllowedValues: ['true', 'false']
-
-  LogsBucketName:
-    Type: String
-    Description: >
-      S3 bucket name where Bedrock model-invocation logs are stored
-      (e.g. akto-aws-bedrock-logs-02). Required when EnableBedrockClassic is true;
-      leave blank otherwise. Note that QuickLogsBucketName falls back to this value,
-      so a Quick-only deployment reading from a different bucket should set that
-      parameter instead of this one.
-    Default: ''
-    AllowedPattern: '^$|^[a-z0-9\-\.]+$'
-    ConstraintDescription: 'Must be a valid S3 bucket name, or blank when EnableBedrockClassic is false'
-
-  LogsPrefix:
-    Type: String
-    Description: '(Optional) S3 prefix path for Bedrock logs. Default: AWSLogs/ (AWS-created folder for model invocation logging)'
-    Default: 'AWSLogs/'
-
   MarkersBucketName:
     Type: String
     Description: >
-      Exact S3 bucket name for AKTO marker/checkpoint files (e.g. akto-markers-02).
-      Use this for a single-account deployment. For a StackSet spanning several
-      accounts use MarkersBucketPrefix instead, which takes precedence over this.
-    Default: ''
-    AllowedPattern: '^$|^[a-z0-9\-\.]+$'
-    ConstraintDescription: 'Must be a valid S3 bucket name, or blank when MarkersBucketPrefix is set'
-
-  MarkersBucketPrefix:
-    Type: String
-    Description: >
-      (StackSet deployments) Base name of a PER-ACCOUNT markers bucket. The deploying
-      account ID is appended, so 'akto-markers' becomes akto-markers-<account-id> in
-      each account. Takes precedence over MarkersBucketName.
-      IMPORTANT: every account in a StackSet must get its OWN markers bucket. The
-      checkpoint keys (akto/markers/quick-suite/manifest.json and friends) do not
-      include the account ID, so pointing two accounts at one shared bucket makes them
-      overwrite each other's checkpoint on every run - each would repeatedly reprocess
-      or skip the other's logs.
-    Default: ''
-    AllowedPattern: '^$|^[a-z0-9\-\.]+$'
-    ConstraintDescription: 'Must be a valid S3 bucket name prefix, or blank'
+      Name of the CENTRAL markers bucket, taken from the MarkersBucketName output of the
+      akto-markers-bucket.yaml stack. Every processor writes its checkpoint there under
+      <account-id>/<region>/, so one place holds the org-wide view of discovered agents,
+      MCP connectors and last-processed timestamps.
+    AllowedPattern: '^[a-z0-9\-\.]{3,63}$'
+    ConstraintDescription: 'Must be the central markers bucket name'
 
   DataIngestionEndpoint:
     Type: String
-    Description: 'AKTO Data Ingestion API endpoint URL (e.g., https://your-akto-instance.com:9095/api/ingestData)'
+    Description: 'AKTO Data Ingestion API endpoint URL (e.g. https://your-akto-instance.com/api/ingestData)'
 
   AktoApiKey:
     Type: String
     NoEcho: true
     Description: 'AKTO API Key for authentication'
 
-  RuntimeLogGroupPrefix:
-    Type: String
-    Description: '(Optional) CloudWatch log group prefix for per-runtime AgentCore observability logs. Default matches AWS''s own naming convention.'
-    Default: '/aws/bedrock-agentcore/runtimes/'
-
-  QuickLogsPrefix:
+  QuickLoggingMode:
     Type: String
     Description: >
-      (Optional) S3 key prefix under which Amazon Quick Suite delivers its CHAT_LOGS.
-      Leave blank to disable the Quick Suite pipeline entirely. Any depth works - this
-      is matched as a plain S3 prefix, so 'AWSLogs/', 'AWSLogs/123456789012/quicksight/'
-      and 'quick-logs/' are all valid. Copy whatever path your CreateDelivery actually
-      writes to, and make it as specific as you can: it is both the scan scope and the
-      IAM grant, so a narrower prefix means fewer objects listed and less access
-      granted. If Quick and Bedrock logs share one bucket, do NOT use a prefix broad
-      enough to cover both - non-chat objects are skipped safely, but each one is still
-      fetched and read first.
-    Default: ''
+      Is Quick chat logging ALREADY enabled in these accounts?
+        discover - YES. The Lambda finds the existing CHAT_LOGS delivery and reads the
+                   bucket straight off it. Bucket names may differ per account; nothing
+                   is created and you supply no bucket name at all.
+        create   - NO. The Lambda creates the bucket and enables logging itself, asking
+                   for every record field including latency and time_to_first_token.
+      'create' is safe on a mixed fleet: an account that already has a delivery is
+      detected and left untouched rather than duplicated, and an account with no Quick
+      Suite in this region has nothing created for it.
+    Default: 'discover'
+    AllowedValues: ['discover', 'create']
 
-  QuickLogsBucketName:
+  QuickBucketBaseName:
     Type: String
     Description: >
-      (Optional) S3 bucket holding the Quick Suite logs. Leave blank to read them
-      from the same bucket as the Bedrock logs (LogsBucketName). Only set this if
-      the Quick log delivery writes to a different bucket.
+      Required only when QuickLoggingMode is 'create'. Base name for the bucket the
+      Lambda creates; the account id AND region are appended, because S3 bucket names are
+      global and one account can run Quick in more than one region.
+      'akto-quick-logs' becomes akto-quick-logs-041877753357-us-east-1.
     Default: ''
-    AllowedPattern: '^$|^[a-z0-9\-\.]+$'
-    ConstraintDescription: 'Must be a valid S3 bucket name, or blank to reuse LogsBucketName'
-
-  QuickLogsBucketPrefix:
-    Type: String
-    Description: >
-      (StackSet deployments) Base name of a PER-ACCOUNT Quick Suite logs bucket. The
-      deploying account ID is appended, so 'akto-amazon-quick-logs' resolves to
-      akto-amazon-quick-logs-041877753357 in one account and
-      akto-amazon-quick-logs-887089841930 in another - letting one StackSet cover every
-      account without per-instance parameter overrides. Takes precedence over
-      QuickLogsBucketName, which in turn takes precedence over LogsBucketName.
-    Default: ''
-    AllowedPattern: '^$|^[a-z0-9\-\.]+$'
-    ConstraintDescription: 'Must be a valid S3 bucket name prefix, or blank'
+    AllowedPattern: '^$|^[a-z0-9\-\.]{3,40}$'
+    ConstraintDescription: 'Must be a valid S3 bucket name prefix, or blank in discover mode'
 
   LambdaCodeVersion:
     Type: String
-    Description: 'Version of Lambda code to deploy (e.g., v1.0, v1.1, v2.0). Check with AKTO team for latest version.'
+    Description: 'Version prefix in lambda-code-akto-<region> holding akto-quick-processor.zip (e.g. v2.0). The object must exist at that prefix before deploying.'
     Default: 'v1.0'
     AllowedPattern: '^v[0-9]+\.[0-9]+$'
     ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
 
 Conditions:
-  # Each pipeline's switch gates BOTH its execution (via the Lambda env var) and the
-  # IAM permissions only it needs, so an account that uses one product never grants
-  # access for the other two.
-  BedrockClassicEnabled: !Equals [!Ref EnableBedrockClassic, 'true']
-  AgentCoreEnabled: !Equals [!Ref EnableAgentCore, 'true']
-  # The prefix is the on/off switch for the whole Quick Suite pipeline — with it
-  # blank, neither the QuickSight nor the extra S3 permissions are granted.
-  QuickEnabled: !Not [!Equals [!Ref QuickLogsPrefix, '']]
-  QuickHasOwnBucket: !Not [!Equals [!Ref QuickLogsBucketName, '']]
-  # StackSet mode: resolve the bucket per account instead of taking a literal name.
-  QuickHasBucketPrefix: !Not [!Equals [!Ref QuickLogsBucketPrefix, '']]
-  MarkersHasPrefix: !Not [!Equals [!Ref MarkersBucketPrefix, '']]
-  # iam:ListAttachedRolePolicies is used by all three pipelines to enrich messages with
-  # the calling identity's attached policies — Bedrock/AgentCore for an execution role,
-  # Quick for an IAM-federated user — so it is granted if any of them is on.
-  AnyRolePolicyLookup: !Or [!Condition BedrockClassicEnabled, !Condition AgentCoreEnabled, !Condition QuickEnabled]
+  # The only conditional left. 'create' grants the permissions needed to make a bucket and
+  # a delivery; in 'discover' mode those are withheld entirely and the Lambda only reads.
+  QuickCreatesLogging: !Equals [!Ref QuickLoggingMode, 'create']
 
 Resources:
-  # IAM Role for Lambda
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'akto-bedrock-processor-cf1-${AWS::AccountId}'
+      RoleName: !Sub 'akto-quick-processor-${AWS::AccountId}-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -162,128 +85,104 @@ Resources:
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
-        - PolicyName: AktoBedrockPolicy
+        - PolicyName: AktoQuickProcessorPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Logs S3 Bucket - Read access to Bedrock logs at specified prefix.
-              # Bedrock Agent Classic pipeline only.
-              - !If
-                - BedrockClassicEnabled
-                - Effect: Allow
-                  Action:
-                    - 's3:GetObject'
-                    - 's3:ListBucket'
-                  Resource:
-                    - !Sub 'arn:aws:s3:::${LogsBucketName}'
-                    - !Sub 'arn:aws:s3:::${LogsBucketName}/${LogsPrefix}*'
-                - !Ref 'AWS::NoValue'
-              # Markers S3 Bucket - Read/Write access to akto/markers/ prefix only
+              # Central markers bucket in the management account. Scoped to this account's
+              # own prefix, so a processor can never read or overwrite another account's
+              # checkpoint even though every account shares the bucket.
               - Effect: Allow
                 Action:
                   - 's3:GetObject'
                   - 's3:PutObject'
-                  - 's3:ListBucket'
-                Resource:
-                  - !Sub
-                    - 'arn:aws:s3:::${MarkersBucket}'
-                    - MarkersBucket: !If [MarkersHasPrefix, !Sub '${MarkersBucketPrefix}-${AWS::AccountId}', !Ref MarkersBucketName]
-                  - !Sub
-                    - 'arn:aws:s3:::${MarkersBucket}/akto/markers/*'
-                    - MarkersBucket: !If [MarkersHasPrefix, !Sub '${MarkersBucketPrefix}-${AWS::AccountId}', !Ref MarkersBucketName]
-              # Bedrock permissions for agent discovery and metadata
+                Resource: !Sub 'arn:aws:s3:::${MarkersBucketName}/${AWS::AccountId}/*'
+              - Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: !Sub 'arn:aws:s3:::${MarkersBucketName}'
+                Condition:
+                  StringLike:
+                    's3:prefix': !Sub '${AWS::AccountId}/*'
+
+              # Quick chat logs. The bucket is discovered at runtime and its name is
+              # unknown at deploy time, so this is scoped by KEY rather than by bucket:
+              # Quick always writes under AWSLogs/<account-id>/, so the Lambda can read its
+              # own account's log objects in whichever bucket the delivery points at, and
+              # nothing else.
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::*/AWSLogs/${AWS::AccountId}/*'
+              - Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: 'arn:aws:s3:::*'
+                Condition:
+                  StringLike:
+                    's3:prefix': 'AWSLogs/*'
+
+              # Quick discovery and enrichment: agents, MCP connectors, and the identity
+              # of the asking user. None support resource-level permissions.
+              - Effect: Allow
+                Action:
+                  - 'quicksight:ListAgents'
+                  - 'quicksight:DescribeAgent'
+                  - 'quicksight:ListTagsForResource'
+                  - 'quicksight:ListActionConnectors'
+                  - 'quicksight:DescribeActionConnector'
+                  - 'quicksight:DescribeUser'
+                  - 'quicksight:ListIAMPolicyAssignmentsForUser'
+                Resource: '*'
+
+              # Read-only delivery lookup: this is how the log bucket is discovered, so
+              # the operator never supplies a bucket name. Granted in both modes.
+              - Effect: Allow
+                Action:
+                  - 'logs:DescribeDeliverySources'
+                  - 'logs:DescribeDeliveries'
+                  - 'logs:DescribeDeliveryDestinations'
+                  - 'logs:GetDelivery'
+                  - 'logs:GetDeliverySource'
+                  - 'logs:GetDeliveryDestination'
+                Resource: '*'
+
+              # Resolves the attached policies of an IAM-federated Quick user, reported as
+              # that caller's effective permissions.
+              - Effect: Allow
+                Action: 'iam:ListAttachedRolePolicies'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+
+              # 'create' mode only: make the bucket and turn Quick logging on. Withheld
+              # entirely in 'discover' mode, where the Lambda never mutates anything.
               - !If
-                - BedrockClassicEnabled
+                - QuickCreatesLogging
                 - Effect: Allow
                   Action:
-                    - 'bedrock:ListAgents'
-                    - 'bedrock:GetAgent'
-                    - 'bedrock:ListTagsForResource'
+                    - 's3:CreateBucket'
+                    - 's3:PutBucketPolicy'
+                    - 's3:GetBucketPolicy'
+                  Resource: !Sub 'arn:aws:s3:::${QuickBucketBaseName}-${AWS::AccountId}-*'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - QuickCreatesLogging
+                - Effect: Allow
+                  Action:
+                    - 'logs:PutDeliverySource'
+                    - 'logs:PutDeliveryDestination'
+                    - 'logs:CreateDelivery'
                   Resource: '*'
                 - !Ref 'AWS::NoValue'
-              # Bedrock AgentCore permissions for harness/runtime discovery
+              # Required by AWS before a CHAT_LOGS delivery source can be created for a
+              # Quick account - easy to miss, and CreateDelivery fails without it.
               - !If
-                - AgentCoreEnabled
+                - QuickCreatesLogging
                 - Effect: Allow
-                  Action:
-                    - 'bedrock-agentcore:ListHarnesses'
-                    - 'bedrock-agentcore:GetHarness'
-                    - 'bedrock-agentcore:ListTagsForResource'
-                    - 'bedrock-agentcore:ListAgentRuntimes'
-                    - 'bedrock-agentcore:GetAgentRuntime'
-                  Resource: '*'
-                - !Ref 'AWS::NoValue'
-              # IAM permissions for role inspection - Bedrock agent execution roles,
-              # AgentCore harness/runtime roles, and IAM-federated Quick users alike.
-              - !If
-                - AnyRolePolicyLookup
-                - Effect: Allow
-                  Action:
-                    - 'iam:ListAttachedRolePolicies'
-                  Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
-                - !Ref 'AWS::NoValue'
-              # CloudWatch Logs - read-only (used by the AgentCore Harness/Runtime trace
-              # pipeline only). DescribeLogGroups has no resource-level permission support
-              # in IAM (AWS requires Resource: "*" for it); FilterLogEvents does support
-              # scoping, so it stays limited to the observability log group prefix.
-              - !If
-                - AgentCoreEnabled
-                - Effect: Allow
-                  Action:
-                    - 'logs:DescribeLogGroups'
-                  Resource: '*'
-                - !Ref 'AWS::NoValue'
-              - !If
-                - AgentCoreEnabled
-                - Effect: Allow
-                  Action:
-                    - 'logs:FilterLogEvents'
-                  Resource:
-                    - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${RuntimeLogGroupPrefix}*'
-                - !Ref 'AWS::NoValue'
-              # Amazon Quick Suite logs S3 bucket — read-only, scoped to the Quick prefix.
-              # Granted only when the Quick pipeline is enabled. Resolves to LogsBucketName
-              # unless the Quick delivery writes to a bucket of its own.
-              - !If
-                - QuickEnabled
-                - Effect: Allow
-                  Action:
-                    - 's3:GetObject'
-                    - 's3:ListBucket'
-                  Resource:
-                    - !Sub
-                      - 'arn:aws:s3:::${QuickBucket}'
-                      - QuickBucket: !If [QuickHasBucketPrefix, !Sub '${QuickLogsBucketPrefix}-${AWS::AccountId}', !If [QuickHasOwnBucket, !Ref QuickLogsBucketName, !Ref LogsBucketName]]
-                    - !Sub
-                      - 'arn:aws:s3:::${QuickBucket}/${QuickLogsPrefix}*'
-                      - QuickBucket: !If [QuickHasBucketPrefix, !Sub '${QuickLogsBucketPrefix}-${AWS::AccountId}', !If [QuickHasOwnBucket, !Ref QuickLogsBucketName, !Ref LogsBucketName]]
-                - !Ref 'AWS::NoValue'
-              # Amazon Quick Suite discovery and enrichment. None of these APIs support
-              # resource-level permissions, so Resource must be "*".
-              #   ListAgents/DescribeAgent      - the agent inventory and its real name
-              #   ListTagsForResource           - the agent's own AWS resource tags
-              #   List/DescribeActionConnector  - the agent's tools (Jira, Slack, S3, ...)
-              #   DescribeUser                  - who asked: Quick role and identity type
-              #   ListIAMPolicyAssignmentsForUser - that user's effective policies
-              - !If
-                - QuickEnabled
-                - Effect: Allow
-                  Action:
-                    - 'quicksight:ListAgents'
-                    - 'quicksight:DescribeAgent'
-                    - 'quicksight:ListTagsForResource'
-                    - 'quicksight:ListActionConnectors'
-                    - 'quicksight:DescribeActionConnector'
-                    - 'quicksight:DescribeUser'
-                    - 'quicksight:ListIAMPolicyAssignmentsForUser'
-                  Resource: '*'
+                  Action: 'quicksight:AllowVendedLogDeliveryForResource'
+                  Resource: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:account/${AWS::AccountId}'
                 - !Ref 'AWS::NoValue'
 
-  # Lambda Function
-  AktoBedrocklambdaFunction:
+  AktoQuickProcessorFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'akto-bedrock-log-processor-cf1-${AWS::AccountId}'
+      FunctionName: !Sub 'akto-quick-processor-${AWS::AccountId}-${AWS::Region}'
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
@@ -291,24 +190,18 @@ Resources:
       MemorySize: 1024
       Code:
         S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
-        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
+        S3Key: !Sub '${LambdaCodeVersion}/akto-quick-processor.zip'
       Environment:
         Variables:
           DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
           AKTO_API_KEY: !Ref AktoApiKey
-          LOGS_BUCKET_NAME: !Ref LogsBucketName
-          LOGS_PREFIX: !Ref LogsPrefix
-          MARKERS_BUCKET_NAME: !If [MarkersHasPrefix, !Sub '${MarkersBucketPrefix}-${AWS::AccountId}', !Ref MarkersBucketName]
-          BEDROCK_CLASSIC_ENABLED: !Ref EnableBedrockClassic
-          AGENTCORE_ENABLED: !Ref EnableAgentCore
-          RUNTIME_LOG_GROUP_PREFIX: !Ref RuntimeLogGroupPrefix
-          QUICK_LOGS_PREFIX: !Ref QuickLogsPrefix
-          QUICK_LOGS_BUCKET_NAME: !If [QuickHasBucketPrefix, !Sub '${QuickLogsBucketPrefix}-${AWS::AccountId}', !Ref QuickLogsBucketName]
-          BEDROCK_AWS_REGION: !Ref 'AWS::Region'
+          MARKERS_BUCKET_NAME: !Ref MarkersBucketName
+          QUICK_LOGGING_MODE: !Ref QuickLoggingMode
+          QUICK_BUCKET_BASE_NAME: !Ref QuickBucketBaseName
+          QUICK_AWS_REGION: !Ref 'AWS::Region'
           AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
-      Description: 'Processes Bedrock Agent Classic S3 logs, AgentCore Harness/Runtime CloudWatch traces, and Amazon Quick Suite chat logs, sending all three to AKTO'
+      Description: 'Discovers Amazon Quick agents and MCP connectors and sends their chat conversations to AKTO'
 
-  # EventBridge Execution Role
   EventBridgeExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -325,68 +218,43 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action:
-                  - 'lambda:InvokeFunction'
-                Resource: !GetAtt AktoBedrocklambdaFunction.Arn
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt AktoQuickProcessorFunction.Arn
 
-  # EventBridge Schedule Rule
-  BedrocktogProcessingScheduleRule:
+  QuickProcessorScheduleRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub 'akto-bedrock-schedule-cf1-${AWS::AccountId}'
+      Name: !Sub 'akto-quick-schedule-${AWS::AccountId}-${AWS::Region}'
+      # Keep in step with SCHEDULE_INTERVAL_MS in config.js, which derives the run budget
+      # from it so a run always finishes before the next trigger fires.
       ScheduleExpression: 'rate(10 minutes)'
       State: ENABLED
-      Description: 'Triggers AKTO Bedrock log processor Lambda function on schedule'
+      Description: 'Triggers the AKTO Amazon Quick processor on schedule'
       Targets:
-        - Arn: !GetAtt AktoBedrocklambdaFunction.Arn
-          Id: AktoBedrocklambdaTarget
+        - Arn: !GetAtt AktoQuickProcessorFunction.Arn
+          Id: AktoQuickProcessorTarget
           RoleArn: !GetAtt EventBridgeExecutionRole.Arn
 
-  # Lambda Permission for EventBridge
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref AktoBedrocklambdaFunction
+      FunctionName: !Ref AktoQuickProcessorFunction
       Action: 'lambda:InvokeFunction'
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt BedrocktogProcessingScheduleRule.Arn
+      SourceArn: !GetAtt QuickProcessorScheduleRule.Arn
 
 Outputs:
   LambdaFunctionName:
-    Description: 'Name of the Lambda function'
-    Value: !Ref AktoBedrocklambdaFunction
+    Description: 'Name of the processor Lambda'
+    Value: !Ref AktoQuickProcessorFunction
 
-  LambdaFunctionArn:
-    Description: 'ARN of the Lambda function'
-    Value: !GetAtt AktoBedrocklambdaFunction.Arn
-
-  EventBridgeRuleName:
-    Description: 'Name of the EventBridge rule'
-    Value: !Ref BedrocktogProcessingScheduleRule
-
-  StackName:
-    Description: 'CloudFormation stack name'
-    Value: !Ref 'AWS::StackName'
-
-  BedrockClassicPipelineStatus:
-    Description: 'Whether the Bedrock Agent Classic pipeline is enabled, and where it reads from'
+  LoggingMode:
+    Description: 'How this account obtains its Quick chat logs'
     Value: !If
-      - BedrockClassicEnabled
-      - !Sub 'ENABLED - reading s3://${LogsBucketName}/${LogsPrefix}'
-      - 'DISABLED - no bedrock:* or Bedrock-logs-bucket permissions granted'
+      - QuickCreatesLogging
+      - !Sub 'CREATE - will provision ${QuickBucketBaseName}-${AWS::AccountId}-${AWS::Region} and enable logging if absent'
+      - 'DISCOVER - reads the bucket off the existing CHAT_LOGS delivery; nothing is created'
 
-  AgentCorePipelineStatus:
-    Description: 'Whether the AgentCore Harness/Runtime pipeline is enabled, and where it reads from'
-    Value: !If
-      - AgentCoreEnabled
-      - !Sub 'ENABLED - reading CloudWatch log groups under ${RuntimeLogGroupPrefix}'
-      - 'DISABLED - no bedrock-agentcore:* or logs:DescribeLogGroups/FilterLogEvents permissions granted'
-
-  QuickSuitePipelineStatus:
-    Description: 'Whether the Amazon Quick Suite pipeline is enabled, and where it reads from'
-    Value: !If
-      - QuickEnabled
-      - !Sub
-        - 'ENABLED - reading s3://${QuickBucket}/${QuickLogsPrefix}'
-        - QuickBucket: !If [QuickHasBucketPrefix, !Sub '${QuickLogsBucketPrefix}-${AWS::AccountId}', !If [QuickHasOwnBucket, !Ref QuickLogsBucketName, !Ref LogsBucketName]]
-      - 'DISABLED - set QuickLogsPrefix to enable (no quicksight:* permissions granted)'
+  MarkersLocation:
+    Description: 'Where this account and region writes its checkpoint'
+    Value: !Sub 's3://${MarkersBucketName}/${AWS::AccountId}/${AWS::Region}/'

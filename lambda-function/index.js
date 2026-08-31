@@ -1,36 +1,27 @@
 /**
- * AKTO Bedrock Log Processor — entry point.
+ * AKTO Amazon Quick processor — entry point.
  *
- * Runs three independent pipelines in one Lambda, each with its own manifest
- * and time-budget checks:
- *   - Bedrock Agent Classic: reads S3 model-invocation logs (discovery.js,
- *     s3Logs.js, extractors.js, manifest.js).
- *   - AgentCore Harness/Runtime: reads CloudWatch observability traces
- *     instead of S3 (traceDiscovery.js, logGroupReader.js, traceParser.js,
- *     traceManifest.js) — a Harness/Runtime never appears in the S3 pipeline.
- *   - Amazon Quick Suite: reads Quick's vended CHAT_LOGS from S3
- *     (quickDiscovery.js, quickLogs.js, quickParser.js, quickManifest.js).
- *     Skipped entirely unless QUICK_LOGS_PREFIX is set.
+ * Discovers Amazon Quick agents and MCP connectors in this account and region, reads
+ * their chat conversations from S3, and sends both to AKTO.
+ *
+ * One invocation does four things:
+ *   1. Resolve where the chat logs live (quickDelivery.js) — read off the account's
+ *      existing CHAT_LOGS delivery, or create that delivery when asked to.
+ *   2. Discover agents and MCP connectors (quickDiscovery.js).
+ *   3. Read new log objects since the checkpoint and turn each chat record into an AKTO
+ *      message (quickLogs.js, quickParser.js, quickMessageBuilder.js).
+ *   4. Send, then checkpoint (aktoClient.js, quickManifest.js) — in that order, so a
+ *      failed send never advances past data that was not delivered.
+ *
+ * The checkpoint lives in a central bucket in the Organization management account, under
+ * <account-id>/<region>/, so one place holds the org-wide view.
  */
 const config = require('./config');
-const { getManifest, updateManifest } = require('./manifest');
-const { getUnprocessedLogFiles, processLogFile, resetLogStats, getLogStats } = require('./s3Logs');
-const { discoverAllNewAgents, rebuildRoleMapFromDiscoveredAgents, resetRunLogState, getIdentityStats } = require('./discovery');
 const { sendToDataIngestionService } = require('./aktoClient');
-
-const {
-    discoverNewResources, initializeHarnessCache: initializeTraceHarnessCache, backfillExecutionRoleArns,
-    buildRoleNameToResourceMap, buildHarnessNameToResourceMap, createStandardMessage: createTraceStandardMessage
-} = require('./traceDiscovery');
-const { discoverObservabilityLogGroups, fetchNewLogEvents } = require('./logGroupReader');
-const { classifyRecord, parseLogRecord, resolveTraceIdentity, resolveTraceContent, buildConversationPair } = require('./traceParser');
-const { getTraceManifest, updateTraceManifest } = require('./traceManifest');
-
+const { getQuickManifest, updateQuickManifest } = require('./quickManifest');
 const { getUnprocessedQuickLogFiles, processQuickLogFile, resetQuickStats, getQuickStats, resetQuickFileState } = require('./quickLogs');
 const { discoverNewQuickAgents, resetQuickRunState } = require('./quickDiscovery');
-const { getQuickManifest, updateQuickManifest } = require('./quickManifest');
-
-let traceHarnessInitialized = false;
+const { resolveQuickLogLocation } = require('./quickDelivery');
 
 /** Logs current heap/RSS usage — cheap visibility into memory pressure without waiting for the final Lambda REPORT line. */
 function logMemory(label) {
@@ -39,292 +30,33 @@ function logMemory(label) {
 }
 
 /**
- * Prints the configuration actually in effect. Most "it found nothing" reports come
- * down to a bucket, prefix, or endpoint being different from what was assumed —
- * having it in the log removes a round trip. Never prints the API key.
+ * Prints the configuration actually in effect. Most "it found nothing" reports come down
+ * to a bucket, prefix or endpoint differing from what was assumed — having it in the log
+ * removes a round trip. Never prints the API key.
  */
 function logEffectiveConfig() {
     let ingestHost = 'unset';
     try {
         ingestHost = new URL(config.DATA_INGESTION_ENDPOINT).host;
-    } catch { /* leave as unset — validateConfig will have already failed on a blank value */ }
+    } catch { /* validateConfig will already have failed on a blank value */ }
 
     console.log('⚙️ Effective configuration:');
     console.log(`  ├─ region              ${config.AWS_REGION} (account ${config.AWS_ACCOUNT_ID})`);
-    console.log(`  ├─ pipelines           bedrock-classic=${config.BEDROCK_CLASSIC_ENABLED ? 'on' : 'OFF'} agentcore=${config.AGENTCORE_ENABLED ? 'on' : 'OFF'} quick-suite=${config.QUICK_ENABLED ? 'on' : 'OFF'}`);
-    console.log(`  ├─ bedrock logs        ${config.BEDROCK_CLASSIC_ENABLED ? `s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}` : 'disabled'}`);
+    console.log(`  ├─ logging mode        ${config.QUICK_LOGGING_MODE}`);
+    console.log(`  ├─ log location        ${config.QUICK_LOGGING_MODE === 'create' ? `will create ${config.QUICK_CREATED_BUCKET_NAME} if absent` : 'discovered from the CHAT_LOGS delivery'}`);
     console.log(`  ├─ checkpoints         s3://${config.MARKERS_BUCKET_NAME}/${config.MARKERS_PREFIX}`);
-    console.log(`  ├─ agentcore logs      ${config.AGENTCORE_ENABLED ? `${config.RUNTIME_LOG_GROUP_PREFIX}*` : 'disabled'}`);
-    console.log(`  ├─ quick suite logs    ${config.QUICK_ENABLED ? `s3://${config.QUICK_LOGS_BUCKET_NAME}/${config.QUICK_LOGS_PREFIX}` : 'disabled (QUICK_LOGS_PREFIX unset)'}`);
     console.log(`  ├─ akto ingest host    ${ingestHost} (api key ${config.AKTO_API_KEY ? 'set' : 'MISSING'})`);
-    console.log(`  └─ lookback            ${config.BEDROCK_CLASSIC_ENABLED ? `${config.LOOKBACK_DAYS}d s3` : ''}${config.AGENTCORE_ENABLED ? ` / ${config.TRACE_LOOKBACK_DAYS}d traces` : ''}${config.QUICK_ENABLED ? ` / ${config.QUICK_LOOKBACK_DAYS}d quick` : ''}`);
-}
-
-/** Wraps a pipeline so its wall-clock cost is visible — the two share one Lambda time budget. */
-async function timed(label, fn) {
-    const startedAt = Date.now();
-    try {
-        return await fn();
-    } finally {
-        console.log(`⏳ ${label} took ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
-    }
-}
-
-async function checkpoint(discoveredAgents, filesProcessed, lastTimestamp, failedFiles, failedMessages = []) {
-    await updateManifest(filesProcessed, discoveredAgents, lastTimestamp, failedFiles, failedMessages);
+    console.log(`  └─ lookback            ${config.QUICK_LOOKBACK_DAYS}d, re-discovery every ${config.QUICK_REDISCOVERY_HOURS}h`);
 }
 
 /**
- * Sends a batch to AKTO, THEN checkpoints — in that order, so a failed send
- * never advances "last processed" past data that was never actually delivered.
+ * Amazon Quick: agents + MCP connectors + chat conversations → AKTO.
+ *
+ * `timeLeft` is the shrinking work clock; `sendTimeLeft` is the Lambda clock, used for
+ * flushes only. Sending is bounded and short, and discarding already-built messages to
+ * respect a soft budget would throw away work already paid for.
  */
-async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, failedFiles, timeLeft, failedMessages = []) {
-    if (messages.length === 0) {
-        // Nothing to deliver, but the files were still read — record that.
-        console.log(`⏭️ Nothing to send; checkpointing file progress only`);
-        await checkpoint(discoveredAgents, filesProcessed, lastTimestamp, failedFiles, failedMessages);
-        return 0;
-    }
-    console.log(`📤 Flushing ${messages.length} message(s) to AKTO Ingestion API...`);
-    const { sent, quarantined } = await sendToDataIngestionService(messages, timeLeft);
-    // Quarantined messages are resolved, not pending — the server refused them and
-    // will refuse them identically next run. Checkpointing past them is what stops
-    // the run replaying the messages that DID land alongside them.
-    if (quarantined.length > 0) failedMessages.push(...quarantined);
-    console.log(`✅ Sent ${sent} message(s) to AKTO${quarantined.length ? `, ${quarantined.length} quarantined` : ''}`);
-    await checkpoint(discoveredAgents, filesProcessed, lastTimestamp, failedFiles, failedMessages);
-    return sent;
-}
-
-/** Same as flush(), but for the AgentCore trace pipeline's manifest shape. */
-async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeLeft) {
-    if (messages.length === 0) return 0;
-    // Quarantined messages are counted as resolved, not delivered: the server refused
-    // them permanently, so checkpointing past them is what stops the next run replaying
-    // the messages that DID land in the same flush.
-    const { sent, quarantined } = await sendToDataIngestionService(messages, timeLeft);
-    if (quarantined.length > 0) {
-        console.warn(`🚫 ${quarantined.length} AgentCore message(s) permanently rejected and dropped: ${quarantined.map((q) => q.requestId).join(', ')}`);
-    }
-    await updateTraceManifest(discoveredAgents, logGroupCheckpoints);
-    return sent;
-}
-
-/**
- * Turns one AgentCore log group's new log events into AKTO conversation
- * messages — one message per trace, not per record. Records are grouped by
- * traceId first, then identity+content resolved jointly per trace.
- */
-async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap) {
-    const stats = { unparseable: 0, other: 0, noTraceId: 0, SPAN: 0, STRANDS_AGGREGATE: 0, GENAI_EVENT: 0, emptyContent: 0, failed: 0 };
-
-    const recordsByTraceId = new Map();
-    for (const event of events) {
-        const record = parseLogRecord(event);
-        if (!record) { stats.unparseable++; continue; }
-        const kind = classifyRecord(record);
-        if (kind === 'OTHER') { stats.other++; continue; }
-        if (!record.traceId) { stats.noTraceId++; continue; }
-        stats[kind]++;
-        if (!recordsByTraceId.has(record.traceId)) recordsByTraceId.set(record.traceId, []);
-        recordsByTraceId.get(record.traceId).push(record);
-    }
-
-    const messages = [];
-    for (const [traceId, records] of recordsByTraceId) {
-        try {
-            const content = resolveTraceContent(records);
-            if (!content.userMessage && !content.agentResponse) { stats.emptyContent++; continue; }
-            const identity = resolveTraceIdentity(records);
-            const pair = buildConversationPair(identity, content, logGroup, roleNameToResourceMap, harnessNameToResourceMap, records);
-            messages.push(await createTraceStandardMessage(pair));
-        } catch (error) {
-            stats.failed++;
-            console.error(`❌ Error building AgentCore message for trace ${traceId}: ${error.message}`);
-        }
-    }
-
-    console.log(`🧾 ${logGroup.logGroupName}: ${events.length} event(s) → ${recordsByTraceId.size} trace(s) → ${messages.length} message(s) | ${JSON.stringify(stats)}`);
-
-    // Events arrived but produced nothing — say which stage swallowed them, since
-    // otherwise this looks identical to "no traffic at all".
-    if (events.length > 0 && messages.length === 0) {
-        const reason = stats.emptyContent > 0
-            ? `${stats.emptyContent} trace(s) carried no user/agent message — spans present but conversation content missing`
-            : recordsByTraceId.size === 0
-                ? `no usable records: ${stats.other} unrecognised, ${stats.noTraceId} without a traceId, ${stats.unparseable} unparseable`
-                : `${stats.failed} trace(s) failed to build`;
-        console.warn(`⚠️ ${logGroup.logGroupName}: no messages produced — ${reason}`);
-    }
-    return messages;
-}
-
-/** Bedrock Agent Classic: S3 model-invocation logs → AKTO. Unchanged from before the AgentCore merge. */
-async function runS3Pipeline(timeLeft, sendTimeLeft) {
-    if (!config.BEDROCK_CLASSIC_ENABLED) {
-        console.log('⏭️ Bedrock Agent Classic pipeline disabled (BEDROCK_CLASSIC_ENABLED=false) — skipping');
-        return { enabled: false, filesDone: 0, filesFailed: 0, filesDeferred: 0, totalSent: 0, traffic: {} };
-    }
-    resetLogStats();
-    resetRunLogState();
-    const manifest = await getManifest();
-    const discoveredAgents = { ...(manifest.discoveredAgents || {}) };
-    let lastTimestamp = manifest.lastProcessedTimestamp || null;
-    let totalSent = 0;
-    // Run-scoped: messages AKTO refused permanently. Accumulated across every flush
-    // (discovery included) so one manifest write carries them all.
-    const failedMessages = [];
-
-    console.log('📋 Rebuilding role map from discovered agents...');
-    await rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft);
-
-    console.log('📋 Discovering agents...');
-    const discoveryMessages = await discoverAllNewAgents(discoveredAgents, timeLeft);
-    console.log(`✅ Discovery: ${discoveryMessages.length} new resource(s) found`);
-
-    if (discoveryMessages.length > 0) {
-        totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp, [], sendTimeLeft, failedMessages);
-    }
-
-    const unprocessedFiles = await getUnprocessedLogFiles(manifest);
-    console.log(`📁 ${unprocessedFiles.length} unprocessed log file(s)`);
-
-    let pending = [];
-    let filesDone = 0;
-    let filesFailed = 0;
-    let filesDeferred = 0;
-    const failedFiles = [];
-
-    for (const file of unprocessedFiles) {
-        if (timeLeft() < config.TIME_SAFETY_MARGIN_MS) {
-            filesDeferred = unprocessedFiles.length - filesDone - filesFailed;
-            console.warn(`⏱️ ${timeLeft()}ms left (below ${config.TIME_SAFETY_MARGIN_MS}ms margin) — stopping early, ${filesDeferred} file(s) deferred to next run`);
-            break;
-        }
-
-        const fileTs = new Date(file.LastModified).toISOString();
-        try {
-            const messages = await processLogFile(config.LOGS_BUCKET_NAME, file.Key, discoveredAgents);
-            pending.push(...messages);
-            filesDone++;
-        } catch (error) {
-            // Progress moves past a failed file rather than stalling on it, so one
-            // unreadable object can never block the whole backlog. The cost is that
-            // this file is not retried — hence the loud log AND a durable record in
-            // the manifest, so it stays visible after the logs age out.
-            filesFailed++;
-            failedFiles.push({ key: file.Key, error: error.message, at: new Date().toISOString() });
-            console.error(`❌ File FAILED and will NOT be retried: ${file.Key} — ${error.message} (recorded in manifest.failedFiles)`);
-        }
-        // Advances on success and failure alike: the checkpoint means "read this
-        // far", and files are processed oldest-first.
-        if (!lastTimestamp || fileTs > lastTimestamp) lastTimestamp = fileTs;
-
-        if (pending.length >= config.FLUSH_THRESHOLD || timeLeft() < config.TIME_SAFETY_MARGIN_MS) {
-            totalSent += await flush(pending, discoveredAgents, filesDone, lastTimestamp, failedFiles, sendTimeLeft, failedMessages);
-            pending = [];
-            logMemory(`checkpoint (${filesDone}/${unprocessedFiles.length} files)`);
-        }
-    }
-
-    // Checkpoint on every path that read at least one file — including the case
-    // where nothing was extracted, which is what used to lose all progress.
-    if (pending.length > 0 || filesDone > 0 || filesFailed > 0) {
-        totalSent += await flush(pending, discoveredAgents, filesDone, lastTimestamp, failedFiles, sendTimeLeft, failedMessages);
-    }
-    if (filesDone === 0 && filesFailed === 0 && discoveryMessages.length === 0) {
-        console.log('✅ Bedrock Agent Classic: nothing new to process');
-    }
-
-    const stats = { ...getLogStats(), ...getIdentityStats() };
-    console.log(`🎉 Bedrock Agent Classic done. Files processed: ${filesDone}, failed: ${filesFailed}, deferred: ${filesDeferred}, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
-    console.log(`📇 Traffic seen: ${stats.agentCalls} agent call(s) ingested, ${stats.serviceAgentIngested} direct model call(s) ingested, ${stats.serviceAgentCalls} dropped, ${stats.noConversation} entr(ies) with no complete exchange, ${stats.noIdentity} without a usable identity, ${stats.unparseableLines} unparseable line(s)`);
-    console.log(`🔗 Identity resolved: ${stats.resolvedByRole} by execution role, ${stats.resolvedBySession} by session name (shared role), ${stats.serviceAgentCallers} as direct-model callers, ${stats.ambiguousSkips} skipped as ambiguous, ${stats.noPrincipal} with an unrecognised ARN`);
-    if (failedMessages.length > 0) {
-        console.warn(`🚫 ${failedMessages.length} message(s) were permanently rejected by AKTO and are recorded in manifest.failedMessages — they are NOT retried. requestId(s): ${failedMessages.slice(0, 5).map((m) => m.requestId).join(', ')}${failedMessages.length > 5 ? ', …' : ''}`);
-    }
-    if (filesFailed > 0) {
-        console.warn(`⚠️ ${filesFailed} file(s) were skipped permanently and are listed in manifest.failedFiles — inspect them if data looks missing`);
-    }
-    return { filesDone, filesFailed, filesDeferred, totalSent, messagesQuarantined: failedMessages.length, traffic: stats };
-}
-
-/** AgentCore Harness/Runtime: CloudWatch traces → AKTO. Own manifest, own discovery, own time-budget checks. */
-async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
-    if (!config.AGENTCORE_ENABLED) {
-        console.log('⏭️ AgentCore pipeline disabled (AGENTCORE_ENABLED=false) — skipping');
-        return { enabled: false, logGroupsFound: 0, groupsProcessed: 0, groupsDeferred: 0, totalSent: 0 };
-    }
-    if (!traceHarnessInitialized) {
-        await initializeTraceHarnessCache();
-        traceHarnessInitialized = true;
-    }
-
-    const traceManifest = await getTraceManifest();
-    const discoveredAgents = { ...(traceManifest.discoveredAgents || {}) };
-    const logGroupCheckpoints = { ...(traceManifest.logGroupCheckpoints || {}) };
-    let totalSent = 0;
-
-    console.log('📋 Discovering AgentCore harnesses/runtimes...');
-    const discoveryMessages = await discoverNewResources(discoveredAgents, timeLeft);
-    console.log(`✅ AgentCore discovery: ${discoveryMessages.length} new resource(s) found`);
-    if (discoveryMessages.length > 0) {
-        totalSent += await flushTrace(discoveryMessages, discoveredAgents, logGroupCheckpoints, sendTimeLeft);
-    }
-
-    await backfillExecutionRoleArns(discoveredAgents, timeLeft);
-    const roleNameToResourceMap = buildRoleNameToResourceMap(discoveredAgents);
-    const harnessNameToResourceMap = buildHarnessNameToResourceMap(discoveredAgents);
-
-    const logGroups = await discoverObservabilityLogGroups();
-    let groupsProcessed = 0;
-    let groupsDeferred = 0;
-
-    if (logGroups.length === 0) {
-        console.log('✅ No AgentCore observability log groups found — tracing likely not enabled on this account. Discovery still ran above.');
-        return { logGroupsFound: 0, groupsProcessed, groupsDeferred, totalSent };
-    }
-
-    const lookbackMs = Date.now() - config.TRACE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-
-    for (const logGroup of logGroups) {
-        if (timeLeft() < config.TIME_SAFETY_MARGIN_MS) {
-            groupsDeferred = logGroups.length - groupsProcessed;
-            console.warn(`⏱️ ${timeLeft()}ms left — stopping early, ${groupsDeferred} AgentCore log group(s) deferred to next run`);
-            break;
-        }
-
-        const sinceMs = logGroupCheckpoints[logGroup.logGroupName]?.lastEventTimestamp || lookbackMs;
-        const { events, latestTimestamp } = await fetchNewLogEvents(logGroup.logGroupName, sinceMs, timeLeft, config.TIME_SAFETY_MARGIN_MS);
-        groupsProcessed++;
-
-        if (events.length === 0) continue;
-
-        // buildTraceMessagesForLogGroup already logs the full event → trace → message
-        // accounting for this group, so there's nothing to restate here.
-        const messages = await buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap);
-        logGroupCheckpoints[logGroup.logGroupName] = { lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId };
-
-        if (messages.length > 0) {
-            totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft);
-        } else {
-            // No messages built, but there's no unsent data at risk — checkpoint now
-            // so this log group doesn't re-scan the same events every run.
-            await updateTraceManifest(discoveredAgents, logGroupCheckpoints);
-        }
-    }
-
-    console.log(`🎉 AgentCore done. Log groups processed: ${groupsProcessed}, deferred: ${groupsDeferred}, messages sent: ${totalSent}`);
-    return { logGroupsFound: logGroups.length, groupsProcessed, groupsDeferred, totalSent };
-}
-
-/** Amazon Quick Suite: vended CHAT_LOGS in S3 → AKTO. Own manifest, own discovery, own time-budget checks. */
 async function runQuickPipeline(timeLeft, sendTimeLeft) {
-    if (!config.QUICK_ENABLED) {
-        console.log('⏭️ Quick Suite pipeline disabled (QUICK_LOGS_PREFIX unset) — skipping');
-        return { enabled: false, filesDone: 0, filesFailed: 0, filesDeferred: 0, totalSent: 0 };
-    }
-
     resetQuickStats();
     resetQuickFileState();
     resetQuickRunState();
@@ -342,33 +74,46 @@ async function runQuickPipeline(timeLeft, sendTimeLeft) {
     let filesFailed = 0;
     let filesDeferred = 0;
 
-    /** Sends first, then checkpoints — a failed send must never advance the checkpoint past undelivered data. */
-    const flushQuick = async (messages) => {
+    /** Sends first, then checkpoints — a failed send must never advance past undelivered data. */
+    const flush = async (messages) => {
         let sent = 0;
         if (messages.length > 0) {
-            console.log(`📤 Flushing ${messages.length} Quick message(s) to AKTO Ingestion API...`);
-            // Sending is gated on the Lambda clock rather than the run budget: the
-            // messages are already built, and discarding them to respect a soft budget
-            // would throw away work already paid for.
+            console.log(`📤 Flushing ${messages.length} message(s) to AKTO Ingestion API...`);
             const result = await sendToDataIngestionService(messages, sendTimeLeft || timeLeft);
             sent = result.sent;
-            // Permanently refused by the server, so retrying is pointless. Recorded in
-            // the manifest as the only durable trace of what was dropped, and the
-            // checkpoint advances past them so the rest of the flush isn't replayed.
+            // Permanently refused by the server, so retrying is pointless. Recorded in the
+            // manifest as the only durable trace of what was dropped, and the checkpoint
+            // advances past them so the rest of the flush is not replayed.
             if (result.quarantined.length > 0) failedMessages.push(...result.quarantined);
-            console.log(`✅ Sent ${sent} Quick message(s)${result.quarantined.length ? `, ${result.quarantined.length} quarantined` : ''}`);
+            console.log(`✅ Sent ${sent} message(s)${result.quarantined.length ? `, ${result.quarantined.length} quarantined` : ''}`);
         }
         await updateQuickManifest({ discoveredAgents, actionConnectors, quickUsers, lastProcessedTimestamp: lastTimestamp, filesProcessed: filesDone, failedFiles, failedMessages });
         return sent;
     };
 
-    console.log('📋 Discovering Quick Suite agents...');
-    const discoveryMessages = await discoverNewQuickAgents(discoveredAgents, actionConnectors, timeLeft);
-    console.log(`✅ Quick discovery: ${discoveryMessages.length} new agent(s) found`);
-    if (discoveryMessages.length > 0) totalSent += await flushQuick(discoveryMessages);
+    // Where the logs live is resolved at runtime, never configured: in 'discover' mode it
+    // comes off the existing CHAT_LOGS delivery (so every account can use a different
+    // bucket name), and in 'create' mode the delivery is provisioned first.
+    const location = await resolveQuickLogLocation();
 
-    const unprocessedFiles = await getUnprocessedQuickLogFiles(manifest);
-    console.log(`📁 ${unprocessedFiles.length} unprocessed Quick log file(s)`);
+    console.log('📋 Discovering Quick agents and MCP connectors...');
+    const discoveryMessages = await discoverNewQuickAgents(discoveredAgents, actionConnectors, timeLeft);
+    console.log(`✅ Discovery: ${discoveryMessages.length} message(s)`);
+    if (discoveryMessages.length > 0) totalSent += await flush(discoveryMessages);
+
+    if (!location) {
+        // Agents and connectors were still discovered and sent above — those APIs need no
+        // log delivery — but there is no bucket to read conversations from.
+        console.warn('⚠️ No readable log location, so no conversations will be ingested this run (discovery above still applied)');
+        return { filesDone: 0, filesFailed: 0, filesDeferred: 0, totalSent, traffic: getQuickStats(), noLogLocation: true };
+    }
+    if (location.justCreated) {
+        console.log('🕒 Quick logging was just enabled — AWS batches vended logs roughly every 5 minutes, so the first conversations arrive on a later run');
+        return { filesDone: 0, filesFailed: 0, filesDeferred: 0, totalSent, traffic: getQuickStats(), loggingJustEnabled: true };
+    }
+
+    const unprocessedFiles = await getUnprocessedQuickLogFiles(manifest, location);
+    console.log(`📁 ${unprocessedFiles.length} unprocessed log file(s)`);
 
     const context = { discoveredAgents, actionConnectors, quickUsers };
     let pending = [];
@@ -376,58 +121,56 @@ async function runQuickPipeline(timeLeft, sendTimeLeft) {
     for (const file of unprocessedFiles) {
         if (timeLeft() < config.TIME_SAFETY_MARGIN_MS) {
             filesDeferred = unprocessedFiles.length - filesDone - filesFailed;
-            console.warn(`⏱️ ${timeLeft()}ms left (below ${config.TIME_SAFETY_MARGIN_MS}ms margin) — stopping early, ${filesDeferred} Quick file(s) deferred to next run`);
+            console.warn(`⏱️ ${timeLeft()}ms left (below ${config.TIME_SAFETY_MARGIN_MS}ms margin) — stopping early, ${filesDeferred} file(s) deferred to next run`);
             break;
         }
 
         const fileTs = new Date(file.LastModified).toISOString();
         try {
-            pending.push(...await processQuickLogFile(config.QUICK_LOGS_BUCKET_NAME, file.Key, context));
+            pending.push(...await processQuickLogFile(location.bucket, file.Key, context));
             filesDone++;
         } catch (error) {
-            // Same tradeoff as the Bedrock pipeline: move past an unreadable object
-            // rather than stalling the whole backlog on it, but record it durably so it
-            // stays visible after the CloudWatch logs age out.
+            // Move past an unreadable object rather than stalling the whole backlog on it,
+            // but record it durably so it stays visible after the logs age out.
             filesFailed++;
             failedFiles.push({ key: file.Key, error: error.message, at: new Date().toISOString() });
-            console.error(`❌ Quick file FAILED and will NOT be retried: ${file.Key} — ${error.message} (recorded in manifest.failedFiles)`);
+            console.error(`❌ File FAILED and will NOT be retried: ${file.Key} — ${error.message} (recorded in manifest.failedFiles)`);
         }
         // Advances on success and failure alike: the checkpoint means "read this far",
         // and files are processed oldest-first.
         if (!lastTimestamp || fileTs > lastTimestamp) lastTimestamp = fileTs;
 
         if (pending.length >= config.FLUSH_THRESHOLD || timeLeft() < config.TIME_SAFETY_MARGIN_MS) {
-            totalSent += await flushQuick(pending);
+            totalSent += await flush(pending);
             pending = [];
-            logMemory(`quick checkpoint (${filesDone}/${unprocessedFiles.length} files)`);
+            logMemory(`checkpoint (${filesDone}/${unprocessedFiles.length} files)`);
         }
     }
 
     if (pending.length > 0 || filesDone > 0 || filesFailed > 0) {
-        totalSent += await flushQuick(pending);
+        totalSent += await flush(pending);
     }
 
     const stats = getQuickStats();
-    console.log(`🎉 Quick Suite done. Files processed: ${filesDone}, failed: ${filesFailed}, deferred: ${filesDeferred}, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
-    console.log(`📇 Quick traffic: ${stats.records} record(s) read → ${stats.chatMessages} chat message(s) ingested, ${stats.nonChatRecords} non-chat record(s) skipped, ${stats.emptyExchanges} with no exchange, ${stats.blocked} blocked/no-answer, ${stats.newAgentsFromLogs} agent(s) discovered from logs, ${stats.unparseableLines} unparseable line(s), ${stats.failed} failed`);
+    console.log(`🎉 Done. Files processed: ${filesDone}, failed: ${filesFailed}, deferred: ${filesDeferred}, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
+    console.log(`📇 Traffic: ${stats.records} record(s) read → ${stats.chatMessages} chat message(s) ingested, ${stats.nonChatRecords} non-chat record(s) skipped, ${stats.emptyExchanges} with no exchange, ${stats.blocked} blocked/no-answer, ${stats.newAgentsFromLogs} agent(s) discovered from logs, ${stats.unparseableLines} unparseable line(s), ${stats.failed} failed`);
     if (filesFailed > 0) {
-        console.warn(`⚠️ ${filesFailed} Quick file(s) were skipped permanently and are listed in the Quick manifest's failedFiles — inspect them if data looks missing`);
+        console.warn(`⚠️ ${filesFailed} file(s) were skipped permanently and are listed in manifest.failedFiles — inspect them if data looks missing`);
     }
-    return { enabled: true, filesDone, filesFailed, filesDeferred, totalSent, traffic: stats };
+    return { filesDone, filesFailed, filesDeferred, totalSent, traffic: stats };
 }
 
 /**
  * Main handler.
  *
- * The S3 pipeline runs first, holding at most its half of the run budget before it
- * has to hand over; AgentCore then gets everything that is left. The split is a floor
- * for AgentCore rather than a ceiling on S3 — time one pipeline doesn't use passes to
- * the other, so neither is throttled when the other has nothing to do. The
- * per-pipeline `⏳ … took Ns` timings show how the budget actually split, so
- * starvation is visible rather than inferred.
+ * The run budget is deliberately shorter than the EventBridge schedule so a run always
+ * finishes before the next trigger fires — EventBridge fires on a timer regardless of
+ * whether the previous invocation is still running, and two overlapping runs would read
+ * the same checkpoint and send duplicates. The Lambda timeout stays as a crash net; this
+ * is the normal exit path.
  */
 exports.handler = async (event, context) => {
-    console.log('🚀 AKTO Bedrock Log Processor started');
+    console.log('🚀 AKTO Amazon Quick processor started');
     console.log(`📍 Region: ${config.AWS_REGION} | Event: ${event?.source || 'manual'} | Time budget: ${context.getRemainingTimeInMillis()}ms`);
     logMemory('start');
 
@@ -435,141 +178,53 @@ exports.handler = async (event, context) => {
     const startedAt = Date.now();
 
     /**
-     * The time every worker loop actually sees: whichever runs out first — the
-     * Lambda clock, or this run's wall-clock budget.
-     *
-     * Expressed as a shrinking timeLeft() rather than a separate flag so that
-     * every existing guard (`timeLeft() < TIME_SAFETY_MARGIN_MS`), including the
-     * ones inside discovery.js and traceDiscovery.js, respects the budget without
-     * being modified. When the budget is spent this reports exactly the safety
-     * margin, which those guards already treat as "stop taking new work".
+     * The clock every worker loop sees: whichever runs out first — the Lambda clock, or
+     * this run's wall-clock budget. Expressed as a shrinking timeLeft() so the existing
+     * `timeLeft() < TIME_SAFETY_MARGIN_MS` guards need no changes. Once the budget is
+     * gone this reports 0, not the margin, or those guards would compare false and the
+     * budget would never actually stop anything.
      */
     const timeLeft = () => {
         const budgetRemaining = config.RUN_BUDGET_MS - (Date.now() - startedAt);
-        // Once the budget is gone this reports 0, not the margin — the guards test
-        // `< TIME_SAFETY_MARGIN_MS`, so returning exactly the margin would compare
-        // false and the budget would never actually stop anything.
         return Math.min(lambdaTimeLeft(), budgetRemaining > 0 ? config.TIME_SAFETY_MARGIN_MS + budgetRemaining : 0);
     };
     const stoppedByBudget = () => config.RUN_BUDGET_MS - (Date.now() - startedAt) <= 0;
 
-    /*
-     * Delivering messages already in hand is a different question from taking on more
-     * work, and it needs a different clock.
-     *
-     * Sending is bounded (the messages are already collected) and short — seconds for
-     * a full batch — so it is gated on the Lambda clock, which still has the remainder
-     * of the timeout. A run may therefore overshoot RUN_BUDGET_MS by the flush
-     * duration; that is a deliberate trade against discarding work already paid for,
-     * and the schedule keeps ~2 minutes of headroom for it.
+    /**
+     * Sending is gated on the Lambda clock rather than the run budget. The messages are
+     * already collected and a flush takes seconds, so a run may overshoot RUN_BUDGET_MS
+     * by the flush duration — a deliberate trade against discarding work already paid for.
      */
     const sendTimeLeft = () => lambdaTimeLeft();
-
-    /**
-     * The same shrinking clock, additionally capped at a share of the run budget.
-     * Used to hand S3 half the run before AgentCore starts; expressed in the same
-     * form so the existing `< TIME_SAFETY_MARGIN_MS` guards need no changes.
-     */
-    const sliceTimeLeft = (sliceMs) => () => {
-        const sliceRemaining = sliceMs - (Date.now() - startedAt);
-        return Math.min(timeLeft(), sliceRemaining > 0 ? config.TIME_SAFETY_MARGIN_MS + sliceRemaining : 0);
-    };
 
     try {
         config.validateConfig();
         logEffectiveConfig();
         console.log(`  └─ run budget          ${(config.RUN_BUDGET_MS / 1000).toFixed(0)}s of work (schedule is ${(config.SCHEDULE_INTERVAL_MS / 60000).toFixed(0)}min; finishing inside it keeps runs from overlapping)`);
-        console.log(`  └─ budget split        evenly across the enabled pipelines — S3 up to ${(config.S3_BUDGET_MS / 1000).toFixed(0)}s (${Math.round(config.S3_BUDGET_SHARE * 100)}%), AgentCore until ${(config.AGENTCORE_BUDGET_MS / 1000).toFixed(0)}s (${Math.round(config.AGENTCORE_BUDGET_SHARE * 100)}%)${config.QUICK_ENABLED ? ', Quick gets the rest' : ''} — each also inherits whatever the previous one leaves`);
 
-        const bedrockAgentClassic = await timed('Bedrock Agent Classic pipeline', () => runS3Pipeline(sliceTimeLeft(config.S3_BUDGET_MS), sendTimeLeft));
-        logMemory('after S3 pipeline');
-
-        // Whatever S3 didn't use rolls over rather than being forfeited, so a run with
-        // no S3 backlog spends the full budget on traces.
-        const handoverAt = Date.now() - startedAt;
-        if (config.BEDROCK_CLASSIC_ENABLED && config.AGENTCORE_ENABLED) {
-            console.log(`🔀 S3 handed over after ${(handoverAt / 1000).toFixed(0)}s of its ${(config.S3_BUDGET_MS / 1000).toFixed(0)}s share — AgentCore now has ${(Math.max(0, config.AGENTCORE_BUDGET_MS - handoverAt) / 1000).toFixed(0)}s of its own share`);
-        }
-
-        // Capped at its cumulative deadline only when Quick is enabled and therefore has
-        // something to be starved of; otherwise AgentCore keeps the whole remaining run,
-        // exactly as it did before Quick existed.
-        const agentCore = await timed('AgentCore pipeline', () => runAgentCorePipeline(config.QUICK_ENABLED ? sliceTimeLeft(config.AGENTCORE_BUDGET_MS) : timeLeft, sendTimeLeft));
-        logMemory('after AgentCore pipeline');
-
-        const quickHandoverAt = Date.now() - startedAt;
-        if (config.QUICK_ENABLED && config.AGENTCORE_ENABLED) {
-            console.log(`🔀 AgentCore handed over after ${(quickHandoverAt / 1000).toFixed(0)}s — Quick Suite now has ${(Math.max(0, config.RUN_BUDGET_MS - quickHandoverAt) / 1000).toFixed(0)}s`);
-        }
-        const quickSuite = await timed('Quick Suite pipeline', () => runQuickPipeline(timeLeft, sendTimeLeft));
-        logMemory('after Quick pipeline');
-
-        /*
-         * Give the rest of the budget back to S3 if it still has a backlog.
-         *
-         * The shares are floors for the later pipelines, not a ceiling on S3, and
-         * without this the floor becomes a ceiling in one common case: an account with
-         * only Bedrock Agent Classic data. AgentCore finds no log groups and Quick is
-         * disabled or idle, so both return in milliseconds and S3 would stop at its
-         * share with the rest of the budget unspent and files still waiting. This
-         * resumes from the checkpoint the first pass just wrote, so no file is read twice.
-         */
-        let s3SecondPass = null;
-        if (bedrockAgentClassic.filesDeferred > 0 && timeLeft() > config.TIME_SAFETY_MARGIN_MS) {
-            console.log(`♻️ Other pipelines finished with ${(timeLeft() / 1000).toFixed(0)}s left and S3 has ${bedrockAgentClassic.filesDeferred} file(s) deferred — returning the remaining budget to S3`);
-            s3SecondPass = await timed('Bedrock Agent Classic pipeline (second pass)', () => runS3Pipeline(timeLeft, sendTimeLeft));
-            // One combined view: totals add up, and "deferred" is whatever the second
-            // pass ended with, since it superseded the first pass's remainder.
-            bedrockAgentClassic.filesDone += s3SecondPass.filesDone;
-            bedrockAgentClassic.filesFailed += s3SecondPass.filesFailed;
-            bedrockAgentClassic.totalSent += s3SecondPass.totalSent;
-            bedrockAgentClassic.filesDeferred = s3SecondPass.filesDeferred;
-            // runS3Pipeline resets the traffic counters on entry, so the second pass's
-            // stats cover only its own files. Sum them, or the run summary would report
-            // whichever pass happened to finish last and undercount the other.
-            for (const [key, value] of Object.entries(s3SecondPass.traffic || {})) {
-                bedrockAgentClassic.traffic[key] = (bedrockAgentClassic.traffic[key] || 0) + value;
-            }
-            bedrockAgentClassic.secondPass = { filesDone: s3SecondPass.filesDone, totalSent: s3SecondPass.totalSent };
-            console.log(`♻️ Second pass added ${s3SecondPass.filesDone} file(s) and ${s3SecondPass.totalSent} message(s) — ${bedrockAgentClassic.filesDeferred} still deferred`);
-        }
+        const quickSuite = await runQuickPipeline(timeLeft, sendTimeLeft);
         logMemory('end');
 
-        // One structured line per run, so CloudWatch Insights can chart throughput
-        // and spot deferrals without parsing prose:
+        // One structured line per run, so CloudWatch Insights can chart throughput and
+        // spot deferrals without parsing prose:
         //   fields @timestamp, @message | filter @message like /RUN SUMMARY/
         const summary = {
             durationMs: Date.now() - startedAt,
             runBudgetMs: config.RUN_BUDGET_MS,
-            s3BudgetMs: config.S3_BUDGET_MS,
-            agentCoreBudgetMs: config.AGENTCORE_BUDGET_MS,
-            s3HandoverMs: handoverAt,
-            agentCoreHandoverMs: quickHandoverAt,
-            pipelineOrder: 's3-then-agentcore-then-quick',
-            pipelinesEnabled: {
-                bedrockClassic: config.BEDROCK_CLASSIC_ENABLED,
-                agentCore: config.AGENTCORE_ENABLED,
-                quickSuite: config.QUICK_ENABLED
-            },
             // Which limit ended the run — the schedule-derived budget (expected on a
             // backlog) or the Lambda clock (means the budget is set too high).
-            // 'work-complete' is reserved for runs that deferred nothing: with the
-            // second S3 pass returning leftover time, anything still deferred means
-            // the budget genuinely ran out rather than a share getting in the way.
             stoppedBy: stoppedByBudget()
                 ? 'run-budget'
                 : lambdaTimeLeft() < config.TIME_SAFETY_MARGIN_MS
                     ? 'lambda-timeout'
-                    : (bedrockAgentClassic.filesDeferred > 0 || agentCore.groupsDeferred > 0 || quickSuite.filesDeferred > 0) ? 'deferred-work-remaining' : 'work-complete',
+                    : quickSuite.filesDeferred > 0 ? 'deferred-work-remaining' : 'work-complete',
             lambdaTimeLeftMs: lambdaTimeLeft(),
-            messagesSent: bedrockAgentClassic.totalSent + agentCore.totalSent + quickSuite.totalSent,
-            s3: bedrockAgentClassic,
-            agentCore,
+            messagesSent: quickSuite.totalSent,
             quickSuite
         };
         console.log(`📊 RUN SUMMARY ${JSON.stringify(summary)}`);
-        if (bedrockAgentClassic.filesDeferred > 0 || agentCore.groupsDeferred > 0 || quickSuite.filesDeferred > 0) {
-            console.warn(`⏱️ Work was deferred to the next run (${bedrockAgentClassic.filesDeferred} S3 file(s), ${agentCore.groupsDeferred} log group(s), ${quickSuite.filesDeferred} Quick file(s)) — expected while catching up on a backlog, but persistent deferrals mean the schedule can't keep pace`);
+        if (quickSuite.filesDeferred > 0) {
+            console.warn(`⏱️ ${quickSuite.filesDeferred} file(s) deferred to the next run — expected while catching up on a backlog, but persistent deferrals mean the schedule can't keep pace`);
         }
 
         // The summary goes in the response too, not just the log — `aws lambda invoke`

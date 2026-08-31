@@ -10,7 +10,7 @@
 const { GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const { gunzip } = require('zlib');
 const { promisify } = require('util');
-const { s3Client, QUICK_LOGS_BUCKET_NAME, QUICK_LOGS_PREFIX, QUICK_LOOKBACK_DAYS } = require('./config');
+const { s3Client, QUICK_LOOKBACK_DAYS } = require('./config');
 const { parseQuickRecord, isChatLog, logTypeOf, missingOptionalFields } = require('./quickParser');
 const { createQuickStandardMessage, discoverAgentFromLogs } = require('./quickDiscovery');
 
@@ -57,7 +57,8 @@ function getQuickLogsStartTime(manifest) {
  * objects are just as valid. Empty objects are still skipped, and readQuickObject()
  * sniffs compression from the bytes rather than the file name.
  */
-async function getUnprocessedQuickLogFiles(manifest) {
+async function getUnprocessedQuickLogFiles(manifest, location) {
+    const { bucket: QUICK_LOGS_BUCKET_NAME, prefix: QUICK_LOGS_PREFIX } = location;
     const startTime = getQuickLogsStartTime(manifest);
     const allFiles = [];
     let continuationToken;
@@ -83,6 +84,15 @@ async function getUnprocessedQuickLogFiles(manifest) {
 
     const unprocessed = logFiles.filter((file) => new Date(file.LastModified) > startTime);
     console.log(`📊 Quick: ${allFiles.length} object(s) across ${pages} page(s), ${logFiles.length} candidate log file(s), ${unprocessed.length} newer than checkpoint`);
+
+    // The derived prefix (AWSLogs/<account>/quicksuitelogs/) follows AWS's observed
+    // naming rather than a documented guarantee. If it matches nothing, fall back to the
+    // broader AWSLogs/ before concluding there are no logs — a wrong guess here would
+    // look identical to an account with no traffic.
+    if (allFiles.length === 0 && QUICK_LOGS_PREFIX !== 'AWSLogs/' && QUICK_LOGS_PREFIX.startsWith('AWSLogs/')) {
+        console.log(`↩️ Nothing under ${QUICK_LOGS_PREFIX} — retrying with the broader prefix AWSLogs/`);
+        return getUnprocessedQuickLogFiles(manifest, { ...location, prefix: 'AWSLogs/' });
+    }
 
     // Turn each "nothing to do" case into a specific, actionable reason.
     if (allFiles.length === 0) {

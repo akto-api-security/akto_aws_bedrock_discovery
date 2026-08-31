@@ -17,6 +17,7 @@
  *      attached policies are fetched through discovery.js's own getRolePolicies —
  *      literally the same call the Bedrock pipeline makes.
  */
+const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
 const {
     ListAgentsCommand, DescribeAgentCommand, ListTagsForResourceCommand,
     ListActionConnectorsCommand, DescribeActionConnectorCommand,
@@ -24,10 +25,10 @@ const {
 } = require('@aws-sdk/client-quicksight');
 const {
     AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, QUICK_NAMESPACE, QUICK_MODEL_ID,
-    QUICK_BUILTIN_AGENT_ID, QUICK_BUILTIN_AGENT_NAME, quickSightClient
+    QUICK_BUILTIN_AGENT_ID, QUICK_BUILTIN_AGENT_NAME, QUICK_REDISCOVERY_HOURS, quickSightClient, iamClient
 } = require('./config');
-const { getRolePolicies } = require('./discovery');
-const { buildQuickMessage } = require('./quickMessageBuilder');
+
+const { buildQuickMessage, buildQuickConnectorMessage } = require('./quickMessageBuilder');
 const { buildQuickTraceData } = require('./quickParser');
 
 /**
@@ -41,6 +42,30 @@ const USER_RESOLVER_VERSION = 2;
 /** Per-invocation caches on top of the manifest's cross-run ones — avoids repeat work inside a single run. */
 const userCache = {};
 const reportedMissingAgents = new Set();
+
+/** Cache of role -> attached policy names, for the lifetime of one invocation. */
+const rolePolicyCache = {};
+
+/**
+ * Lists a role's attached managed policy names.
+ *
+ * A Quick agent has no execution role of its own — permissions attach to the asking
+ * user — but an IAM-federated Quick user resolves to a real IAM role, and its attached
+ * policies are what the message reports as the caller's effective permissions.
+ */
+async function getRolePolicies(roleName) {
+    if (rolePolicyCache[roleName] !== undefined) return rolePolicyCache[roleName];
+    try {
+        const response = await iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
+        const policies = response.AttachedPolicies?.map((p) => p.PolicyName).join(',') || '';
+        rolePolicyCache[roleName] = policies;
+        return policies;
+    } catch (error) {
+        console.error(`⚠️ Policy list failed for role ${roleName}: ${error.message}`);
+        rolePolicyCache[roleName] = '';
+        return '';
+    }
+}
 
 /** Generic pager for QuickSight's capitalised NextToken convention. */
 async function listAllPages(sendPage, pluck) {
@@ -120,21 +145,55 @@ async function refreshActionConnectors(actionConnectors, timeLeft) {
         }
         let enabledActions = [];
         let description = '';
+        let authType = '';
+        let baseEndpoint = '';
+        let tokenEndpoint = '';
+        let authorizationEndpoint = '';
+        let clientId = '';
+        let vpcConnectionArn = '';
         try {
             const detail = (await quickSightClient.send(new DescribeActionConnectorCommand({ AwsAccountId: AWS_ACCOUNT_ID, ActionConnectorId: id }))).ActionConnector;
             enabledActions = detail?.EnabledActions || [];
             description = detail?.Description || '';
+            vpcConnectionArn = detail?.VpcConnectionArn || '';
+            authType = detail?.AuthenticationConfig?.AuthenticationType || '';
+            /*
+             * BaseEndpoint is the external URL this connector actually talks to — for an
+             * MCP connector, the MCP server itself. Paired with authType it answers the
+             * question that matters for review: "what can this agent reach, and how well
+             * is it guarded?" An MCP server on AuthenticationType NONE is a finding.
+             *
+             * AuthenticationMetadata is a union whose every variant carries BaseEndpoint
+             * under a different key, so take the first one that has it rather than
+             * switching on the auth type.
+             */
+            const metadata = detail?.AuthenticationConfig?.AuthenticationMetadata || {};
+            baseEndpoint = findNested(metadata, 'BaseEndpoint');
+            tokenEndpoint = findNested(metadata, 'TokenEndpoint');
+            authorizationEndpoint = findNested(metadata, 'AuthorizationEndpoint');
+            clientId = findNested(metadata, 'ClientId');
         } catch (error) {
             console.warn(`⚠️ Quick DescribeActionConnector failed for ${id}: ${error.message} — keeping summary-level detail only`);
         }
         actionConnectors[id] = {
             id,
             name: summary.Name || id,
+            // Kept as a free string, not an enum: the SDK's ActionConnectorType is stale
+            // (no MODEL_CONTEXT_PROTOCOL, no GOOGLE_SLIDES) while the service keeps adding
+            // types, so anything unrecognised must still pass through intact.
             type: summary.Type || 'UNKNOWN',
             status: summary.Status || '',
             arn: summary.Arn || '',
             description,
             enabledActions,
+            authType,
+            baseEndpoint,
+            tokenEndpoint,
+            authorizationEndpoint,
+            clientId,
+            vpcConnectionArn,
+            createdTime: summary.CreatedTime ? new Date(summary.CreatedTime).toISOString() : '',
+            lastUpdatedTime: summary.LastUpdatedTime ? new Date(summary.LastUpdatedTime).toISOString() : '',
             resolvedAt: new Date().toISOString()
         };
         added++;
@@ -224,6 +283,10 @@ async function discoverNewQuickAgents(discoveredAgents, actionConnectors, timeLe
     const messages = [];
 
     await refreshActionConnectors(actionConnectors, timeLeft);
+    // Connectors are discovered as resources in their own right, not just as tool names
+    // inside a conversation. Without this an MCP server that nobody had chatted through
+    // yet was invisible — you could point one anywhere and nothing would report it.
+    messages.push(...buildConnectorDiscoveryMessages(actionConnectors, discoveredAgents));
 
     const agents = await listAllQuickAgents();
     console.log(`🔎 Quick ListAgents returned ${agents.length} agent(s)`);
@@ -231,7 +294,31 @@ async function discoverNewQuickAgents(discoveredAgents, actionConnectors, timeLe
     for (const agent of agents) {
         if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining Quick agent discovery'); return messages; }
         const key = `quick-agent-${agent.AgentId}`;
-        if (discoveredAgents[key]) continue;
+        // Re-send periodically rather than exactly once, so a dropped message recovers
+        // on its own. Already-known agents skip the DescribeAgent/tags calls below and
+        // are re-announced from what the manifest already holds.
+        const known = discoveredAgents[key];
+        if (known && !needsRediscovery(known)) continue;
+        if (known) {
+            messages.push(buildQuickMessage({
+                resourceType: 'QUICK_AGENT',
+                agentId: known.resourceId,
+                agentName: known.resourceName || known.resourceId,
+                description: known.description || '',
+                agentStatus: known.agentStatus || 'ACTIVE',
+                agentLifecycle: known.agentLifecycle || '',
+                creator: known.creator || '',
+                spaces: known.spaces || [],
+                actionConnectors: known.actionConnectorIds || [],
+                createdAt: known.discoveredAt,
+                updatedAt: known.discoveredAt,
+                arn: known.agentArn || '',
+                agentTags: known.agentTags || {},
+                ...describeConnectors(known.actionConnectorIds, actionConnectors)
+            }, false));
+            known.lastDiscoverySentAt = new Date().toISOString();
+            continue;
+        }
         try {
             const metadata = await getQuickAgentMetadata(agent.AgentId);
             const arn = metadata?.Arn || agent.Arn || `arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.AgentId}`;
@@ -270,7 +357,8 @@ async function discoverNewQuickAgents(discoveredAgents, actionConnectors, timeLe
                 spaces: metadata?.Spaces || [],
                 actionConnectorIds: connectorIds,
                 agentTags,
-                discoveredAt: new Date().toISOString()
+                discoveredAt: new Date().toISOString(),
+                lastDiscoverySentAt: new Date().toISOString()
             };
             console.log(`✅ Discovered Quick agent '${discoveredAgents[key].resourceName}' (${agent.AgentId})${connectorIds.length ? ` with ${connectorIds.length} action connector(s)` : ''}`);
         } catch (error) {
@@ -278,6 +366,112 @@ async function discoverNewQuickAgents(discoveredAgents, actionConnectors, timeLe
         }
     }
 
+    return messages;
+}
+
+/**
+ * Depth-first search for one named field inside AuthenticationMetadata.
+ *
+ * The metadata is a union whose shape changes per auth type, and the interesting values
+ * are not at a fixed depth. A real MCP connector using client-credentials nests them
+ * three levels down:
+ *
+ *   ClientCredentialsGrantMetadata
+ *     .BaseEndpoint                                   <- depth 2
+ *     .ReadClientCredentialsDetails
+ *       .ReadClientCredentialsGrantDetails
+ *         .TokenEndpoint / .ClientId                  <- depth 4
+ *
+ * An API-key or 3LO connector nests them differently again, so searching by name beats
+ * hardcoding a path per variant.
+ *
+ * Only ever called with names from FIELDS below — an allowlist rather than a blocklist,
+ * so a secret AWS starts returning in future cannot be swept up by accident.
+ */
+function findNested(node, name, depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 6) return '';
+    if (typeof node[name] === 'string' && node[name]) return node[name];
+    for (const value of Object.values(node)) {
+        const found = findNested(value, name, depth + 1);
+        if (found) return found;
+    }
+    return '';
+}
+
+/**
+ * Is this connector an MCP server?
+ *
+ * Matched on a substring rather than equality because the SDK's ActionConnectorType enum
+ * is already behind the service (it carries neither MODEL_CONTEXT_PROTOCOL nor
+ * GOOGLE_SLIDES), so the type arrives as a free string and could gain a suffix.
+ */
+function isMcpConnector(connector) {
+    return String(connector?.type || '').toUpperCase().includes('MODEL_CONTEXT_PROTOCOL');
+}
+
+/**
+ * Should this resource's discovery message be sent again?
+ *
+ * True when it has never been sent, or when the last send is older than
+ * QUICK_REDISCOVERY_HOURS. Discovery used to be strictly one-time, which meant a message
+ * the ingest API dropped was gone for good and the only recovery was deleting the
+ * manifest — replaying every conversation in the lookback window as a side effect.
+ * Re-sending periodically makes the dashboard self-heal at a cost of one message per
+ * resource per day.
+ */
+function needsRediscovery(entry) {
+    if (!entry?.lastDiscoverySentAt) return true;
+    const ageMs = Date.now() - new Date(entry.lastDiscoverySentAt).getTime();
+    if (!Number.isFinite(ageMs)) return true;
+    return ageMs > QUICK_REDISCOVERY_HOURS * 60 * 60 * 1000;
+}
+
+/**
+ * Discovery messages for action connectors — one per connector, first time and then
+ * once per QUICK_REDISCOVERY_HOURS.
+ *
+ * `usedByAgents` is resolved from each agent's own ActionConnectors list, so the message
+ * can answer "which agents can invoke this MCP server" rather than leaving the connector
+ * floating unattached.
+ */
+function buildConnectorDiscoveryMessages(actionConnectors, discoveredAgents) {
+    const messages = [];
+    let skippedNonMcp = 0;
+    for (const connector of Object.values(actionConnectors || {})) {
+        if (!connector?.id) continue;
+        /*
+         * Only MCP connectors are reported as discovered resources.
+         *
+         * The others (Google Slides, Jira, Slack …) are first-party SaaS integrations with
+         * a known vendor endpoint and a managed OAuth flow — inventorying them adds noise
+         * rather than signal. An MCP connector is different in kind: it points at an
+         * arbitrary server chosen by whoever configured it, so its endpoint and auth mode
+         * are worth surfacing on their own.
+         *
+         * Non-MCP connectors are still RESOLVED by refreshActionConnectors above, so they
+         * keep appearing by name as tools inside conversation traceData. This filter only
+         * decides what becomes a standalone discovery message.
+         */
+        if (!isMcpConnector(connector)) { skippedNonMcp++; continue; }
+        if (!needsRediscovery(connector)) continue;
+
+        const usedByAgents = Object.values(discoveredAgents || {})
+            .filter((a) => (a?.actionConnectorIds || []).includes(connector.id))
+            .map((a) => a.resourceName || a.resourceId)
+            .filter(Boolean);
+
+        messages.push(buildQuickConnectorMessage(connector, usedByAgents));
+        connector.lastDiscoverySentAt = new Date().toISOString();
+
+        const flags = [
+            connector.type,
+            connector.authType ? `auth=${connector.authType}` : '',
+            String(connector.authType || '').toUpperCase() === 'NONE' ? 'UNAUTHENTICATED' : ''
+        ].filter(Boolean).join(' ');
+        console.log(`🔌 Discovered action connector '${connector.name}' (${flags})${connector.baseEndpoint ? ` → ${connector.baseEndpoint}` : ''}`);
+    }
+    if (messages.length > 0) console.log(`✅ MCP connector discovery: ${messages.length} message(s)`);
+    if (skippedNonMcp > 0) console.log(`ℹ️ ${skippedNonMcp} non-MCP connector(s) resolved for tool naming but not reported as resources`);
     return messages;
 }
 
@@ -433,7 +627,7 @@ function resetQuickRunState() {
 }
 
 module.exports = {
-    listAllQuickAgents, getQuickAgentMetadata, getQuickResourceTags, refreshActionConnectors,
-    resolveQuickUser, discoverNewQuickAgents, discoverAgentFromLogs,
+    getRolePolicies, listAllQuickAgents, getQuickAgentMetadata, getQuickResourceTags, refreshActionConnectors,
+    resolveQuickUser, discoverNewQuickAgents, discoverAgentFromLogs, buildConnectorDiscoveryMessages, needsRediscovery, isMcpConnector, findNested,
     createQuickStandardMessage, describeConnectors, resetQuickRunState
 };

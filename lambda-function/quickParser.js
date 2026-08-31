@@ -25,7 +25,43 @@
  * total data loss if AWS settles on either spelling.
  */
 const { AWS_REGION, AWS_ACCOUNT_ID, MAX_TRACE_BYTES, QUICK_NAMESPACE } = require('./config');
-const { capTraceData } = require('./extractors');
+
+/**
+ * Caps one trace so a single pathological conversation can never produce a message too
+ * large for the downstream broker. Step *results* are the bulk of the bytes, so they are
+ * truncated (longest first) before anything structural is dropped: which tools ran, in
+ * what order, is worth more than the full text of what they returned.
+ */
+function capTraceData(trace, maxBytes) {
+    const size = (v) => Buffer.byteLength(JSON.stringify(v), 'utf8');
+    if (size(trace) <= maxBytes) return trace;
+
+    const steps = [...(trace.executionFlow || [])];
+    // Longest results first — one huge result is the usual cause.
+    const order = steps
+        .map((s, i) => ({ i, len: String(s.result || '').length }))
+        .sort((a, b) => b.len - a.len);
+
+    for (const { i } of order) {
+        if (size(trace) <= maxBytes) break;
+        const result = String(steps[i].result || '');
+        if (result.length <= 200) continue;
+        steps[i] = { ...steps[i], result: `${result.slice(0, 200)}…[truncated ${result.length - 200} chars]`, resultTruncated: true };
+        trace = { ...trace, executionFlow: steps };
+    }
+
+    // Still too big — the step list itself is the problem, so keep the summary and the
+    // first steps rather than emit something the broker will reject outright.
+    if (size(trace) > maxBytes) {
+        const kept = [];
+        for (const step of steps) {
+            kept.push(step);
+            if (size({ ...trace, executionFlow: kept }) > maxBytes) { kept.pop(); break; }
+        }
+        trace = { ...trace, executionFlow: kept, executionFlowTruncated: { kept: kept.length, total: steps.length } };
+    }
+    return trace;
+}
 
 /** First present, non-empty value among several candidate field names. */
 function pick(record, ...names) {
@@ -318,7 +354,7 @@ function buildQuickTraceData(pair, connectors = {}, botName, maxBytes = MAX_TRAC
 }
 
 module.exports = {
-    pick, str, arr, isChatLog, logTypeOf, toIsoTimestamp, parseQuickUserArn, parseQuickResourceArn,
+    capTraceData, pick, str, arr, isChatLog, logTypeOf, toIsoTimestamp, parseQuickUserArn, parseQuickResourceArn,
     normalizeResource, normalizeAttachment, normalizeConnectorId, summarizeResources,
     parseQuickRecord, missingOptionalFields, buildQuickTraceData
 };

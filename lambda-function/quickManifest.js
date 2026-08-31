@@ -1,7 +1,9 @@
 /**
- * The S3-backed checkpoint for the Amazon Quick Suite chat-log pipeline —
- * separate from manifest.js (Bedrock Agent Classic) and traceManifest.js
- * (AgentCore), so no two pipelines ever contend over the same file.
+ * The S3-backed checkpoint for the Amazon Quick pipeline.
+ *
+ * Lives in the CENTRAL markers bucket in the management account, under
+ * <account-id>/<region>/, so every account's state sits in one place and no two
+ * processors ever write the same key.
  *
  * Holds four things beyond the file checkpoint, all of which exist to keep
  * QuickSight API calls out of the steady state:
