@@ -51,11 +51,21 @@ async function sendBatchWithRetry(batch, batchNum, totalBatches) {
 async function sendToDataIngestionService(messages) {
     if (messages.length === 0) return;
     const totalBatches = Math.ceil(messages.length / SEND_BATCH_SIZE);
-    console.log(`📤 Sending ${messages.length} message(s) to AKTO in ${totalBatches} batch(es)`);
+    // Naming the destination host makes "sent successfully but nothing in the
+    // dashboard" immediately answerable — it's usually the wrong instance.
+    let host = DATA_INGESTION_ENDPOINT;
+    try {
+        host = new URL(DATA_INGESTION_ENDPOINT).host;
+    } catch { /* fall back to the raw value */ }
+
+    const startedAt = Date.now();
+    console.log(`📤 Sending ${messages.length} message(s) to ${host} in ${totalBatches} batch(es)`);
     for (let i = 0; i < messages.length; i += SEND_BATCH_SIZE) {
         const batchNum = Math.floor(i / SEND_BATCH_SIZE) + 1;
         await sendBatchWithRetry(messages.slice(i, i + SEND_BATCH_SIZE), batchNum, totalBatches);
     }
+    const elapsed = Date.now() - startedAt;
+    console.log(`✅ All ${messages.length} message(s) accepted by ${host} in ${(elapsed / 1000).toFixed(1)}s (${Math.round(elapsed / messages.length)}ms/msg)`);
 }
 
 module.exports = { sendToDataIngestionService };

@@ -115,6 +115,11 @@ async function getUnprocessedLogFiles(manifest) {
     const startTime = getLogsStartTime(manifest);
     let allFiles = [];
     let continuationToken;
+    let pages = 0;
+
+    // Name the exact location being read: a wrong LOGS_PREFIX is the single most
+    // common reason discovery finds nothing, and it is invisible from counts alone.
+    console.log(`🪣 Listing s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} for .gz logs newer than ${startTime.toISOString()}`);
 
     do {
         const response = await s3Client.send(new ListObjectsV2Command({
@@ -125,6 +130,7 @@ async function getUnprocessedLogFiles(manifest) {
         }));
         allFiles.push(...(response.Contents || []));
         continuationToken = response.NextContinuationToken;
+        pages++;
     } while (continuationToken);
 
     const logFiles = allFiles
@@ -132,7 +138,20 @@ async function getUnprocessedLogFiles(manifest) {
         .sort((a, b) => new Date(a.LastModified) - new Date(b.LastModified));
 
     const unprocessed = logFiles.filter((file) => new Date(file.LastModified) > startTime);
-    console.log(`📊 ${allFiles.length} total objects, ${logFiles.length} .gz log files, ${unprocessed.length} newer than checkpoint`);
+    console.log(`📊 ${allFiles.length} object(s) across ${pages} page(s), ${logFiles.length} .gz log file(s), ${unprocessed.length} newer than checkpoint`);
+
+    // Turn each "nothing to do" case into a specific, actionable reason.
+    if (allFiles.length === 0) {
+        console.warn(`⚠️ Nothing at s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} — check LOGS_PREFIX matches where Bedrock actually delivers, and that model invocation logging is enabled for this account/region`);
+    } else if (logFiles.length === 0) {
+        const sample = allFiles.slice(0, 3).map((f) => f.Key).join(', ');
+        console.warn(`⚠️ Objects exist under the prefix but none are .gz Bedrock logs. First key(s): ${sample} — LOGS_PREFIX may be pointing at the wrong level`);
+    } else if (unprocessed.length === 0) {
+        const newest = logFiles[logFiles.length - 1];
+        console.log(`✅ Up to date — newest log file is ${newest.Key} (${new Date(newest.LastModified).toISOString()}), at or before the checkpoint`);
+    } else {
+        console.log(`📄 Oldest unprocessed: ${unprocessed[0].Key} (${new Date(unprocessed[0].LastModified).toISOString()})`);
+    }
     return unprocessed;
 }
 

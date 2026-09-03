@@ -6,6 +6,7 @@ const { BedrockAgentClient } = require('@aws-sdk/client-bedrock-agent');
 const { BedrockAgentCoreControlClient } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { CloudWatchLogsClient } = require('@aws-sdk/client-cloudwatch-logs');
 const { IAMClient } = require('@aws-sdk/client-iam');
+const { LambdaClient } = require('@aws-sdk/client-lambda');
 const { S3Client } = require('@aws-sdk/client-s3');
 
 const DATA_INGESTION_ENDPOINT = process.env.DATA_INGESTION_ENDPOINT;
@@ -34,6 +35,33 @@ const TRACE_LOOKBACK_DAYS = 3;
 const TRACE_MARKERS_PREFIX = `${MARKERS_PREFIX}agentcore-tracing/`;
 const TRACE_MANIFEST_KEY = `${TRACE_MARKERS_PREFIX}manifest.json`;
 
+// AgentCore Gateway interception (gatewayAttacher.js / gatewayDiscovery.js /
+// gatewayInterceptor.js). Only the attacher Lambda reads these — the interceptor
+// itself has its own config module with no SDK imports (interceptorConfig.js).
+const INTERCEPTOR_LAMBDA_ARN = process.env.INTERCEPTOR_LAMBDA_ARN || '';
+const INTERCEPTION_POINTS = ['REQUEST', 'RESPONSE'];
+// Empty include list = every gateway in the region. Both accept comma-separated
+// gateway IDs and exist for staged rollout / carve-outs, not day-to-day use.
+const INCLUDE_GATEWAY_IDS = parseIdList(process.env.INCLUDE_GATEWAY_IDS);
+const EXCLUDE_GATEWAY_IDS = parseIdList(process.env.EXCLUDE_GATEWAY_IDS);
+// Logs every attach decision without calling UpdateGateway — use before the
+// first real run against a client account.
+const INTERCEPTOR_DRY_RUN = String(process.env.INTERCEPTOR_DRY_RUN || '').trim().toLowerCase() === 'true';
+// Gateways get their own marker folder, like the S3 and trace pipelines, so their
+// discovery bookkeeping never contends with either checkpoint.
+const GATEWAY_MARKERS_PREFIX = `${MARKERS_PREFIX}agentcore-gateways/`;
+const GATEWAY_MANIFEST_KEY = `${GATEWAY_MARKERS_PREFIX}manifest.json`;
+// Lambda caps all environment variables at 4KB combined. The published map only
+// carries gateways whose name can't be derived from their ID (normally none), so
+// this is an exception budget rather than a per-gateway cost — but it is measured
+// in real bytes so a few long names can't silently break the write.
+const GATEWAY_NAME_MAP_MAX_BYTES = 3000;
+
+/** Splits a comma-separated env var into a trimmed, non-empty list. */
+function parseIdList(value) {
+    return String(value || '').split(',').map((id) => id.trim()).filter(Boolean);
+}
+
 /** Throws if any required environment variable is missing or blank. Call this first, before touching AWS. */
 function validateConfig() {
     const required = { LOGS_BUCKET_NAME, LOGS_PREFIX, MARKERS_BUCKET_NAME, DATA_INGESTION_ENDPOINT, AKTO_API_KEY };
@@ -47,10 +75,13 @@ module.exports = {
     AWS_REGION, AWS_ACCOUNT_ID, MARKERS_PREFIX, MANIFEST_KEY,
     SEND_BATCH_SIZE, FLUSH_THRESHOLD, TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, LOOKBACK_DAYS,
     RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH, TRACE_LOOKBACK_DAYS, TRACE_MARKERS_PREFIX, TRACE_MANIFEST_KEY,
+    INTERCEPTOR_LAMBDA_ARN, INTERCEPTION_POINTS, INCLUDE_GATEWAY_IDS, EXCLUDE_GATEWAY_IDS, INTERCEPTOR_DRY_RUN,
+    GATEWAY_MARKERS_PREFIX, GATEWAY_MANIFEST_KEY, GATEWAY_NAME_MAP_MAX_BYTES,
     validateConfig,
     bedrockAgentClient: new BedrockAgentClient({ region: AWS_REGION }),
     bedrockAgentCoreControlClient: new BedrockAgentCoreControlClient({ region: AWS_REGION }),
     cloudWatchLogsClient: new CloudWatchLogsClient({ region: AWS_REGION }),
     s3Client: new S3Client({ region: AWS_REGION }),
-    iamClient: new IAMClient({ region: AWS_REGION })
+    iamClient: new IAMClient({ region: AWS_REGION }),
+    lambdaClient: new LambdaClient({ region: AWS_REGION })
 };

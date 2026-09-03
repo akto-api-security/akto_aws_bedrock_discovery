@@ -1,11 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  AKTO Bedrock Discovery - Client Deployment. One Lambda runs two independent
-  pipelines: Bedrock Agent Classic (S3 model-invocation logs) and AgentCore
-  Harness/Runtime (CloudWatch observability traces). The AgentCore half is a
-  no-op if the account hasn't enabled CloudWatch Transaction Search + tracing
-  — the Lambda simply finds zero log groups and the Agent Classic half keeps
-  working normally.
+  AKTO Bedrock Discovery + AgentCore Gateway Interception - Client Deployment.
 
 Parameters:
   LogsBucketName:
@@ -41,17 +36,39 @@ Parameters:
 
   LambdaCodeVersion:
     Type: String
-    Description: 'Version of Lambda code to deploy (e.g., v1.0, v1.1, v2.0). Check with AKTO team for latest version.'
-    Default: 'v1.0'
+    Description: >
+      Version of Lambda code to deploy. Check with AKTO team for the latest
+      version. Gateway interception requires v4.1 or later.
+    Default: 'v4.1'
     AllowedPattern: '^v[0-9]+\.[0-9]+$'
     ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
 
+  # ---------------------------------------------------------------------------
+  # AgentCore Gateway interception
+  # ---------------------------------------------------------------------------
+  EnableGatewayInterception:
+    Type: String
+    Description: >
+      Apply real-time AKTO guardrails to AgentCore Gateway MCP traffic? "true"
+      deploys the interceptor Lambda and attaches it to every gateway found in
+      this region automatically."false" deploys discovery only.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  # Gates every interception resource. When false this stack is exactly the
+  # discovery-only deployment: no interceptor, no attacher, no gateway writes.
+  InterceptionEnabled: !Equals [!Ref EnableGatewayInterception, 'true']
+
 Resources:
-  # IAM Role for Lambda
+  # ===========================================================================
+  # DISCOVERY (S3 model-invocation logs + AgentCore traces)
+  # ===========================================================================
+
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'akto-bedrock-processor-cf-${AWS::AccountId}'
+      RoleName: !Sub 'akto-bedrock-processor-cf-${AWS::AccountId}-${AWS::Region}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -176,6 +193,15 @@ Resources:
         - Arn: !GetAtt AktoBedrocklambdaFunction.Arn
           Id: AktoBedrocklambdaTarget
           RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+        # The attacher shares this schedule rather than owning a second rule: it
+        # only needs a periodic nudge to pick up gateways created after deploy,
+        # and an already-attached gateway costs one read. No RoleArn here — the
+        # Lambda::Permission below is what authorises EventBridge to invoke it.
+        - !If
+          - InterceptionEnabled
+          - Arn: !GetAtt AktoGatewayAttacherFunction.Arn
+            Id: AktoGatewayAttacherTarget
+          - !Ref 'AWS::NoValue'
 
   # Lambda Permission for EventBridge
   LambdaInvokePermission:
@@ -185,6 +211,189 @@ Resources:
       Action: 'lambda:InvokeFunction'
       Principal: events.amazonaws.com
       SourceArn: !GetAtt BedrocktogProcessingScheduleRule.Arn
+
+  # ===========================================================================
+  # GATEWAY INTERCEPTOR (real-time guardrails on MCP tool traffic)
+  # ===========================================================================
+
+  # Deliberately minimal: the interceptor makes no AWS API calls, it only talks
+  # to AKTO over HTTPS. Logs are all it needs.
+  InterceptorExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: InterceptionEnabled
+    Properties:
+      RoleName: !Sub 'akto-bedrock-interceptor-cf-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  # Invoked synchronously by the gateway on every guarded tools/call, so it is
+  # sized for latency (small, short timeout) rather than for the discovery
+  # workload. Timeout must stay above AKTO_GUARDRAIL_TIMEOUT_MS (5s default) so
+  # a slow AKTO fails open inside the function instead of timing out the Lambda.
+  AktoInterceptorFunction:
+    Type: AWS::Lambda::Function
+    Condition: InterceptionEnabled
+    Properties:
+      FunctionName: !Sub 'akto-bedrock-interceptor-cf-${AWS::AccountId}'
+      Runtime: nodejs22.x
+      Handler: interceptor.handler
+      Role: !GetAtt InterceptorExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code:
+        S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
+        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
+      Environment:
+        Variables:
+          DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
+          AKTO_API_KEY: !Ref AktoApiKey
+          BEDROCK_AWS_REGION: !Ref 'AWS::Region'
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+      Description: 'AKTO AgentCore Gateway interceptor - real-time guardrails on MCP tools/call traffic (fails open)'
+
+  # ===========================================================================
+  # GATEWAY ATTACHER (auto-detects gateways, attaches the interceptor)
+  # ===========================================================================
+
+  GatewayAttacherExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: InterceptionEnabled
+    Properties:
+      RoleName: !Sub 'akto-bedrock-gw-attacher-cf-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AktoGatewayAttachPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Gateway discovery + interceptor attachment. These are the only
+              # write permissions AKTO needs anywhere in this stack, and they
+              # live on this role alone — never on the discovery processor's.
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:ListGateways'
+                  - 'bedrock-agentcore:GetGateway'
+                  - 'bedrock-agentcore:ListGatewayTargets'
+                  - 'bedrock-agentcore:UpdateGateway'
+                Resource: '*'
+              # Maps harnesses to the gateways they call, for logging which
+              # agents sit behind each attached gateway.
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:ListHarnesses'
+                  - 'bedrock-agentcore:GetHarness'
+                Resource: '*'
+              # UpdateGateway re-passes the gateway's own execution role, so
+              # PassRole is required — constrained to AgentCore so it cannot be
+              # used to hand a role to anything else.
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'bedrock-agentcore.amazonaws.com'
+              # Lets each discovered gateway invoke the interceptor, via a
+              # resource policy on our own function — the client's gateway role
+              # is never modified. GetFunctionConfiguration/UpdateFunctionConfiguration
+              # publish the gatewayId->name map the interceptor uses to tag traffic.
+              # All scoped to the interceptor function only.
+              - Effect: Allow
+                Action:
+                  - 'lambda:AddPermission'
+                  - 'lambda:RemovePermission'
+                  - 'lambda:GetPolicy'
+                  - 'lambda:GetFunctionConfiguration'
+                  - 'lambda:UpdateFunctionConfiguration'
+                Resource: !GetAtt AktoInterceptorFunction.Arn
+              # Gateway metadata for discovery messages: the customer's own tags on
+              # the gateway, and each target's backend configuration.
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:ListTagsForResource'
+                  - 'bedrock-agentcore:GetGatewayTarget'
+                Resource: '*'
+              # Attached policy names on the gateway's execution role — the same
+              # role enrichment agents and harnesses already get.
+              - Effect: Allow
+                Action:
+                  - 'iam:ListAttachedRolePolicies'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              # Gateway discovery checkpoint, so a gateway is announced to AKTO once
+              # rather than on every sweep. Confined to AKTO's own marker prefix.
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${MarkersBucketName}'
+                  - !Sub 'arn:aws:s3:::${MarkersBucketName}/akto/markers/*'
+
+  AktoGatewayAttacherFunction:
+    Type: AWS::Lambda::Function
+    Condition: InterceptionEnabled
+    Properties:
+      FunctionName: !Sub 'akto-bedrock-gw-attacher-cf-${AWS::AccountId}'
+      Runtime: nodejs22.x
+      Handler: gatewayAttacher.handler
+      Role: !GetAtt GatewayAttacherExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
+        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
+      Environment:
+        Variables:
+          INTERCEPTOR_LAMBDA_ARN: !GetAtt AktoInterceptorFunction.Arn
+          DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
+          AKTO_API_KEY: !Ref AktoApiKey
+          MARKERS_BUCKET_NAME: !Ref MarkersBucketName
+          BEDROCK_AWS_REGION: !Ref 'AWS::Region'
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+      Description: 'Auto-detects AgentCore Gateways, announces them to AKTO as discovered inventory, and keeps the interceptor attached'
+
+  # Lets the shared discovery schedule invoke the attacher too, so gateways
+  # created after deployment get picked up and manual removals self-heal.
+  GatewayAttacherInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: InterceptionEnabled
+    Properties:
+      FunctionName: !Ref AktoGatewayAttacherFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BedrocktogProcessingScheduleRule.Arn
+
+  # Attaches at deploy time so there's no wait for the first scheduled sweep,
+  # and detaches on stack delete so no gateway is left pointing at a Lambda that
+  # no longer exists. Always reports success — a gateway that can't be attached
+  # must not roll back (or block the deletion of) the whole stack; check the
+  # attacher's CloudWatch logs for per-gateway outcomes.
+  AktoGatewayInterceptorAttachment:
+    Type: Custom::AktoGatewayInterceptor
+    Condition: InterceptionEnabled
+    DependsOn:
+      - GatewayAttacherExecutionRole
+    Properties:
+      ServiceToken: !GetAtt AktoGatewayAttacherFunction.Arn
+      InterceptorLambdaArn: !GetAtt AktoInterceptorFunction.Arn
+      # Changing the code version re-runs attachment on stack update; without a
+      # changing property CloudFormation would skip the custom resource entirely.
+      CodeVersion: !Ref LambdaCodeVersion
 
 Outputs:
   LambdaFunctionName:
@@ -202,3 +411,22 @@ Outputs:
   StackName:
     Description: 'CloudFormation stack name'
     Value: !Ref 'AWS::StackName'
+
+  GatewayInterceptionEnabled:
+    Description: 'Whether AgentCore Gateway interception was deployed'
+    Value: !Ref EnableGatewayInterception
+
+  InterceptorFunctionArn:
+    Condition: InterceptionEnabled
+    Description: 'ARN of the interceptor Lambda attached to AgentCore Gateways'
+    Value: !GetAtt AktoInterceptorFunction.Arn
+
+  GatewayAttacherFunctionName:
+    Condition: InterceptionEnabled
+    Description: 'Name of the gateway attacher Lambda (check its logs for per-gateway attach outcomes)'
+    Value: !Ref AktoGatewayAttacherFunction
+
+  GatewayAttachmentResult:
+    Condition: InterceptionEnabled
+    Description: 'Summary of the deploy-time gateway attachment sweep'
+    Value: !GetAtt AktoGatewayInterceptorAttachment.Summary
