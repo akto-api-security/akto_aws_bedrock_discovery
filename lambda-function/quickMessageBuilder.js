@@ -11,7 +11,7 @@
  * agentType still separates the two resource kinds within Quick:
  * 'QUICK_SUITE_AGENT' for agents, 'QUICK_ACTION_CONNECTOR' for MCP connectors.
  */
-const { AWS_REGION, AWS_ACCOUNT_ID, QUICK_MODEL_ID, QUICK_BUILTIN_AGENT_ID } = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, QUICK_MODEL_ID, QUICK_BUILTIN_AGENT_ID, CODE_VERSION } = require('./config');
 const { summarizeResources } = require('./quickParser');
 
 /**
@@ -147,6 +147,11 @@ function buildQuickMessage(data, isConversation) {
         'gen-ai': 'Gen AI',
         'account-id': accountId,
         region,
+        // The build that produced this message. Carried on every message rather than
+        // announced separately, so the version a message came from is visible wherever
+        // the message is — which is how a rollout is confirmed: watch the tag change on
+        // live traffic instead of trusting that an update was applied.
+        'lambda-version': CODE_VERSION,
         agentType: 'QUICK_SUITE_AGENT',
         'bot-name': resourceName || '',
         'agent-id': agentId,
@@ -345,6 +350,7 @@ function buildQuickConnectorMessage(connector, usedByAgents = []) {
         'gen-ai': 'Gen AI',
         'account-id': AWS_ACCOUNT_ID,
         region: AWS_REGION,
+        'lambda-version': CODE_VERSION,
         agentType: 'QUICK_ACTION_CONNECTOR',
         'bot-name': name,
         'agent-id': connector.id,

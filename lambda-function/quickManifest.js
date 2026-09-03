@@ -20,7 +20,7 @@
  *                         visible after the CloudWatch logs age out.
  */
 const { GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { s3Client, MARKERS_BUCKET_NAME, QUICK_MANIFEST_KEY } = require('./config');
+const { s3Client, MARKERS_BUCKET_NAME, QUICK_MANIFEST_KEY, CODE_VERSION } = require('./config');
 
 const MAX_FAILED_FILES = 50;
 
@@ -90,6 +90,10 @@ async function updateQuickManifest({ discoveredAgents, actionConnectors, quickUs
 
         const manifest = {
             version: '1.1',
+            // The build that wrote this manifest. Since every account writes into the one
+            // central markers bucket, this is how you see which build each account is
+            // actually running after the updater has rolled a release out.
+            codeVersion: CODE_VERSION,
             lastProcessedTimestamp: checkpoint || new Date().toISOString(),
             lastManifestUpdate: new Date().toISOString(),
             filesProcessedCount: filesProcessed,
@@ -107,7 +111,7 @@ async function updateQuickManifest({ discoveredAgents, actionConnectors, quickUs
             ContentType: 'application/json'
         }));
         const moved = previous !== manifest.lastProcessedTimestamp;
-        console.log(`✅ Quick manifest checkpointed: lastProcessedTimestamp=${manifest.lastProcessedTimestamp}${moved ? '' : ' (unchanged)'}, ${manifest.agentCount} known agent(s), ${Object.keys(manifest.actionConnectors).length} connector(s), ${Object.keys(manifest.quickUsers).length} user(s)${mergedFailures.length ? `, ${mergedFailures.length} failed file(s) recorded` : ''}${mergedRejects.length ? `, ${mergedRejects.length} rejected message(s) recorded` : ''}`);
+        console.log(`✅ Quick manifest checkpointed (build ${CODE_VERSION}): lastProcessedTimestamp=${manifest.lastProcessedTimestamp}${moved ? '' : ' (unchanged)'}, ${manifest.agentCount} known agent(s), ${Object.keys(manifest.actionConnectors).length} connector(s), ${Object.keys(manifest.quickUsers).length} user(s)${mergedFailures.length ? `, ${mergedFailures.length} failed file(s) recorded` : ''}${mergedRejects.length ? `, ${mergedRejects.length} rejected message(s) recorded` : ''}`);
     } catch (error) {
         console.error(`❌ Error checkpointing Quick manifest: ${error.message}`);
     }

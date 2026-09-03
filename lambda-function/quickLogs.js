@@ -10,7 +10,7 @@
 const { GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const { gunzip } = require('zlib');
 const { promisify } = require('util');
-const { s3Client, QUICK_LOOKBACK_DAYS } = require('./config');
+const { s3Client, QUICK_LOOKBACK_DAYS, AWS_ACCOUNT_ID } = require('./config');
 const { parseQuickRecord, isChatLog, logTypeOf, missingOptionalFields } = require('./quickParser');
 const { createQuickStandardMessage, discoverAgentFromLogs } = require('./quickDiscovery');
 
@@ -96,7 +96,20 @@ async function getUnprocessedQuickLogFiles(manifest, location) {
 
     // Turn each "nothing to do" case into a specific, actionable reason.
     if (allFiles.length === 0) {
-        console.warn(`⚠️ Nothing at s3://${QUICK_LOGS_BUCKET_NAME}/${QUICK_LOGS_PREFIX} — check QUICK_LOGS_PREFIX matches where the CHAT_LOGS delivery actually writes, and that the delivery (PutDeliverySource/CreateDelivery) exists for this account`);
+        /*
+         * An empty listing has two very different causes and they need different fixes.
+         *
+         * When the bucket belongs to someone else — a shared org-wide log bucket, or a
+         * delivery someone configured earlier — the usual cause is that its policy does not
+         * authorise this account. That failure is silent everywhere else: the delivery is
+         * created successfully, reports healthy, and simply never receives anything. Saying
+         * so here is the only place it surfaces.
+         */
+        if (location.sharedBucket) {
+            console.warn(`⚠️ Nothing at s3://${QUICK_LOGS_BUCKET_NAME}/${QUICK_LOGS_PREFIX}. This bucket is not managed by this account, so the likeliest cause is its bucket policy. It must (a) allow delivery.logs.amazonaws.com to s3:PutObject on AWSLogs/${AWS_ACCOUNT_ID}/*, or nothing is ever written, and (b) allow this account to s3:GetObject and s3:ListBucket the same prefix, or nothing can be read back. Note a delivery can exist and look healthy while (a) is missing.`);
+        } else {
+            console.warn(`⚠️ Nothing at s3://${QUICK_LOGS_BUCKET_NAME}/${QUICK_LOGS_PREFIX} — check the prefix matches where the CHAT_LOGS delivery actually writes, and that the delivery exists for this account`);
+        }
     } else if (unprocessed.length === 0) {
         const newest = logFiles[logFiles.length - 1];
         if (newest) console.log(`✅ Quick up to date — newest log file is ${newest.Key} (${new Date(newest.LastModified).toISOString()}), at or before the checkpoint`);

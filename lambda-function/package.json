@@ -5,8 +5,9 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "package": "npm ci && zip -r ../akto-quick-processor.zip . -x '*.git*' 'node_modules/.cache/*'",
-    "deploy": "npm run package && aws lambda update-function-code --function-name akto-quick-processor --zip-file fileb://../akto-quick-processor.zip"
+    "package": "npm ci && zip -r ../akto-quick-processor.zip . -x '*.git*' 'node_modules/.cache/*' 'test/*' 'scripts/*'",
+    "deploy": "npm run package && aws lambda update-function-code --function-name akto-quick-processor --zip-file fileb://../akto-quick-processor.zip",
+    "prepackage": "node scripts/stamp-version.js"
   },
   "keywords": [
     "aws",

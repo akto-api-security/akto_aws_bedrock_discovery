@@ -41,6 +41,7 @@ function logEffectiveConfig() {
     } catch { /* validateConfig will already have failed on a blank value */ }
 
     console.log('⚙️ Effective configuration:');
+    console.log(`  ├─ build               ${config.CODE_VERSION}`);
     console.log(`  ├─ region              ${config.AWS_REGION} (account ${config.AWS_ACCOUNT_ID})`);
     console.log(`  ├─ logging mode        ${config.QUICK_LOGGING_MODE}`);
     console.log(`  ├─ log location        ${config.QUICK_LOGGING_MODE === 'create' ? `will create ${config.QUICK_CREATED_BUCKET_NAME} if absent` : 'discovered from the CHAT_LOGS delivery'}`);
@@ -170,7 +171,7 @@ async function runQuickPipeline(timeLeft, sendTimeLeft) {
  * is the normal exit path.
  */
 exports.handler = async (event, context) => {
-    console.log('🚀 AKTO Amazon Quick processor started');
+    console.log(`🚀 AKTO Amazon Quick processor started — build ${config.CODE_VERSION}`);
     console.log(`📍 Region: ${config.AWS_REGION} | Event: ${event?.source || 'manual'} | Time budget: ${context.getRemainingTimeInMillis()}ms`);
     logMemory('start');
 
@@ -209,6 +210,7 @@ exports.handler = async (event, context) => {
         // spot deferrals without parsing prose:
         //   fields @timestamp, @message | filter @message like /RUN SUMMARY/
         const summary = {
+            codeVersion: config.CODE_VERSION,
             durationMs: Date.now() - startedAt,
             runBudgetMs: config.RUN_BUDGET_MS,
             // Which limit ended the run — the schedule-derived budget (expected on a

@@ -32,7 +32,8 @@ const {
 const { CreateBucketCommand, PutBucketPolicyCommand, GetBucketPolicyCommand } = require('@aws-sdk/client-s3');
 const { ListAgentsCommand } = require('@aws-sdk/client-quicksight');
 const {
-    AWS_REGION, AWS_ACCOUNT_ID, QUICK_LOGGING_MODE, QUICK_CREATED_BUCKET_NAME,
+    AWS_REGION, AWS_ACCOUNT_ID, QUICK_LOGGING_MODE, QUICK_TARGET_BUCKET_NAME,
+    QUICK_MAY_CREATE_BUCKET, QUICK_MAY_CREATE_DELIVERY,
     QUICK_DELIVERY_SOURCE_NAME, QUICK_DELIVERY_DESTINATION_NAME, QUICK_RECORD_FIELDS,
     cloudWatchLogsClient, s3Client, quickSightClient
 } = require('./config');
@@ -150,7 +151,11 @@ async function discoverDelivery() {
         sourceName: source.name,
         recordFields,
         hasOptionalFields,
-        needsS3Delivery: false
+        needsS3Delivery: false,
+        // The delivery already existed, so whoever set it up owns the bucket — this
+        // account may or may not. Treated as shared for diagnostics: a permissions
+        // problem is the likelier explanation for an empty listing than a missing bucket.
+        sharedBucket: true
     };
 }
 
@@ -323,13 +328,13 @@ async function resolveQuickLogLocation() {
         }
     }
 
-    if (QUICK_LOGGING_MODE !== 'create') {
-        console.warn(`⚠️ No Quick CHAT_LOGS delivery to S3 in ${AWS_REGION} for account ${AWS_ACCOUNT_ID}. Either Quick logging was never enabled here, or Quick is homed in another region. Set QUICK_LOGGING_MODE=create to enable it automatically.`);
+    if (!QUICK_MAY_CREATE_DELIVERY) {
+        console.warn(`⚠️ No Quick CHAT_LOGS delivery to S3 in ${AWS_REGION} for account ${AWS_ACCOUNT_ID}. Either Quick logging was never enabled here, or Quick is homed in another region. Set QuickLoggingMode to create-new-bucket or use-existing-bucket to have it enabled automatically.`);
         return null;
     }
 
-    if (!QUICK_CREATED_BUCKET_NAME) {
-        console.error('❌ QUICK_LOGGING_MODE=create but QUICK_BUCKET_BASE_NAME is unset — nothing to name the bucket');
+    if (!QUICK_TARGET_BUCKET_NAME) {
+        console.error(`❌ QuickLoggingMode is '${QUICK_LOGGING_MODE}' but no bucket name was given — nothing to deliver into`);
         return null;
     }
 
@@ -355,11 +360,27 @@ async function resolveQuickLogLocation() {
 
     const reuseSource = existing?.needsS3Delivery ? existing.sourceName : null;
     console.log(reuseSource
-        ? `🛠️ Adding an S3 delivery to existing source '${reuseSource}' (bucket ${QUICK_CREATED_BUCKET_NAME})`
-        : `🛠️ No Quick chat logging in ${AWS_REGION} — creating it (bucket ${QUICK_CREATED_BUCKET_NAME})`);
+        ? `🛠️ Adding an S3 delivery to existing source '${reuseSource}' → s3://${QUICK_TARGET_BUCKET_NAME}`
+        : `🛠️ No Quick chat logging in ${AWS_REGION} — enabling it → s3://${QUICK_TARGET_BUCKET_NAME}`);
     try {
-        await ensureBucket(QUICK_CREATED_BUCKET_NAME);
-        await createDelivery(QUICK_CREATED_BUCKET_NAME, reuseSource);
+        if (QUICK_MAY_CREATE_BUCKET) {
+            await ensureBucket(QUICK_TARGET_BUCKET_NAME);
+        } else {
+            /*
+             * use-existing-bucket: the bucket is the operator's, usually owned by a
+             * different account, so this function neither creates it nor edits its policy.
+             * Doing so would need s3:PutBucketPolicy on someone else's central log bucket
+             * for every account in the fleet — a standing right to rewrite it, granted to
+             * dozens of roles, to save a one-time setup step.
+             *
+             * The consequence to be aware of: if that policy does not authorise
+             * delivery.logs.amazonaws.com for this account, the delivery below is still
+             * created successfully and simply never receives anything. quickLogs.js says so
+             * explicitly when the listing comes back empty, because nothing else would.
+             */
+            console.log(`ℹ️ Using the existing bucket ${QUICK_TARGET_BUCKET_NAME} as-is — not creating it and not changing its policy. Its policy must already allow delivery.logs.amazonaws.com to write AWSLogs/${AWS_ACCOUNT_ID}/* and allow this account to read it back.`);
+        }
+        await createDelivery(QUICK_TARGET_BUCKET_NAME, reuseSource);
     } catch (error) {
         console.error(`❌ Could not enable Quick chat logging: ${error.message}`);
         return null;
@@ -368,9 +389,10 @@ async function resolveQuickLogLocation() {
     // Nothing to read yet: AWS batches vended logs roughly every five minutes, so the
     // first objects appear on a later invocation.
     return {
-        bucket: QUICK_CREATED_BUCKET_NAME,
+        bucket: QUICK_TARGET_BUCKET_NAME,
         prefix: derivePrefix(),
         justCreated: true,
+        sharedBucket: !QUICK_MAY_CREATE_BUCKET,
         hasOptionalFields: true,
         needsS3Delivery: false
     };

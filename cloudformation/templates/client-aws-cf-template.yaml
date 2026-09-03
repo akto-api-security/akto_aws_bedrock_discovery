@@ -35,40 +35,65 @@ Parameters:
   QuickLoggingMode:
     Type: String
     Description: >
-      Is Quick chat logging ALREADY enabled in these accounts?
-        discover - YES. The Lambda finds the existing CHAT_LOGS delivery and reads the
-                   bucket straight off it. Bucket names may differ per account; nothing
-                   is created and you supply no bucket name at all.
-        create   - NO. The Lambda creates the bucket and enables logging itself, asking
-                   for every record field including latency and time_to_first_token.
-      'create' is safe on a mixed fleet: an account that already has a delivery is
-      detected and left untouched rather than duplicated, and an account with no Quick
-      Suite in this region has nothing created for it.
-    Default: 'discover'
-    AllowedValues: ['discover', 'create']
+      Which of these describes the accounts you are deploying to?
 
-  QuickBucketBaseName:
+      already-enabled - Quick chat logging is ALREADY delivering to S3 in these accounts.
+      The processor finds the existing delivery and reads from wherever it already writes,
+      so accounts may use completely different bucket names. Nothing is created and
+      QuickBucketName is ignored.
+
+      create-new-bucket - Quick chat logging is NOT set up. The processor creates one
+      bucket per account and enables logging into it, requesting every field including
+      response latency. QuickBucketName is a BASE name here - see its description.
+
+      use-existing-bucket - Quick chat logging is NOT set up, and you already have a bucket
+      for it (typically one bucket shared by every account). The processor enables logging
+      into that bucket but does NOT create it and does NOT change its policy - you grant
+      access on the bucket yourself first. See the deployment guide for the exact policy.
+
+      Any mode is safe on a mixed fleet - an account that already has logging is detected
+      and left untouched rather than given a second delivery.
+    Default: 'already-enabled'
+    AllowedValues: ['already-enabled', 'create-new-bucket', 'use-existing-bucket']
+
+  QuickBucketName:
     Type: String
     Description: >
-      Required only when QuickLoggingMode is 'create'. Base name for the bucket the
-      Lambda creates; the account id AND region are appended, because S3 bucket names are
-      global and one account can run Quick in more than one region.
-      'akto-quick-logs' becomes akto-quick-logs-041877753357-us-east-1.
+      Where Quick chat logs are delivered. Read differently depending on QuickLoggingMode:
+
+      already-enabled - LEAVE BLANK. The bucket is read from the existing delivery.
+
+      create-new-bucket - a BASE name. The account ID and region are appended, so
+      'akto-quick-logs' becomes akto-quick-logs-123456789012-us-east-1. Each account gets
+      its own bucket, and the name stays unique even if an account runs Quick in two
+      regions (S3 bucket names are global).
+
+      use-existing-bucket - the EXACT name of your bucket, used as given. It must be in the
+      SAME REGION as this deployment: AWS requires a log delivery destination to be in the
+      delivery's own region, so accounts in two regions need one bucket each. Each account
+      writes and reads only AWSLogs/<its-own-account-id>/, so a shared bucket does not mean
+      accounts can see each other's conversations.
     Default: ''
-    AllowedPattern: '^$|^[a-z0-9\-\.]{3,40}$'
-    ConstraintDescription: 'Must be a valid S3 bucket name prefix, or blank in discover mode'
+    AllowedPattern: '^$|^[a-z0-9\-\.]{3,55}$'
+    ConstraintDescription: 'Must be a valid S3 bucket name, or blank when QuickLoggingMode is already-enabled'
 
   LambdaCodeVersion:
     Type: String
-    Description: 'Version prefix in lambda-code-akto-<region> holding akto-quick-processor.zip (e.g. v2.0). The object must exist at that prefix before deploying.'
+    Description: 'Version folder holding akto-quick-processor.zip inside the aws-quick/ area of lambda-code-akto-<region> (e.g. v2.0). The object must exist there before deploying.'
     Default: 'v1.0'
     AllowedPattern: '^v[0-9]+\.[0-9]+$'
     ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
 
 Conditions:
-  # The only conditional left. 'create' grants the permissions needed to make a bucket and
-  # a delivery; in 'discover' mode those are withheld entirely and the Lambda only reads.
-  QuickCreatesLogging: !Equals [!Ref QuickLoggingMode, 'create']
+  # Two separate grants, because the two setup modes need different authority.
+  #
+  # Only create-new-bucket may make an S3 bucket. use-existing-bucket deliberately gets no
+  # S3 write permission at all: that bucket usually belongs to another account, and granting
+  # every processor in the fleet the right to rewrite its policy - to save a one-time setup
+  # step - is not a trade worth making.
+  QuickCreatesBucket: !Equals [!Ref QuickLoggingMode, 'create-new-bucket']
+  # Both setup modes create the CHAT_LOGS delivery itself. already-enabled creates nothing.
+  QuickCreatesDelivery: !Not [!Equals [!Ref QuickLoggingMode, 'already-enabled']]
 
 Resources:
   LambdaExecutionRole:
@@ -150,19 +175,19 @@ Resources:
                 Action: 'iam:ListAttachedRolePolicies'
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
 
-              # 'create' mode only: make the bucket and turn Quick logging on. Withheld
-              # entirely in 'discover' mode, where the Lambda never mutates anything.
+              # create-new-bucket only, and scoped to the names this account can generate.
+              # Never granted for use-existing-bucket: that bucket is the operator's.
               - !If
-                - QuickCreatesLogging
+                - QuickCreatesBucket
                 - Effect: Allow
                   Action:
                     - 's3:CreateBucket'
                     - 's3:PutBucketPolicy'
                     - 's3:GetBucketPolicy'
-                  Resource: !Sub 'arn:aws:s3:::${QuickBucketBaseName}-${AWS::AccountId}-*'
+                  Resource: !Sub 'arn:aws:s3:::${QuickBucketName}-${AWS::AccountId}-*'
                 - !Ref 'AWS::NoValue'
               - !If
-                - QuickCreatesLogging
+                - QuickCreatesDelivery
                 - Effect: Allow
                   Action:
                     - 'logs:PutDeliverySource'
@@ -173,7 +198,7 @@ Resources:
               # Required by AWS before a CHAT_LOGS delivery source can be created for a
               # Quick account - easy to miss, and CreateDelivery fails without it.
               - !If
-                - QuickCreatesLogging
+                - QuickCreatesDelivery
                 - Effect: Allow
                   Action: 'quicksight:AllowVendedLogDeliveryForResource'
                   Resource: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:account/${AWS::AccountId}'
@@ -190,14 +215,14 @@ Resources:
       MemorySize: 1024
       Code:
         S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
-        S3Key: !Sub '${LambdaCodeVersion}/akto-quick-processor.zip'
+        S3Key: !Sub 'aws-quick/${LambdaCodeVersion}/akto-quick-processor.zip'
       Environment:
         Variables:
           DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
           AKTO_API_KEY: !Ref AktoApiKey
           MARKERS_BUCKET_NAME: !Ref MarkersBucketName
           QUICK_LOGGING_MODE: !Ref QuickLoggingMode
-          QUICK_BUCKET_BASE_NAME: !Ref QuickBucketBaseName
+          QUICK_BUCKET_NAME: !Ref QuickBucketName
           QUICK_AWS_REGION: !Ref 'AWS::Region'
           AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
       Description: 'Discovers Amazon Quick agents and MCP connectors and sends their chat conversations to AKTO'
@@ -243,6 +268,171 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt QuickProcessorScheduleRule.Arn
 
+  # ---------------------------------------------------------------------------------
+  # Automatic updates
+  #
+  # A second, deliberately tiny function whose only job is to keep the processor's code
+  # current. It is separate from the processor on purpose: if a processor build were ever
+  # broken badly enough not to start, nothing inside the processor could repair it — but
+  # this updater is untouched by that and can always roll the next build in.
+  #
+  # Its code is inline rather than an S3 artifact, so there is no second zip for AKTO to
+  # publish or version, and nothing here ever needs to change.
+  # ---------------------------------------------------------------------------------
+  UpdaterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'akto-quick-updater-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AktoQuickUpdaterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the published pointer, and the build objects it names.
+              # Scoped to this product's folder, not the whole bucket: AKTO publishes
+              # other products alongside it and this function has no business reading them.
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::lambda-code-akto-${AWS::Region}/aws-quick/*'
+              # Change the code of exactly one function - the processor in this account
+              # and region. It cannot touch any other Lambda.
+              - Effect: Allow
+                Action:
+                  - 'lambda:UpdateFunctionCode'
+                  - 'lambda:ListTags'
+                  - 'lambda:TagResource'
+                Resource: !GetAtt AktoQuickProcessorFunction.Arn
+
+  UpdaterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'akto-quick-updater-${AWS::AccountId}-${AWS::Region}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt UpdaterRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Description: 'Keeps the AKTO Quick processor on the build published to its update channel'
+      Environment:
+        Variables:
+          TARGET_FUNCTION: !Ref AktoQuickProcessorFunction
+          TARGET_ARN: !GetAtt AktoQuickProcessorFunction.Arn
+          CODE_BUCKET: !Sub 'lambda-code-akto-${AWS::Region}'
+          # AKTO publishes several products into this one bucket, so each keeps its own
+          # folder. Without it, versions.json would sit at the root and be contended
+          # between products - and a processor could install a version string meant for
+          # something else entirely.
+          CODE_PREFIX: 'aws-quick'
+          CODE_OBJECT: 'akto-quick-processor.zip'
+          # Which pointer in versions.json this account follows. Embedded rather than
+          # exposed as a stack parameter: customers should not have to reason about
+          # release channels, and every customer account belongs on the same one.
+          #
+          # AKTO ONLY: change to 'canary' in the copy of this template used for AKTO's own
+          # test account, so a build can be validated there before versions.json promotes
+          # it to stable for everyone else.
+          UPDATE_CHANNEL: 'stable'
+      Code:
+        # The AWS SDK v3 ships with the Node.js 22 runtime, so this needs no dependencies
+        # and stays a single inline file.
+        ZipFile: |
+          const { LambdaClient, UpdateFunctionCodeCommand, ListTagsCommand, TagResourceCommand } = require('@aws-sdk/client-lambda');
+          const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+
+          const TAG = 'akto:code-version';
+          const lambda = new LambdaClient({});
+          const s3 = new S3Client({});
+
+          exports.handler = async () => {
+            const fn = process.env.TARGET_FUNCTION;
+            const arn = process.env.TARGET_ARN;
+            const bucket = process.env.CODE_BUCKET;
+            const channel = process.env.UPDATE_CHANNEL;
+            const prefix = process.env.CODE_PREFIX;
+            const object = process.env.CODE_OBJECT;
+
+            // What build should this account be on?
+            let want;
+            try {
+              const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: `${prefix}/versions.json` }));
+              want = JSON.parse(await res.Body.transformToString())[channel];
+            } catch (e) {
+              console.error(`Cannot read s3://${bucket}/${prefix}/versions.json - leaving code unchanged: ${e.message}`);
+              return;
+            }
+            if (!want) {
+              console.log(`Channel '${channel}' is not listed in ${prefix}/versions.json - leaving code unchanged`);
+              return;
+            }
+
+            // What build is it on? Recorded as a tag when this updater last changed it.
+            // A missing tag reads as unknown, which simply reapplies the channel build once.
+            const { Tags = {} } = await lambda.send(new ListTagsCommand({ Resource: arn }));
+            const have = Tags[TAG];
+
+            if (have === want) {
+              console.log(`Up to date: ${fn} is on ${have}`);
+              return;
+            }
+
+            const key = `${prefix}/${want}/${object}`;
+            console.log(`Updating ${fn}: ${have || 'unknown'} -> ${want} from s3://${bucket}/${key}`);
+            try {
+              await lambda.send(new UpdateFunctionCodeCommand({ FunctionName: fn, S3Bucket: bucket, S3Key: key }));
+            } catch (e) {
+              if (e.name === 'ResourceConflictException') {
+                console.log('Processor is mid-update - retrying on the next check');
+                return;
+              }
+              console.error(`Update to ${want} FAILED - ${fn} stays on ${have || 'unknown'}: ${e.message}`);
+              throw e;
+            }
+            // Tagged last on purpose: if this call fails the tag still names the old build,
+            // so the next check repeats the same update and tags again. Never a false
+            // "already current" while the code says otherwise.
+            await lambda.send(new TagResourceCommand({ Resource: arn, Tags: { [TAG]: want } }));
+            console.log(`Updated ${fn} to ${want}`);
+          };
+
+  UpdaterScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'akto-quick-updater-schedule-${AWS::AccountId}-${AWS::Region}'
+      # A check, not an update: it compares two strings and exits unless AKTO has
+      # published something new, so a quiet month costs ~2,900 no-op invocations of a
+      # 128 MB function — comfortably inside each account's own free tier.
+      #
+      # rate() rather than cron() on purpose. Each account's rule starts counting from
+      # its own creation time, so a hundred accounts naturally spread their checks across
+      # the quarter hour instead of all reading versions.json on the same second.
+      #
+      # Deliberately NOT aligned with the processor's schedule. An update landing mid-run
+      # is safe: AWS lets the running invocation finish on the old code and only the next
+      # invocation picks up the new build, so there is nothing to synchronise.
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Description: 'Checks whether the AKTO Quick processor is on the published build'
+      Targets:
+        - Arn: !GetAtt UpdaterFunction.Arn
+          Id: AktoQuickUpdaterTarget
+
+  UpdaterInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdaterFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UpdaterScheduleRule.Arn
+
 Outputs:
   LambdaFunctionName:
     Description: 'Name of the processor Lambda'
@@ -251,9 +441,16 @@ Outputs:
   LoggingMode:
     Description: 'How this account obtains its Quick chat logs'
     Value: !If
-      - QuickCreatesLogging
-      - !Sub 'CREATE - will provision ${QuickBucketBaseName}-${AWS::AccountId}-${AWS::Region} and enable logging if absent'
-      - 'DISCOVER - reads the bucket off the existing CHAT_LOGS delivery; nothing is created'
+      - QuickCreatesBucket
+      - !Sub 'create-new-bucket - will provision ${QuickBucketName}-${AWS::AccountId}-${AWS::Region} and enable logging if absent'
+      - !If
+        - QuickCreatesDelivery
+        - !Sub 'use-existing-bucket - will enable logging into ${QuickBucketName}, which you must have granted access to'
+        - 'already-enabled - reads the bucket off the existing CHAT_LOGS delivery; nothing is created'
+
+  AutoUpdate:
+    Description: 'How this account receives new AKTO builds'
+    Value: 'Automatic - checked every 15 minutes against the build AKTO has released'
 
   MarkersLocation:
     Description: 'Where this account and region writes its checkpoint'

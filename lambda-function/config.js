@@ -15,6 +15,24 @@ const { IAMClient } = require('@aws-sdk/client-iam');
 const { QuickSightClient } = require('@aws-sdk/client-quicksight');
 const { S3Client } = require('@aws-sdk/client-s3');
 
+/**
+ * Which build of this function is running.
+ *
+ * Read from a VERSION file baked into the deployment zip at package time, so it cannot
+ * drift from the code it describes the way a separately-set environment variable can.
+ * Reported in the startup banner, the run summary and the manifest, so the version each
+ * account is running is visible without opening the console — which matters once the
+ * updater starts rolling versions out on its own.
+ */
+const CODE_VERSION = (() => {
+    try {
+        return require('fs').readFileSync(require('path').join(__dirname, 'VERSION'), 'utf-8').trim() || 'unknown';
+    } catch {
+        // No VERSION file — a local checkout or a zip built before stamping existed.
+        return 'unknown';
+    }
+})();
+
 const DATA_INGESTION_ENDPOINT = process.env.DATA_INGESTION_ENDPOINT;
 const AKTO_API_KEY = process.env.AKTO_API_KEY;
 const MARKERS_BUCKET_NAME = process.env.MARKERS_BUCKET_NAME;
@@ -74,28 +92,58 @@ const MAX_TRACE_BYTES = Number(process.env.MAX_TRACE_BYTES || 64 * 1024);
 const QUICK_LOOKBACK_DAYS = Number(process.env.QUICK_LOOKBACK_DAYS || 3);
 
 /**
- * How this account gets its Quick chat logs into S3.
+ * How Quick chat logs reach S3 in this account, and who is responsible for the bucket.
  *
- *   'discover' - logging is already set up. Find the existing CHAT_LOGS delivery and read
- *                the bucket and path straight off it. Nothing is created.
- *   'create'   - logging is not set up. Create the bucket and the delivery, then read
- *                from what was just created.
+ *   already-enabled      Logging is already delivering to S3. Find the existing CHAT_LOGS
+ *                        delivery and read the bucket straight off it. Nothing is created,
+ *                        and QUICK_BUCKET_NAME is unused — which is what lets every account
+ *                        use a different bucket name without configuring anything.
  *
- * 'create' is safe on a mixed fleet: discovery always runs first, so an account that
- * already has a delivery is left alone rather than given a duplicate.
+ *   create-new-bucket    Logging is not set up. Create a bucket for this account and enable
+ *                        logging into it. QUICK_BUCKET_NAME is a BASE name; the account id
+ *                        and region are appended, because bucket names are global and one
+ *                        account may run Quick in more than one region.
+ *
+ *   use-existing-bucket  Logging is not set up, but a bucket already exists — typically one
+ *                        bucket shared by every account in the org. Enable logging into it
+ *                        WITHOUT creating it or touching its policy: that bucket usually
+ *                        belongs to another account, where this function has no authority
+ *                        and should claim none. The operator grants access once, on the
+ *                        bucket itself.
+ *
+ * All three run discovery first, so an account that already has a delivery is left alone
+ * rather than given a duplicate — that is what makes a single setting safe across a fleet
+ * where some accounts are already configured and some are not.
  */
-const QUICK_LOGGING_MODE = String(process.env.QUICK_LOGGING_MODE || 'discover').trim().toLowerCase();
+const QUICK_LOGGING_MODE = String(process.env.QUICK_LOGGING_MODE || 'already-enabled').trim().toLowerCase();
+const QUICK_MODES = ['already-enabled', 'create-new-bucket', 'use-existing-bucket'];
 
 /**
- * Base name for the bucket created in 'create' mode. The account id AND region are both
- * appended: bucket names are global, so an account running Quick in two regions would
- * otherwise collide on the second CreateBucket.
- *   'akto-quick-logs' -> akto-quick-logs-041877753357-us-east-1
+ * The bucket name as supplied. Read differently depending on the mode above, so the
+ * resolution lives here rather than being repeated at each use.
  */
-const QUICK_BUCKET_BASE_NAME = (process.env.QUICK_BUCKET_BASE_NAME || '').trim();
-const QUICK_CREATED_BUCKET_NAME = QUICK_BUCKET_BASE_NAME
-    ? `${QUICK_BUCKET_BASE_NAME}-${AWS_ACCOUNT_ID}-${AWS_REGION}`
-    : '';
+const QUICK_BUCKET_NAME = (process.env.QUICK_BUCKET_NAME || '').trim();
+
+/**
+ * The bucket this function will deliver into, once the mode has been applied.
+ *
+ *   create-new-bucket    <name>-<account-id>-<region>, created if absent
+ *   use-existing-bucket  <name> exactly as given, never created
+ *   already-enabled      empty — the bucket comes from the existing delivery instead
+ */
+const QUICK_TARGET_BUCKET_NAME = !QUICK_BUCKET_NAME
+    ? ''
+    : QUICK_LOGGING_MODE === 'create-new-bucket'
+        ? `${QUICK_BUCKET_NAME}-${AWS_ACCOUNT_ID}-${AWS_REGION}`
+        : QUICK_LOGGING_MODE === 'use-existing-bucket'
+            ? QUICK_BUCKET_NAME
+            : '';
+
+/** True when this function may create the bucket itself. Only ever one mode. */
+const QUICK_MAY_CREATE_BUCKET = QUICK_LOGGING_MODE === 'create-new-bucket';
+
+/** True when this function should set logging up rather than only read what exists. */
+const QUICK_MAY_CREATE_DELIVERY = QUICK_LOGGING_MODE === 'create-new-bucket' || QUICK_LOGGING_MODE === 'use-existing-bucket';
 
 /** Names for the delivery chain this function creates in 'create' mode. */
 const QUICK_DELIVERY_SOURCE_NAME = process.env.QUICK_DELIVERY_SOURCE_NAME || 'akto-quick-chat-source';
@@ -153,22 +201,26 @@ function validateConfig() {
     if (!String(AWS_ACCOUNT_ID || '').trim()) {
         throw new Error('AWS_ACCOUNT_ID environment variable is required (QuickSight APIs take it explicitly)');
     }
-    if (!['discover', 'create'].includes(QUICK_LOGGING_MODE)) {
-        throw new Error(`QUICK_LOGGING_MODE must be 'discover' or 'create', got '${QUICK_LOGGING_MODE}'`);
+    if (!QUICK_MODES.includes(QUICK_LOGGING_MODE)) {
+        throw new Error(`QUICK_LOGGING_MODE must be one of ${QUICK_MODES.join(', ')} — got '${QUICK_LOGGING_MODE}'`);
     }
-    if (QUICK_LOGGING_MODE === 'create' && !QUICK_BUCKET_BASE_NAME) {
-        throw new Error("QUICK_BUCKET_BASE_NAME is required when QUICK_LOGGING_MODE is 'create' (it names the bucket this function will create)");
+    // Both setup modes need somewhere to deliver to; only the mode decides whether that
+    // name is a base to extend or a bucket to use verbatim.
+    if (QUICK_MAY_CREATE_DELIVERY && !QUICK_BUCKET_NAME) {
+        throw new Error(`QUICK_BUCKET_NAME is required when QUICK_LOGGING_MODE is '${QUICK_LOGGING_MODE}'`);
     }
 }
 
 module.exports = {
+    CODE_VERSION,
     DATA_INGESTION_ENDPOINT, AKTO_API_KEY, MARKERS_BUCKET_NAME, MARKERS_PREFIX,
     AWS_REGION, AWS_ACCOUNT_ID,
     SEND_BATCH_SIZE, MAX_BATCH_BYTES, SEND_DEADLINE_MARGIN_MS, FLUSH_THRESHOLD,
     TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, MAX_TRACE_BYTES,
     SCHEDULE_INTERVAL_MS, RUN_BUDGET_MS,
     QUICK_LOOKBACK_DAYS, QUICK_MARKERS_PREFIX, QUICK_MANIFEST_KEY,
-    QUICK_LOGGING_MODE, QUICK_BUCKET_BASE_NAME, QUICK_CREATED_BUCKET_NAME,
+    QUICK_LOGGING_MODE, QUICK_MODES, QUICK_BUCKET_NAME, QUICK_TARGET_BUCKET_NAME,
+    QUICK_MAY_CREATE_BUCKET, QUICK_MAY_CREATE_DELIVERY,
     QUICK_DELIVERY_SOURCE_NAME, QUICK_DELIVERY_DESTINATION_NAME, QUICK_RECORD_FIELDS,
     QUICK_MODEL_ID, QUICK_NAMESPACE, QUICK_BUILTIN_AGENT_ID, QUICK_BUILTIN_AGENT_NAME,
     QUICK_REDISCOVERY_HOURS,
