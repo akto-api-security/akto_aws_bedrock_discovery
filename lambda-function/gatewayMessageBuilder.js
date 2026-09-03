@@ -95,7 +95,7 @@ function buildGatewayDiscoveryMessage(profile) {
     };
 
     return {
-        path: '/mcp',
+        path: '/discovery',
         original_host: profile.host,
         method: 'POST',
         requestHeaders: JSON.stringify(requestHeaders),
