@@ -1,0 +1,4 @@
+node_modules/
+# Build artifact, written by scripts/stamp-version.js on every package.
+# Never commit it: a stale stamp from another branch mislabels the build.
+VERSION
