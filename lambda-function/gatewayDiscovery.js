@@ -12,7 +12,8 @@ const {
     GetGatewayTargetCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand
 } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { bedrockAgentCoreControlClient, iamClient, AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
+const config = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID } = config;
 const { getRoleSecurityProfile } = require('./iamPermissions');
 const { listAllPages, listAllHarnesses, getHarnessMetadata } = require('./traceDiscovery');
 
@@ -33,7 +34,7 @@ function extractGatewayIdFromArn(gatewayArn) {
 async function listAllGateways() {
     try {
         return await listAllPages(
-            (nextToken) => bedrockAgentCoreControlClient.send(new ListGatewaysCommand({ nextToken })),
+            (nextToken) => config.bedrockAgentCoreControlClient.send(new ListGatewaysCommand({ nextToken })),
             (response) => response.items
         );
     } catch (error) {
@@ -51,7 +52,7 @@ async function getGatewayDetail(gatewayId, { useCache = true } = {}) {
     if (!gatewayId) return null;
     if (useCache && gatewayDetailCache[gatewayId]) return gatewayDetailCache[gatewayId];
     try {
-        const detail = await bedrockAgentCoreControlClient.send(new GetGatewayCommand({ gatewayIdentifier: gatewayId }));
+        const detail = await config.bedrockAgentCoreControlClient.send(new GetGatewayCommand({ gatewayIdentifier: gatewayId }));
         gatewayDetailCache[gatewayId] = detail;
         return detail;
     } catch (error) {
@@ -66,7 +67,7 @@ async function listGatewayTargets(gatewayId) {
     if (gatewayTargetsCache[gatewayId]) return gatewayTargetsCache[gatewayId];
     try {
         const targets = await listAllPages(
-            (nextToken) => bedrockAgentCoreControlClient.send(new ListGatewayTargetsCommand({ gatewayIdentifier: gatewayId, nextToken })),
+            (nextToken) => config.bedrockAgentCoreControlClient.send(new ListGatewayTargetsCommand({ gatewayIdentifier: gatewayId, nextToken })),
             (response) => response.items
         );
         gatewayTargetsCache[gatewayId] = targets;
@@ -165,7 +166,7 @@ async function summarizeGateway(gatewayArn) {
 async function getGatewayTags(gatewayArn) {
     if (!gatewayArn) return {};
     try {
-        return (await bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: gatewayArn }))).tags || {};
+        return (await config.bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: gatewayArn }))).tags || {};
     } catch (error) {
         console.error(`⚠️ Tag fetch failed for gateway ${gatewayArn}: ${error.message}`);
         return {};
@@ -179,7 +180,7 @@ async function getGatewayTags(gatewayArn) {
  */
 async function getGatewayTargetDetail(gatewayId, targetId) {
     try {
-        return await bedrockAgentCoreControlClient.send(new GetGatewayTargetCommand({
+        return await config.bedrockAgentCoreControlClient.send(new GetGatewayTargetCommand({
             gatewayIdentifier: gatewayId, targetId
         }));
     } catch (error) {
@@ -193,7 +194,7 @@ async function getGatewayRolePolicies(roleArn) {
     const roleName = roleArn ? String(roleArn).split('/').pop() : '';
     if (!roleName) return '';
     try {
-        const response = await iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
+        const response = await config.iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
         return (response.AttachedPolicies || []).map((p) => p.PolicyName).join(',');
     } catch (error) {
         console.error(`⚠️ Policy list failed for gateway role ${roleName}: ${error.message}`);

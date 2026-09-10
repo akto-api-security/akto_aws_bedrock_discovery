@@ -12,7 +12,8 @@
 const { GetAgentCommand, ListAgentsCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
 const { getRoleSecurityProfile } = require('./iamPermissions');
-const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_SERVICE_AGENT_TRAFFIC, bedrockAgentClient, iamClient } = require('./config');
+const config = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_SERVICE_AGENT_TRAFFIC } = config;
 const { buildAgentMessage } = require('./messageBuilder');
 
 const agentNameCache = {};
@@ -50,7 +51,7 @@ async function listAllPages(sendPage, pluck) {
 async function listAllAgents() {
     try {
         return await listAllPages(
-            (nextToken) => bedrockAgentClient.send(new ListAgentsCommand({ nextToken })),
+            (nextToken) => config.bedrockAgentClient.send(new ListAgentsCommand({ nextToken })),
             (response) => response.agentSummaries
         );
     } catch (error) {
@@ -62,7 +63,7 @@ async function listAllAgents() {
 /** Fetches full metadata for one agent. Returns null on failure. */
 async function getAgentMetadata(agentId) {
     try {
-        return (await bedrockAgentClient.send(new GetAgentCommand({ agentId }))).agent;
+        return (await config.bedrockAgentClient.send(new GetAgentCommand({ agentId }))).agent;
     } catch (error) {
         console.error(`❌ GetAgent failed for ${agentId}: ${error.message}`);
         return null;
@@ -81,7 +82,7 @@ async function fetchTagsCached(cacheKey, fetcher) {
 async function getBedrockAgentTags(agentId) {
     try {
         const arn = `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agentId}`;
-        return (await bedrockAgentClient.send(new BedrockAgentListTagsCommand({ resourceArn: arn }))).tags || {};
+        return (await config.bedrockAgentClient.send(new BedrockAgentListTagsCommand({ resourceArn: arn }))).tags || {};
     } catch (error) {
         console.error(`⚠️ Tag fetch failed for agent ${agentId}: ${error.message}`);
         return {};
@@ -102,7 +103,7 @@ async function addAgentRoleAndPermissions(tags, agentId, knownRoleArn) {
     try {
         let roleArn = knownRoleArn || '';
         if (!roleArn) {
-            const agentDetails = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
+            const agentDetails = await config.bedrockAgentClient.send(new GetAgentCommand({ agentId }));
             roleArn = agentDetails.agent?.agentResourceRoleArn || agentDetails.agent?.executionRoleArn || '';
         }
         if (!roleArn) {
@@ -144,7 +145,7 @@ async function fetchAgentName(agentId, knownName) {
     }
     if (agentNameCache[agentId]) return agentNameCache[agentId];
     try {
-        const details = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
+        const details = await config.bedrockAgentClient.send(new GetAgentCommand({ agentId }));
         const name = details?.agent?.agentName || details?.agentName || '';
         if (name) agentNameCache[agentId] = name;
         return name;
