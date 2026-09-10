@@ -10,6 +10,7 @@ STACK_NAME="${STACK_NAME:-akto-bedrock-hub}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION=$(aws configure get region)
 REGION=${REGION:-us-east-1}
+DEFAULT_CODE_BUCKET="lambda-code-akto-${REGION}"
 
 echo "AKTO Bedrock Hub Deploy"
 echo "======================="
@@ -17,7 +18,8 @@ echo "Account: $ACCOUNT_ID  Region: $REGION"
 echo ""
 
 read -p "Markers bucket name: " MARKERS_BUCKET
-read -p "Lambda code S3 bucket: " CODE_BUCKET
+read -p "Lambda code S3 bucket [$DEFAULT_CODE_BUCKET]: " CODE_BUCKET
+CODE_BUCKET=${CODE_BUCKET:-$DEFAULT_CODE_BUCKET}
 read -p "Lambda code S3 key [unified_bedrock/hub/akto-bedrock-processor.zip]: " CODE_KEY
 CODE_KEY=${CODE_KEY:-unified_bedrock/hub/akto-bedrock-processor.zip}
 read -p "Akto ingestion endpoint: " DATA_INGESTION_ENDPOINT
@@ -25,11 +27,18 @@ read -sp "Akto API key: " AKTO_API_KEY; echo ""
 read -p "Cross-account External ID: " CROSS_ACCOUNT_EXTERNAL_ID
 read -p "Customer role ARN(s) [optional, comma-separated]: " CROSS_ACCOUNT_ROLE_ARNS
 
+for var in MARKERS_BUCKET DATA_INGESTION_ENDPOINT AKTO_API_KEY CROSS_ACCOUNT_EXTERNAL_ID; do
+  if [[ -z "${!var}" ]]; then
+    echo "Error: $var is required."
+    exit 1
+  fi
+done
+
 echo ""
 echo "Building Lambda package..."
 cd "$REPO_ROOT/lambda-function"
 npm ci
-npm run package
+VERSION=hub npm run package
 
 echo "Uploading to s3://$CODE_BUCKET/$CODE_KEY ..."
 aws s3 cp "$REPO_ROOT/akto-bedrock-processor.zip" "s3://$CODE_BUCKET/$CODE_KEY" --region "$REGION"

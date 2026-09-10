@@ -74,8 +74,8 @@ Multiple AWS accounts (same customer): comma-separate the ARNs.
 
 ```bash
 cd lambda-function
-npm ci && npm run package
-aws s3 cp ../akto-bedrock-processor.zip s3://YOUR_CODE_BUCKET/path/akto-bedrock-processor.zip
+npm ci && VERSION=hub npm run package
+aws s3 cp ../akto-bedrock-processor.zip s3://YOUR_CODE_BUCKET/unified_bedrock/hub/akto-bedrock-processor.zip
 ```
 
 2. CloudFormation → **Create stack** → upload `cloudformation/templates/hub-template.yaml`
@@ -99,7 +99,7 @@ aws s3 cp ../akto-bedrock-processor.zip s3://YOUR_CODE_BUCKET/path/akto-bedrock-
 ## Option C — AWS CLI
 
 ```bash
-cd lambda-function && npm ci && npm run package && cd ..
+cd lambda-function && npm ci && VERSION=hub npm run package && cd ..
 
 aws s3 cp akto-bedrock-processor.zip s3://YOUR_CODE_BUCKET/path/akto-bedrock-processor.zip
 
