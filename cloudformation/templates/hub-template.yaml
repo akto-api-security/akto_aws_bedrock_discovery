@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AKTO Bedrock cross-account discovery. Deploy in your account. Customer gives
+  you a role ARN — set CROSS_ACCOUNT_ROLE_ARNS on the Lambda. Regions are found
+  automatically.
+
+Parameters:
+  MarkersBucketName:
+    Type: String
+
+  DataIngestionEndpoint:
+    Type: String
+
+  AktoApiKey:
+    Type: String
+    NoEcho: true
+
+  CrossAccountExternalId:
+    Type: String
+    Description: External ID for the customer trust policy
+    MinLength: 8
+
+  CrossAccountRoleArns:
+    Type: String
+    Description: >
+      Customer role ARN(s), comma-separated if they use multiple AWS accounts.
+      Can be set later in the Lambda env var CROSS_ACCOUNT_ROLE_ARNS.
+    Default: ''
+
+  ProcessorCodeBucket:
+    Type: String
+
+  ProcessorCodeKey:
+    Type: String
+    Default: unified_bedrock/v4.3/akto-bedrock-processor.zip
+
+Resources:
+  MarkersBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref MarkersBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  HubRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'akto-bedrock-hub-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AktoHubPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt MarkersBucket.Arn
+                  - !Sub '${MarkersBucket.Arn}/*'
+
+  HubFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'akto-bedrock-hub-${AWS::AccountId}'
+      Runtime: nodejs22.x
+      Handler: hub.handler
+      Role: !GetAtt HubRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref ProcessorCodeBucket
+        S3Key: !Ref ProcessorCodeKey
+      Environment:
+        Variables:
+          HUB_AWS_REGION: !Ref AWS::Region
+          CROSS_ACCOUNT_EXTERNAL_ID: !Ref CrossAccountExternalId
+          CROSS_ACCOUNT_ROLE_ARNS: !Ref CrossAccountRoleArns
+          MARKERS_BUCKET_NAME: !Ref MarkersBucket
+          MARKERS_S3_REGION: !Ref AWS::Region
+          DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
+          AKTO_API_KEY: !Ref AktoApiKey
+
+  HubSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'akto-bedrock-hub-schedule-${AWS::AccountId}'
+      ScheduleExpression: rate(10 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt HubFunction.Arn
+          Id: HubTarget
+
+  HubPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HubFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HubSchedule.Arn
+
+Outputs:
+  HubRoleArn:
+    Value: !GetAtt HubRole.Arn
+  CrossAccountExternalId:
+    Value: !Ref CrossAccountExternalId

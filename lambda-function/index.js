@@ -360,6 +360,7 @@ exports.handler = async (event, context) => {
 
     try {
         config.validateConfig();
+        await config.initAwsClients();
         logEffectiveConfig();
         console.log(`  └─ run budget          ${(config.RUN_BUDGET_MS / 1000).toFixed(0)}s of work (schedule is ${(config.SCHEDULE_INTERVAL_MS / 60000).toFixed(0)}min; finishing inside it keeps runs from overlapping)`);
         console.log(`  └─ budget split        S3 holds up to ${(config.S3_BUDGET_MS / 1000).toFixed(0)}s (${Math.round(config.S3_BUDGET_SHARE * 100)}%), AgentCore gets the rest plus anything S3 leaves`);

@@ -8,12 +8,12 @@
  * AgentCore runtime).
  */
 const { GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { s3Client, MARKERS_BUCKET_NAME, TRACE_MANIFEST_KEY } = require('./config');
+const { markersS3Client, MARKERS_BUCKET_NAME, TRACE_MANIFEST_KEY } = require('./config');
 
 /** Reads the manifest from S3. Returns {discoveredAgents:{}, logGroupCheckpoints:{}} on first run or any read error — never null, never throws. */
 async function getTraceManifest() {
     try {
-        const response = await s3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: TRACE_MANIFEST_KEY }));
+        const response = await markersS3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: TRACE_MANIFEST_KEY }));
         const chunks = [];
         for await (const chunk of response.Body) chunks.push(chunk);
         const manifest = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
@@ -43,7 +43,7 @@ async function updateTraceManifest(discoveredAgents, logGroupCheckpoints) {
             discoveredAgents: discoveredAgents || {},
             logGroupCheckpoints: logGroupCheckpoints || {}
         };
-        await s3Client.send(new PutObjectCommand({
+        await markersS3Client.send(new PutObjectCommand({
             Bucket: MARKERS_BUCKET_NAME,
             Key: TRACE_MANIFEST_KEY,
             Body: JSON.stringify(manifest, null, 2),
