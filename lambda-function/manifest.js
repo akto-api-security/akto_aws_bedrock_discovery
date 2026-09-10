@@ -4,12 +4,13 @@
  * written back incrementally as batches are successfully sent to AKTO.
  */
 const { GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { markersS3Client, MARKERS_BUCKET_NAME, MANIFEST_KEY, CODE_VERSION } = require('./config');
+const config = require('./config');
+const { MARKERS_BUCKET_NAME, MANIFEST_KEY, CODE_VERSION } = config;
 
 /** Reads the manifest from S3. Returns {} on first run or on any read error — never null, never throws. */
 async function getManifest() {
     try {
-        const response = await markersS3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: MANIFEST_KEY }));
+        const response = await config.markersS3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: MANIFEST_KEY }));
         const chunks = [];
         for await (const chunk of response.Body) chunks.push(chunk);
         const manifest = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
@@ -100,7 +101,7 @@ async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTim
             ...(mergedFailures.length > 0 && { failedFiles: mergedFailures }),
             ...(mergedRejects.length > 0 && { failedMessages: mergedRejects })
         };
-        await markersS3Client.send(new PutObjectCommand({
+        await config.markersS3Client.send(new PutObjectCommand({
             Bucket: MARKERS_BUCKET_NAME,
             Key: MANIFEST_KEY,
             Body: JSON.stringify(manifest, null, 2),

@@ -11,7 +11,8 @@
  */
 const crypto = require('crypto');
 const { GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { s3Client, MARKERS_BUCKET_NAME, GATEWAY_MANIFEST_KEY } = require('./config');
+const config = require('./config');
+const { MARKERS_BUCKET_NAME, GATEWAY_MANIFEST_KEY } = config;
 
 /** Stable hash of the attributes we'd report — key order can't affect it. */
 function fingerprintProfile(profile) {
@@ -28,7 +29,7 @@ function fingerprintProfile(profile) {
 /** Reads the manifest. Returns an empty shape on first run or any read error — never throws. */
 async function getGatewayManifest() {
     try {
-        const response = await s3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: GATEWAY_MANIFEST_KEY }));
+        const response = await config.markersS3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: GATEWAY_MANIFEST_KEY }));
         const chunks = [];
         for await (const chunk of response.Body) chunks.push(chunk);
         const manifest = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
@@ -58,7 +59,7 @@ async function updateGatewayManifest(discoveredGateways) {
             gatewayCount: Object.keys(discoveredGateways || {}).length,
             discoveredGateways: discoveredGateways || {}
         };
-        await s3Client.send(new PutObjectCommand({
+        await config.markersS3Client.send(new PutObjectCommand({
             Bucket: MARKERS_BUCKET_NAME,
             Key: GATEWAY_MANIFEST_KEY,
             Body: JSON.stringify(manifest, null, 2),

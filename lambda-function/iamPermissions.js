@@ -20,7 +20,7 @@ const {
     GetRoleCommand, ListAttachedRolePoliciesCommand, GetPolicyCommand, GetPolicyVersionCommand,
     ListRolePoliciesCommand, GetRolePolicyCommand
 } = require('@aws-sdk/client-iam');
-const { iamClient } = require('./config');
+const config = require('./config');
 
 /**
  * Per-value cap. Tags travel on every message for the life of an agent, so an
@@ -190,7 +190,7 @@ async function getRoleSecurityProfile(executionRoleArn, prefix) {
 
     // Trust policy + boundary + last-used all come from the one GetRole call.
     try {
-        const role = (await iamClient.send(new GetRoleCommand({ RoleName: roleName }))).Role || {};
+        const role = (await config.iamClient.send(new GetRoleCommand({ RoleName: roleName }))).Role || {};
         readTrustPolicy(parsePolicyDocument(role.AssumeRolePolicyDocument), acc, roleAccountId);
         permissionsBoundary = role.PermissionsBoundary?.PermissionsBoundaryArn || '';
         lastUsed = role.RoleLastUsed?.LastUsedDate ? new Date(role.RoleLastUsed.LastUsedDate).toISOString() : '';
@@ -202,19 +202,19 @@ async function getRoleSecurityProfile(executionRoleArn, prefix) {
     // Attached (managed) policies — names were already reported before this
     // module existed; the documents behind them are what is new.
     try {
-        const attached = (await iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }))).AttachedPolicies || [];
+        const attached = (await config.iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }))).AttachedPolicies || [];
         for (const policy of attached) {
             attachedNames.push(policy.PolicyName);
             attachedArns.push(policy.PolicyArn);
             try {
-                const detail = (await iamClient.send(new GetPolicyCommand({ PolicyArn: policy.PolicyArn }))).Policy || {};
+                const detail = (await config.iamClient.send(new GetPolicyCommand({ PolicyArn: policy.PolicyArn }))).Policy || {};
                 const versionId = detail.DefaultVersionId;
                 // Version + update date make a policy change detectable downstream
                 // without diffing the whole document.
                 policyVersions.push(`${policy.PolicyName}:${versionId || '?'}@${detail.UpdateDate ? new Date(detail.UpdateDate).toISOString().slice(0, 10) : '?'}`);
                 policyTypes.push(`${policy.PolicyName}:${String(policy.PolicyArn).startsWith('arn:aws:iam::aws:policy/') ? 'aws-managed' : 'customer-managed'}`);
                 if (!versionId) continue;
-                const version = await iamClient.send(new GetPolicyVersionCommand({ PolicyArn: policy.PolicyArn, VersionId: versionId }));
+                const version = await config.iamClient.send(new GetPolicyVersionCommand({ PolicyArn: policy.PolicyArn, VersionId: versionId }));
                 absorbStatements(parsePolicyDocument(version.PolicyVersion?.Document), acc);
             } catch (error) {
                 console.error(`⚠️ Policy document read failed for ${policy.PolicyArn}: ${error.message}`);
@@ -227,11 +227,11 @@ async function getRoleSecurityProfile(executionRoleArn, prefix) {
     // Inline policies are invisible to ListAttachedRolePolicies, so a role that
     // keeps its real grants inline looked unprivileged until this call existed.
     try {
-        const names = (await iamClient.send(new ListRolePoliciesCommand({ RoleName: roleName }))).PolicyNames || [];
+        const names = (await config.iamClient.send(new ListRolePoliciesCommand({ RoleName: roleName }))).PolicyNames || [];
         for (const name of names) {
             inlineNames.push(name);
             try {
-                const inline = await iamClient.send(new GetRolePolicyCommand({ RoleName: roleName, PolicyName: name }));
+                const inline = await config.iamClient.send(new GetRolePolicyCommand({ RoleName: roleName, PolicyName: name }));
                 absorbStatements(parsePolicyDocument(inline.PolicyDocument), acc);
             } catch (error) {
                 console.error(`⚠️ GetRolePolicy failed for ${roleName}/${name}: ${error.message}`);
@@ -277,7 +277,7 @@ async function getAttachedPolicyNames(roleName) {
     const cached = cacheGet(cacheKey);
     if (cached !== null) return cached;
     try {
-        const response = await iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
+        const response = await config.iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
         return cacheSet(cacheKey, response.AttachedPolicies?.map((p) => p.PolicyName).join(',') || '');
     } catch (error) {
         console.error(`⚠️ Policy list failed for role ${roleName}: ${error.message}`);

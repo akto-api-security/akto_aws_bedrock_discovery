@@ -10,7 +10,8 @@
 const { ListHarnessesCommand, GetHarnessCommand, ListAgentRuntimesCommand, GetAgentRuntimeCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
 const { getRoleSecurityProfile } = require('./iamPermissions');
-const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, bedrockAgentCoreControlClient, iamClient } = require('./config');
+const config = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS } = config;
 const { buildAgentMessage } = require('./traceMessageBuilder');
 
 const harnessNameCache = {};       // role suffix -> harness name
@@ -34,7 +35,7 @@ async function listAllPages(sendPage, pluck) {
 async function listAllHarnesses() {
     try {
         return await listAllPages(
-            (nextToken) => bedrockAgentCoreControlClient.send(new ListHarnessesCommand({ nextToken })),
+            (nextToken) => config.bedrockAgentCoreControlClient.send(new ListHarnessesCommand({ nextToken })),
             (response) => response.harnesses
         );
     } catch (error) {
@@ -46,7 +47,7 @@ async function listAllHarnesses() {
 /** Fetches full metadata for one harness. Returns null on failure. */
 async function getHarnessMetadata(harnessId) {
     try {
-        return (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
+        return (await config.bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
     } catch (error) {
         console.error(`❌ GetHarness failed for ${harnessId}: ${error.message}`);
         return null;
@@ -62,7 +63,7 @@ async function getHarnessMetadata(harnessId) {
 async function listAllAgentRuntimes() {
     try {
         return await listAllPages(
-            (nextToken) => bedrockAgentCoreControlClient.send(new ListAgentRuntimesCommand({ nextToken })),
+            (nextToken) => config.bedrockAgentCoreControlClient.send(new ListAgentRuntimesCommand({ nextToken })),
             (response) => response.agentRuntimes
         );
     } catch (error) {
@@ -74,7 +75,7 @@ async function listAllAgentRuntimes() {
 /** Fetches full metadata for one AgentCore Runtime. Returns null on failure. */
 async function getAgentRuntimeMetadata(agentRuntimeId) {
     try {
-        return await bedrockAgentCoreControlClient.send(new GetAgentRuntimeCommand({ agentRuntimeId }));
+        return await config.bedrockAgentCoreControlClient.send(new GetAgentRuntimeCommand({ agentRuntimeId }));
     } catch (error) {
         console.error(`❌ GetAgentRuntime failed for ${agentRuntimeId}: ${error.message}`);
         return null;
@@ -84,7 +85,7 @@ async function getAgentRuntimeMetadata(agentRuntimeId) {
 /** Fetches AWS resource tags for one AgentCore Runtime. */
 async function getAgentRuntimeTags(agentRuntimeArn) {
     try {
-        return (await bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: agentRuntimeArn }))).tags || {};
+        return (await config.bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: agentRuntimeArn }))).tags || {};
     } catch (error) {
         console.error(`⚠️ Tag fetch failed for runtime ${agentRuntimeArn}: ${error.message}`);
         return {};
@@ -102,7 +103,7 @@ async function initializeHarnessCache() {
         for (const item of harnesses) {
             if (!item.harnessId || !item.harnessName) continue;
             try {
-                const details = (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId: item.harnessId }))).harness;
+                const details = (await config.bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId: item.harnessId }))).harness;
                 const roleMatch = details?.executionRoleArn?.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
                 if (roleMatch) {
                     const suffix = roleMatch[1];
@@ -132,7 +133,7 @@ async function fetchTagsCached(cacheKey, fetcher) {
 async function getHarnessTags(harnessId) {
     try {
         const arn = `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harnessId}`;
-        return (await bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: arn }))).tags || {};
+        return (await config.bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: arn }))).tags || {};
     } catch (error) {
         console.error(`⚠️ Tag fetch failed for harness ${harnessId}: ${error.message}`);
         return {};
@@ -252,7 +253,7 @@ async function summarizeHarnessGateways(gatewayArns) {
 /** Reads a harness's configured tools/skills and formats them as tag values. */
 async function getHarnessToolsAndSkills(harnessId) {
     try {
-        const details = (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
+        const details = (await config.bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
         const tags = {};
         const tools = details?.tools || [];
         if (tools.length > 0) {

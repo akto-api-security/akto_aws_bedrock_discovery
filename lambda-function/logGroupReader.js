@@ -4,7 +4,8 @@
  * parsing/classification is traceParser.js's job.
  */
 const { DescribeLogGroupsCommand, FilterLogEventsCommand } = require('@aws-sdk/client-cloudwatch-logs');
-const { cloudWatchLogsClient, RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH } = require('./config');
+const config = require('./config');
+const { RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH } = config;
 
 /**
  * Pulls the runtime ID out of a per-runtime log group name:
@@ -26,7 +27,7 @@ async function discoverObservabilityLogGroups() {
     try {
         let nextToken;
         do {
-            const response = await cloudWatchLogsClient.send(new DescribeLogGroupsCommand({
+            const response = await config.cloudWatchLogsClient.send(new DescribeLogGroupsCommand({
                 logGroupNamePrefix: RUNTIME_LOG_GROUP_PREFIX,
                 nextToken
             }));
@@ -60,7 +61,7 @@ async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarg
                 console.warn(`⏱️ Time budget low — deferring remaining pages for ${logGroupName}`);
                 break;
             }
-            const response = await cloudWatchLogsClient.send(new FilterLogEventsCommand({
+            const response = await config.cloudWatchLogsClient.send(new FilterLogEventsCommand({
                 logGroupName,
                 startTime: sinceMs + 1, // +1ms: startTime is inclusive, avoids re-fetching the last event already processed
                 limit: MAX_LOG_EVENTS_PER_FETCH,
