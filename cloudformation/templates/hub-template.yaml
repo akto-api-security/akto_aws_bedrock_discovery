@@ -32,19 +32,9 @@ Parameters:
 
   ProcessorCodeKey:
     Type: String
-    Default: unified_bedrock/v4.3/akto-bedrock-processor.zip
+    Default: lambda/akto-bedrock-processor.zip
 
 Resources:
-  MarkersBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Ref MarkersBucketName
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-
   HubRole:
     Type: AWS::IAM::Role
     Properties:
@@ -72,8 +62,8 @@ Resources:
                   - s3:PutObject
                   - s3:ListBucket
                 Resource:
-                  - !GetAtt MarkersBucket.Arn
-                  - !Sub '${MarkersBucket.Arn}/*'
+                  - !Sub 'arn:aws:s3:::${MarkersBucketName}'
+                  - !Sub 'arn:aws:s3:::${MarkersBucketName}/*'
 
   HubFunction:
     Type: AWS::Lambda::Function
@@ -92,7 +82,7 @@ Resources:
           HUB_AWS_REGION: !Ref AWS::Region
           CROSS_ACCOUNT_EXTERNAL_ID: !Ref CrossAccountExternalId
           CROSS_ACCOUNT_ROLE_ARNS: !Ref CrossAccountRoleArns
-          MARKERS_BUCKET_NAME: !Ref MarkersBucket
+          MARKERS_BUCKET_NAME: !Ref MarkersBucketName
           MARKERS_S3_REGION: !Ref AWS::Region
           DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
           AKTO_API_KEY: !Ref AktoApiKey

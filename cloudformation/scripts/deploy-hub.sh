@@ -10,31 +10,52 @@ STACK_NAME="${STACK_NAME:-akto-bedrock-hub}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION=$(aws configure get region)
 REGION=${REGION:-us-east-1}
-DEFAULT_CODE_BUCKET="lambda-code-akto-${REGION}"
+
+# Defaults — override via env if needed
+MARKERS_BUCKET="${MARKERS_BUCKET:-akto-bedrock-hub-${ACCOUNT_ID}}"
+CODE_BUCKET="$MARKERS_BUCKET"
+CODE_KEY="${CODE_KEY:-lambda/akto-bedrock-processor.zip}"
+CROSS_ACCOUNT_EXTERNAL_ID="${CROSS_ACCOUNT_EXTERNAL_ID:-akto-bedrock-hub-${ACCOUNT_ID}}"
+CROSS_ACCOUNT_ROLE_ARNS="${CROSS_ACCOUNT_ROLE_ARNS:-}"
 
 echo "AKTO Bedrock Hub Deploy"
 echo "======================="
 echo "Account: $ACCOUNT_ID  Region: $REGION"
+echo "Bucket:  s3://$MARKERS_BUCKET  (auto-created if missing)"
+echo "External ID: $CROSS_ACCOUNT_EXTERNAL_ID"
 echo ""
 
-read -p "Markers bucket name: " MARKERS_BUCKET
-read -p "Lambda code S3 bucket [$DEFAULT_CODE_BUCKET]: " CODE_BUCKET
-CODE_BUCKET=${CODE_BUCKET:-$DEFAULT_CODE_BUCKET}
-read -p "Lambda code S3 key [unified_bedrock/hub/akto-bedrock-processor.zip]: " CODE_KEY
-CODE_KEY=${CODE_KEY:-unified_bedrock/hub/akto-bedrock-processor.zip}
-read -p "Akto ingestion endpoint: " DATA_INGESTION_ENDPOINT
-read -sp "Akto API key: " AKTO_API_KEY; echo ""
-read -p "Cross-account External ID: " CROSS_ACCOUNT_EXTERNAL_ID
-read -p "Customer role ARN(s) [optional, comma-separated]: " CROSS_ACCOUNT_ROLE_ARNS
+if [[ -z "$DATA_INGESTION_ENDPOINT" ]]; then
+  read -p "Akto ingestion endpoint: " DATA_INGESTION_ENDPOINT
+fi
+if [[ -z "$AKTO_API_KEY" ]]; then
+  read -sp "Akto API key: " AKTO_API_KEY; echo ""
+fi
 
-for var in MARKERS_BUCKET DATA_INGESTION_ENDPOINT AKTO_API_KEY CROSS_ACCOUNT_EXTERNAL_ID; do
+for var in DATA_INGESTION_ENDPOINT AKTO_API_KEY; do
   if [[ -z "${!var}" ]]; then
     echo "Error: $var is required."
     exit 1
   fi
 done
 
+ensure_bucket() {
+  if aws s3api head-bucket --bucket "$MARKERS_BUCKET" --region "$REGION" 2>/dev/null; then
+    echo "Bucket s3://$MARKERS_BUCKET exists."
+    return
+  fi
+  echo "Creating bucket s3://$MARKERS_BUCKET ..."
+  if [[ "$REGION" == "us-east-1" ]]; then
+    aws s3api create-bucket --bucket "$MARKERS_BUCKET" --region "$REGION"
+  else
+    aws s3api create-bucket --bucket "$MARKERS_BUCKET" --region "$REGION" \
+      --create-bucket-configuration "LocationConstraint=$REGION"
+  fi
+}
+
 echo ""
+ensure_bucket
+
 echo "Building Lambda package..."
 cd "$REPO_ROOT/lambda-function"
 npm ci
