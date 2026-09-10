@@ -2,7 +2,7 @@
  * Pure functions that turn a raw Bedrock model-invocation log entry into
  * AKTO-shaped conversation pairs. No AWS calls, no shared state.
  */
-const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, MAX_TRACE_BYTES } = require('./config');
 
 /** Pulls plain text out of a Bedrock content-block (array format expected from AWS APIs). */
 function extractTextFromContent(content) {
@@ -44,10 +44,54 @@ function removeXMLTags(text, tag) {
     return text.replace(new RegExp(`<${tag}>.*?</${tag}>`, 'gs'), '');
 }
 
+
 /**
- * Extracts every user/assistant conversation pair found in one log entry: the
- * final assistant response (from the output field) paired with the most recent
- * user message, plus any earlier user→assistant pairs from the message history.
+ * Keys a caller might plausibly use for a conversation identifier, in preference
+ * order. Bedrock itself never emits one — requestMetadata is the only field in the
+ * whole ModelInvocationLog schema that the caller populates, so an application that
+ * wants its sessions visible has to put the id here. Spellings vary by SDK and
+ * framework, so several are accepted rather than dictating one.
+ */
+const SESSION_METADATA_KEYS = [
+    'sessionId', 'session_id', 'sessionID', 'session',
+    'conversationId', 'conversation_id', 'threadId', 'thread_id'
+];
+
+/**
+ * Reads the caller-supplied requestMetadata off a log entry.
+ *
+ * AWS caps it at 16 entries with keys and values of 256 characters each; those
+ * caps are re-applied here rather than trusted, since this value is the one part
+ * of the record that did not come from Bedrock.
+ *
+ * Returns the sanitized map plus whichever key looked like a session identifier,
+ * so the caller gets a single normalized field regardless of the spelling used.
+ */
+function extractRequestMetadata(logEntry) {
+    const raw = logEntry?.requestMetadata;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { metadata: {}, sessionId: '' };
+
+    const metadata = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (Object.keys(metadata).length >= 16) break;
+        if (typeof key !== 'string' || !key) continue;
+        if (value === null || value === undefined || typeof value === 'object') continue;
+        metadata[key.slice(0, 256)] = String(value).slice(0, 256);
+    }
+
+    let sessionId = '';
+    for (const candidate of SESSION_METADATA_KEYS) {
+        const hit = Object.keys(metadata).find((k) => k.toLowerCase() === candidate.toLowerCase());
+        if (hit && metadata[hit]) { sessionId = metadata[hit]; break; }
+    }
+    return { metadata, sessionId };
+}
+
+/**
+ * Extracts the one exchange this log entry actually represents: the assistant's
+ * response (from the output field) paired with the most recent user message.
+ *
+ * Returns an array (0 or 1 pairs) because callers iterate it.
  */
 function extractConversationPairs(logEntry) {
     const pairs = [];
@@ -67,6 +111,7 @@ function extractConversationPairs(logEntry) {
             .filter((text) => text && !text.includes('<function_results>') && text.trim().length > 0);
 
         const arn = logEntry.identity?.arn || '';
+        const requestMetadata = extractRequestMetadata(logEntry);
         // Type detection and resource lookup now handled in s3Logs.js via discovery mappings
         const baseFields = {
             timestamp: logEntry.timestamp,
@@ -84,21 +129,21 @@ function extractConversationPairs(logEntry) {
             region: logEntry.region || AWS_REGION,
             inputTokenCount: logEntry.input?.inputTokenCount || 0,
             outputTokenCount: logEntry.output?.outputTokenCount || 0,
-            awsMetadata: {}
+            awsMetadata: {},
+            // The caller's own tags — the only route to a session id on this path.
+            requestMetadata: requestMetadata.metadata,
+            sessionId: requestMetadata.sessionId
         };
 
         if (finalAssistantResponse && userMessages.length > 0) {
-            pairs.push({ ...baseFields, userMessage: userMessages[userMessages.length - 1], agentResponse: finalAssistantResponse });
-        }
-
-        for (let i = 0; i < messages.length - 1; i++) {
-            if (messages[i].role !== 'user' || messages[i + 1].role !== 'assistant') continue;
-            const userText = extractTextFromContent(messages[i].content);
-            if (!userText || userText.includes('<function_results>') || !userText.trim()) continue;
-            const cleaned = cleanAgentResponse(extractTextFromContent(messages[i + 1].content));
-            if (!cleaned) continue;
-            if (pairs.some((p) => p.userMessage === userText && p.agentResponse === cleaned)) continue;
-            pairs.push({ ...baseFields, userMessage: userText, agentResponse: cleaned });
+            pairs.push({
+                ...baseFields,
+                userMessage: userMessages[userMessages.length - 1],
+                agentResponse: finalAssistantResponse,
+                // How much history this call carried — useful for spotting long
+                // conversations without re-sending their turns.
+                conversationTurns: messages.length
+            });
         }
     } catch (error) {
         console.error(`❌ Error extracting conversation pairs: ${error.message}`);
@@ -116,10 +161,79 @@ function extractToolActionType(input) {
     return 'unknown';
 }
 
-/** Extracts the tool-call execution trace for a conversation pair, matching each toolUse to its toolResult by toolUseId. */
-function extractTraceData(logEntry, botName) {
+/**
+ * Index of the last user message that is a real question rather than a tool result.
+ *
+ * That message is the one extractConversationPairs emits, so everything after it is
+ * the work done to answer it — which is exactly the trace this log entry should
+ * report. Returns -1 when there is no such message, in which case the caller keeps
+ * the whole array rather than guessing.
+ */
+function lastRealUserIndex(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i];
+        if (message.role !== 'user') continue;
+        const blocks = Array.isArray(message.content) ? message.content : [];
+        const hasText = blocks.some((b) => b && b.text !== undefined);
+        const isToolResult = blocks.some((b) => b && b.toolResult);
+        if (hasText && !isToolResult) return i;
+    }
+    return -1;
+}
+
+/**
+ * Caps one trace so a single pathological conversation can never produce a message
+ * too large for the downstream broker. Tool *results* are the bulk of the bytes, so
+ * they are truncated (longest first) before anything structural is dropped: which
+ * tools ran, in what order, is worth more than the full text of what they returned.
+ */
+function capTraceData(trace, maxBytes) {
+    const size = (v) => Buffer.byteLength(JSON.stringify(v), 'utf8');
+    if (size(trace) <= maxBytes) return trace;
+
+    const steps = [...(trace.executionFlow || [])];
+    // Longest results first — one huge result is the usual cause.
+    const order = steps
+        .map((s, i) => ({ i, len: String(s.result || '').length }))
+        .sort((a, b) => b.len - a.len);
+
+    for (const { i } of order) {
+        if (size(trace) <= maxBytes) break;
+        const result = String(steps[i].result || '');
+        if (result.length <= 200) continue;
+        steps[i] = { ...steps[i], result: `${result.slice(0, 200)}…[truncated ${result.length - 200} chars]`, resultTruncated: true };
+        trace = { ...trace, executionFlow: steps };
+    }
+
+    // Still too big — the step list itself is the problem, so keep the summary and
+    // the first steps rather than emit something the broker will reject outright.
+    if (size(trace) > maxBytes) {
+        const kept = [];
+        for (const step of steps) {
+            kept.push(step);
+            if (size({ ...trace, executionFlow: kept }) > maxBytes) { kept.pop(); break; }
+        }
+        trace = { ...trace, executionFlow: kept, executionFlowTruncated: { kept: kept.length, total: steps.length } };
+    }
+    return trace;
+}
+
+/**
+ * Extracts the tool-call execution trace for a conversation pair, matching each
+ * toolUse to its toolResult by toolUseId.
+ *
+ * Scoped to the exchange being reported, not the whole conversation. Bedrock resends
+ * the entire history on every call, so walking all of it made message N carry the
+ * tool results of turns 1…N — the same duplication extractConversationPairs already
+ * removes for the conversation itself. On real client logs that was 88% of the
+ * payload and grew without bound as a session went on. Each turn's tools still reach
+ * AKTO exactly once, on the message for the turn they ran in.
+ */
+function extractTraceData(logEntry, botName, maxBytes = MAX_TRACE_BYTES) {
     try {
-        const messages = logEntry.input?.inputBodyJson?.messages || [];
+        const allMessages = logEntry.input?.inputBodyJson?.messages || [];
+        const from = lastRealUserIndex(allMessages);
+        const messages = from >= 0 ? allMessages.slice(from + 1) : allMessages;
         const stopReason = logEntry.output?.outputBodyJson?.stopReason;
 
         const resultsByToolUseId = {};
@@ -155,7 +269,7 @@ function extractTraceData(logEntry, botName) {
             actions.add(action);
         });
 
-        return {
+        return capTraceData({
             executionFlow,
             toolsSummary: {
                 agentOrchestrator: botName,
@@ -164,7 +278,7 @@ function extractTraceData(logEntry, botName) {
                 totalToolCalls: toolCalls.length,
                 executionPattern: `${botName}→${[...tools].join('→')}`
             }
-        };
+        }, maxBytes);
     } catch (error) {
         console.warn(`⚠️ Trace extraction failed: ${error.message}`);
         return { executionFlow: [], toolsSummary: {} };
@@ -172,5 +286,6 @@ function extractTraceData(logEntry, botName) {
 }
 
 module.exports = {
-    extractTextFromContent, cleanAgentResponse, removeXMLTags, extractConversationPairs, extractTraceData
+    extractTextFromContent, cleanAgentResponse, removeXMLTags, extractConversationPairs, extractTraceData,
+    lastRealUserIndex, capTraceData, extractRequestMetadata
 };

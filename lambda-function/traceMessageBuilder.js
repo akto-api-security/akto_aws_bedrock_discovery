@@ -4,6 +4,7 @@
  * Classic isn't discovered or traced here (see lambda-function/ for that).
  */
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
+const { actorIp } = require('./identityActor');
 
 /** Normalizes discovery-message identity across HARNESS/RUNTIME, which use different field names for the same concept. */
 function resolveDiscoveryIdentity(data) {
@@ -50,6 +51,10 @@ function buildAgentMessage(data, isConversation) {
         requestHeaders['X-Request-Id'] = data.requestId;
         requestHeaders['bedrock-input-tokens'] = String(data.inputTokenCount || 0);
         requestHeaders['bedrock-output-tokens'] = String(data.outputTokenCount || 0);
+        // Surfaced as headers as well as tags so a consumer can correlate turns
+        // without unwrapping responsePayload's nested traceData.
+        if (data.traceData?.sessionId) requestHeaders['bedrock-session-id'] = data.traceData.sessionId;
+        if (data.traceData?.traceId) requestHeaders['bedrock-trace-id'] = data.traceData.traceId;
     }
 
     const requestPayload = isConversation
@@ -82,7 +87,18 @@ function buildAgentMessage(data, isConversation) {
         model: modelId,
         'bedrock-identity-arn': data.arn || '',
         ...(isConversation
-            ? { operation: data.operation || 'Unknown', 'input-tokens': String(data.inputTokenCount || 0), 'output-tokens': String(data.outputTokenCount || 0), ...(data.logType === 'HARNESS' ? data.harnessTags : data.runtimeTags) }
+            ? {
+                operation: data.operation || 'Unknown',
+                'input-tokens': String(data.inputTokenCount || 0),
+                'output-tokens': String(data.outputTokenCount || 0),
+                'total-tokens': String(data.totalTokenCount || 0),
+                // Zero cache tokens on a multi-cycle turn means the tool catalogue
+                // was resent uncached every round — the usual cost surprise.
+                'cache-read-tokens': String(data.cacheReadTokenCount || 0),
+                'cache-write-tokens': String(data.cacheWriteTokenCount || 0),
+                'llm-calls': String(data.llmCallCount || 0),
+                ...(data.logType === 'HARNESS' ? data.harnessTags : data.runtimeTags)
+            }
             : { 'discovery-type': 'METADATA_ONLY', 'has-conversations': 'false', ...(discoveryIdentity.tags || {}) })
     };
 
@@ -94,7 +110,7 @@ function buildAgentMessage(data, isConversation) {
         responseHeaders: JSON.stringify({ 'Content-Type': 'application/json', ...(isConversation && { 'X-Request-Id': data.requestId }) }),
         requestPayload: JSON.stringify(requestPayload),
         responsePayload: JSON.stringify(responsePayload),
-        ip: '0.0.0.0',
+        ip: actorIp(data.arn),
         time: timestamp.toString(),
         statusCode: '200',
         type: 'HTTP',

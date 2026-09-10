@@ -13,6 +13,7 @@ const {
 } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
 const { bedrockAgentCoreControlClient, iamClient, AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
+const { getRoleSecurityProfile } = require('./iamPermissions');
 const { listAllPages, listAllHarnesses, getHarnessMetadata } = require('./traceDiscovery');
 
 const gatewayDetailCache = {};
@@ -257,6 +258,8 @@ async function buildGatewayProfile(gateway, { harnessMap = {} } = {}) {
         'gateway-protocol': gateway.protocolType || '',
         'gateway-role': gateway.roleArn || '',
         'gateway-role-policies': rolePolicies,
+        // Names alone never said what the gateway's own role may reach.
+        ...(await getRoleSecurityProfile(gateway.roleArn, 'gateway')),
         'gateway-created-at': gateway.createdAt ? new Date(gateway.createdAt).toISOString() : '',
         'gateway-updated-at': gateway.updatedAt ? new Date(gateway.updatedAt).toISOString() : '',
         'auth-type': gateway.authorizerType || '',

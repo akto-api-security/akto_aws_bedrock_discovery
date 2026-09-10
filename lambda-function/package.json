@@ -5,8 +5,9 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "package": "npm install && zip -r ../akto-bedrock-processor.zip . -x '*.git*' 'node_modules/.cache/*' '*.zip'",
-    "deploy": "npm run package && aws lambda update-function-code --function-name akto-bedrock-log-processor --zip-file fileb://../akto-bedrock-processor.zip"
+    "package": "npm ci && zip -r ../akto-bedrock-processor.zip . -x '*.git*' 'node_modules/.cache/*' '*.zip' 'test/*' 'scripts/*'",
+    "deploy": "npm run package && aws lambda update-function-code --function-name akto-bedrock-log-processor-unified-$(aws sts get-caller-identity --query Account --output text) --zip-file fileb://../akto-bedrock-processor.zip",
+    "prepackage": "node scripts/stamp-version.js"
   },
   "keywords": [
     "aws",
@@ -24,7 +25,8 @@
     "@aws-sdk/client-cloudwatch-logs": "^3.682.0",
     "@aws-sdk/client-iam": "^3.682.0",
     "@aws-sdk/client-lambda": "^3.1071.0",
-    "@aws-sdk/client-s3": "^3.682.0"
+    "@aws-sdk/client-s3": "^3.682.0",
+    "@aws-sdk/util-arn-parser": "^3.682.0"
   },
   "engines": {
     "node": ">=22.x"

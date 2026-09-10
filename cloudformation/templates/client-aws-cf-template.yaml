@@ -37,9 +37,11 @@ Parameters:
   LambdaCodeVersion:
     Type: String
     Description: >
-      Version of Lambda code to deploy. Check with AKTO team for the latest
-      version. Gateway interception requires v4.1 or later.
-    Default: 'v4.1'
+      Version of Lambda code to deploy initially. Check with AKTO team for the
+      latest version. Gateway interception requires v4.1 or later. After the
+      stack is created the updater keeps this current on its own, so this value
+      only decides which build the account STARTS on.
+    Default: 'v4.3'
     AllowedPattern: '^v[0-9]+\.[0-9]+$'
     ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
 
@@ -59,6 +61,11 @@ Conditions:
   # Gates every interception resource. When false this stack is exactly the
   # discovery-only deployment: no interceptor, no attacher, no gateway writes.
   InterceptionEnabled: !Equals [!Ref EnableGatewayInterception, 'true']
+
+  # The updater is always deployed, so its target list depends only on whether
+  # interception is on: with it off the other two functions do not exist, and
+  # pointing the updater at them would mean a guaranteed failure on every run.
+  AutoUpdateAllThree: !Condition InterceptionEnabled
 
 Resources:
   # ===========================================================================
@@ -119,8 +126,22 @@ Resources:
               # IAM permissions for role inspection (agent execution roles + harness/runtime roles)
               - Effect: Allow
                 Action:
+                  - 'iam:GetRole'
                   - 'iam:ListAttachedRolePolicies'
+                  - 'iam:ListRolePolicies'
+                  - 'iam:GetRolePolicy'
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              # Policy documents behind the attached policy names. GetPolicy and
+              # GetPolicyVersion address a policy ARN, not a role ARN, so they cannot
+              # share the role statement above. AWS-managed policies live under the
+              # fixed aws account alias and need their own entry.
+              - Effect: Allow
+                Action:
+                  - 'iam:GetPolicy'
+                  - 'iam:GetPolicyVersion'
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                  - 'arn:aws:iam::aws:policy/*'
               # CloudWatch Logs - read-only (used by the AgentCore Harness/Runtime trace
               # pipeline only). DescribeLogGroups has no resource-level permission support
               # in IAM (AWS requires Resource: "*" for it); FilterLogEvents does support
@@ -139,7 +160,7 @@ Resources:
   AktoBedrocklambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'akto-bedrock-log-processor-cf-${AWS::AccountId}'
+      FunctionName: !Sub 'akto-bedrock-log-processor-unified-${AWS::AccountId}'
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
@@ -147,7 +168,7 @@ Resources:
       MemorySize: 1024
       Code:
         S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
-        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
+        S3Key: !Sub 'unified_bedrock/${LambdaCodeVersion}/akto-bedrock-processor.zip'
       Environment:
         Variables:
           DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
@@ -249,7 +270,7 @@ Resources:
       MemorySize: 256
       Code:
         S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
-        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
+        S3Key: !Sub 'unified_bedrock/${LambdaCodeVersion}/akto-bedrock-processor.zip'
       Environment:
         Variables:
           DATA_INGESTION_ENDPOINT: !Ref DataIngestionEndpoint
@@ -331,8 +352,22 @@ Resources:
               # role enrichment agents and harnesses already get.
               - Effect: Allow
                 Action:
+                  - 'iam:GetRole'
                   - 'iam:ListAttachedRolePolicies'
+                  - 'iam:ListRolePolicies'
+                  - 'iam:GetRolePolicy'
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              # Policy documents behind the attached policy names. GetPolicy and
+              # GetPolicyVersion address a policy ARN, not a role ARN, so they cannot
+              # share the role statement above. AWS-managed policies live under the
+              # fixed aws account alias and need their own entry.
+              - Effect: Allow
+                Action:
+                  - 'iam:GetPolicy'
+                  - 'iam:GetPolicyVersion'
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                  - 'arn:aws:iam::aws:policy/*'
               # Gateway discovery checkpoint, so a gateway is announced to AKTO once
               # rather than on every sweep. Confined to AKTO's own marker prefix.
               - Effect: Allow
@@ -356,7 +391,7 @@ Resources:
       MemorySize: 512
       Code:
         S3Bucket: !Sub 'lambda-code-akto-${AWS::Region}'
-        S3Key: !Sub '${LambdaCodeVersion}/akto-bedrock-processor.zip'
+        S3Key: !Sub 'unified_bedrock/${LambdaCodeVersion}/akto-bedrock-processor.zip'
       Environment:
         Variables:
           INTERCEPTOR_LAMBDA_ARN: !GetAtt AktoInterceptorFunction.Arn
@@ -395,7 +430,200 @@ Resources:
       # changing property CloudFormation would skip the custom resource entirely.
       CodeVersion: !Ref LambdaCodeVersion
 
+  # ---------------------------------------------------------------------------------
+  # Automatic updates
+  #
+  # A second, deliberately tiny function whose only job is to keep this stack's Lambdas
+  # current. It is separate from them on purpose: if a build were ever broken badly
+  # enough not to start, nothing inside those functions could repair it — but this
+  # updater is untouched by that and can always roll the next build in.
+  #
+  # Its code is inline rather than an S3 artifact, so there is no second zip for AKTO to
+  # publish or version, and nothing here ever needs to change.
+  #
+  # All three functions run the SAME zip (different handlers), so one updater keeps the
+  # whole stack on one build. Updating only the processor would leave the attacher and
+  # interceptor on an older copy of shared modules — the two halves would drift apart.
+  # ---------------------------------------------------------------------------------
+  UpdaterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'akto-bedrock-updater-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AktoBedrockUpdaterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the published pointer, and the build objects it names. Scoped to this
+              # product's folder, not the whole bucket: AKTO publishes other products
+              # alongside it and this function has no business reading them.
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::lambda-code-akto-${AWS::Region}/unified_bedrock/*'
+              # Change the code of exactly the functions this stack created, in this
+              # account and region. It cannot touch any other Lambda.
+              - Effect: Allow
+                Action:
+                  - 'lambda:UpdateFunctionCode'
+                  - 'lambda:ListTags'
+                  - 'lambda:TagResource'
+                Resource: !If
+                  - AutoUpdateAllThree
+                  - - !GetAtt AktoBedrocklambdaFunction.Arn
+                    - !GetAtt AktoInterceptorFunction.Arn
+                    - !GetAtt AktoGatewayAttacherFunction.Arn
+                  - - !GetAtt AktoBedrocklambdaFunction.Arn
+
+  UpdaterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'akto-bedrock-updater-${AWS::AccountId}-${AWS::Region}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt UpdaterRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Description: 'Keeps the AKTO Bedrock Lambdas on the build published to their update channel'
+      Environment:
+        Variables:
+          # Comma-separated, because with interception off the other two do not exist.
+          # Full ARNs, not bare names: ListTags and TagResource require an ARN, and
+          # UpdateFunctionCode accepts one, so passing ARNs removes any need for this
+          # function to discover its own account id at runtime.
+          TARGET_FUNCTION_ARNS: !If
+            - AutoUpdateAllThree
+            - !Sub '${AktoBedrocklambdaFunction.Arn},${AktoInterceptorFunction.Arn},${AktoGatewayAttacherFunction.Arn}'
+            - !GetAtt AktoBedrocklambdaFunction.Arn
+          CODE_BUCKET: !Sub 'lambda-code-akto-${AWS::Region}'
+          # Fixed: AKTO publishes every build of this product into this one folder.
+          CODE_PREFIX: 'unified_bedrock'
+          CODE_OBJECT: 'akto-bedrock-processor.zip'
+          # Which pointer in versions.json this account follows. Embedded rather than
+          # exposed as a stack parameter: customers should not have to reason about
+          # release channels, and every customer account belongs on the same one.
+          #
+          # AKTO ONLY: change to 'canary' in the copy of this template used for AKTO's own
+          # test account, so a build can be validated there before versions.json promotes
+          # it to stable for everyone else.
+          UPDATE_CHANNEL: 'stable'
+      Code:
+        # The AWS SDK v3 ships with the Node.js 22 runtime, so this needs no dependencies
+        # and stays a single inline file.
+        ZipFile: |
+          const { LambdaClient, UpdateFunctionCodeCommand, ListTagsCommand, TagResourceCommand } = require('@aws-sdk/client-lambda');
+          const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+          const TAG = 'akto:code-version';
+          const lambda = new LambdaClient({});
+          const s3 = new S3Client({});
+
+          exports.handler = async () => {
+            const targets = (process.env.TARGET_FUNCTION_ARNS || '').split(',').map((t) => t.trim()).filter(Boolean);
+            const bucket = process.env.CODE_BUCKET;
+            const channel = process.env.UPDATE_CHANNEL;
+            const prefix = process.env.CODE_PREFIX;
+            const object = process.env.CODE_OBJECT;
+
+            // What build should this account be on? Read once for the whole stack.
+            let want;
+            try {
+              const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: `${prefix}/versions.json` }));
+              want = JSON.parse(await res.Body.transformToString())[channel];
+            } catch (e) {
+              console.error(`Cannot read s3://${bucket}/${prefix}/versions.json - leaving code unchanged: ${e.message}`);
+              return;
+            }
+            if (!want) {
+              console.log(`Channel '${channel}' is not listed in ${prefix}/versions.json - leaving code unchanged`);
+              return;
+            }
+
+            const key = `${prefix}/${want}/${object}`;
+            const results = [];
+
+            // Each function is handled independently: one failure must not stop the
+            // others, and the failed one simply retries on the next check.
+            for (const arn of targets) {
+              const fn = arn.split(':function:')[1] || arn;
+              try {
+                // What build is it on? Recorded as a tag when this updater last changed it.
+                // A missing tag reads as unknown, which simply reapplies the channel build once.
+                const { Tags = {} } = await lambda.send(new ListTagsCommand({ Resource: arn }));
+                const have = Tags[TAG];
+
+                if (have === want) {
+                  results.push(`${fn}=${have}`);
+                  continue;
+                }
+
+                console.log(`Updating ${fn}: ${have || 'unknown'} -> ${want} from s3://${bucket}/${key}`);
+                await lambda.send(new UpdateFunctionCodeCommand({ FunctionName: arn, S3Bucket: bucket, S3Key: key }));
+                // Tagged last on purpose: if this call fails the tag still names the old
+                // build, so the next check repeats the same update and tags again. Never a
+                // false "already current" while the code says otherwise.
+                await lambda.send(new TagResourceCommand({ Resource: arn, Tags: { [TAG]: want } }));
+                results.push(`${fn}: ${have || 'unknown'} -> ${want}`);
+              } catch (e) {
+                if (e.name === 'ResourceConflictException') {
+                  results.push(`${fn}=mid-update, retrying next check`);
+                  continue;
+                }
+                // Logged, not thrown: throwing would abandon the remaining functions.
+                console.error(`Update of ${fn} to ${want} FAILED: ${e.message}`);
+                results.push(`${fn}=FAILED (${e.message})`);
+              }
+            }
+            console.log(`Channel '${channel}' wants ${want} | ${results.join(' | ')}`);
+          };
+
+  UpdaterScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'akto-bedrock-updater-schedule-${AWS::AccountId}-${AWS::Region}'
+      # A check, not an update: it compares two strings and exits unless AKTO has
+      # published something new, so a quiet month costs ~2,900 no-op invocations of a
+      # 128 MB function — comfortably inside each account's own free tier.
+      #
+      # rate() rather than cron() on purpose. Each account's rule starts counting from
+      # its own creation time, so a hundred accounts naturally spread their checks across
+      # the quarter hour instead of all reading versions.json on the same second.
+      #
+      # Deliberately NOT aligned with the processor's schedule. An update landing mid-run
+      # is safe: AWS lets the running invocation finish on the old code and only the next
+      # invocation picks up the new build, so there is nothing to synchronise.
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Description: 'Checks whether the AKTO Bedrock Lambdas are on the published build'
+      Targets:
+        - Arn: !GetAtt UpdaterFunction.Arn
+          Id: AktoBedrockUpdaterTarget
+
+  UpdaterInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdaterFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UpdaterScheduleRule.Arn
+
+
 Outputs:
+  AutoUpdate:
+    Description: 'Whether this stack keeps itself on the published build'
+    Value: !Sub 'ENABLED - checking s3://lambda-code-akto-${AWS::Region}/unified_bedrock/versions.json every 15 minutes'
+
+  UpdaterFunctionName:
+    Description: 'Name of the updater Lambda'
+    Value: !Ref UpdaterFunction
+
   LambdaFunctionName:
     Description: 'Name of the Lambda function'
     Value: !Ref AktoBedrocklambdaFunction

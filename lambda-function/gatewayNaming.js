@@ -1,6 +1,12 @@
 /**
  * Gateway identity derivation, shared by the interceptor (hot path) and the
  * attacher (control plane).
+ *
+ * Deliberately dependency-free — no AWS SDK, no config — because the interceptor
+ * imports it and must stay lean. It also has to be the *same* code on both sides:
+ * if the attacher and the interceptor derived names differently, a gateway's
+ * discovery record and its live traffic would disagree on `bot-name`.
+ */
 
 // AgentCore gateway IDs are "<name>-<10 char suffix>", e.g.
 //   akto-unified-test-gateway-1-ur3v24waoj -> akto-unified-test-gateway-1

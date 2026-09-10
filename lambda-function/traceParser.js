@@ -119,12 +119,36 @@ function extractConversationContentFromGenAiEvents(records) {
     const choiceTexts = records.filter((r) => r.eventName === 'gen_ai.choice').map((r) => extractTextFromContentBlocks(r.body?.message?.content));
     const assistantTexts = records.filter((r) => r.eventName === 'gen_ai.assistant.message').map((r) => extractTextFromContentBlocks(r.body?.content));
     return {
-        userMessage: userTexts[userTexts.length - 1] || '',
+        userMessage: lastRealUserText(records) || userTexts[userTexts.length - 1] || '',
         agentResponse: choiceTexts[choiceTexts.length - 1] || assistantTexts[assistantTexts.length - 1] || ''
     };
 }
 
-/** Only reliable userMessage source in a multi-round tool-using trace — generic gen_ai.user.message gets repurposed for tool-result feedback by later rounds. */
+/**
+ * The last gen_ai.user.message that is an actual question rather than tool-result
+ * feedback or an AgentCore memory injection.
+ *
+ * Direct analogue of lastRealUserIndex in extractors.js on the S3 path. Needed
+ * because the generic gen_ai.user.message role is reused for two other things:
+ * toolResult blocks fed back on later event-loop cycles, and the
+ * <user_context> summary AgentCore managed memory injects. Taking the plain
+ * last record therefore yields the memory block on a tool-free trace and an
+ * empty string on a tool-using one — never the question the user asked.
+ */
+function lastRealUserText(records) {
+    for (let i = records.length - 1; i >= 0; i--) {
+        const record = records[i];
+        if (record.eventName !== 'gen_ai.user.message') continue;
+        const blocks = record.body?.content || [];
+        if (blocks.some((b) => b?.toolResult)) continue;
+        const text = extractTextFromContentBlocks(blocks).trim();
+        if (!text || text.startsWith('<user_context>')) continue;
+        return text;
+    }
+    return '';
+}
+
+/** Preferred userMessage source when a build emits it — not seen on current AgentCore telemetry, so lastRealUserText carries the real load. */
 function extractUserMessageFromHarnessConversationEvent(records) {
     const event = records.find((r) => r.eventName === 'gen_ai.HarnessConversationRole.user.message');
     return event ? extractTextFromContentBlocks(event.body?.content) : '';
@@ -180,10 +204,23 @@ function extractAgentCoreExecutionFlow(records, botName) {
     }
 
     const toolCalls = [];
+    const seenToolUseIds = new Set();
     for (const record of records) {
         if (record.eventName !== 'gen_ai.assistant.message') continue;
         for (const block of record.body?.content || []) {
-            if (block?.toolUse) toolCalls.push(block.toolUse);
+            if (!block?.toolUse) continue;
+            // The tracer re-emits the accumulating message history once per
+            // event-loop cycle, so a tool call made early arrives again in every
+            // later cycle's record. Bedrock mints a unique toolUseId per call, so
+            // that id is the identity of the call: deduping on it drops only the
+            // re-emissions and keeps a genuine second call to the same tool. A
+            // block carrying no id cannot be deduped — keep it rather than lose a call.
+            const toolUseId = block.toolUse.toolUseId;
+            if (toolUseId) {
+                if (seenToolUseIds.has(toolUseId)) continue;
+                seenToolUseIds.add(toolUseId);
+            }
+            toolCalls.push(block.toolUse);
         }
     }
     if (toolCalls.length === 0) return { executionFlow: [], toolsSummary: {} };
@@ -210,6 +247,43 @@ function extractAgentCoreExecutionFlow(records, botName) {
             executionPattern: `${botName}→${[...tools].join('→')}`
         }
     };
+}
+
+
+/**
+ * Token usage for one trace.
+ *
+ * The invoke_agent span already aggregates the whole turn, so it is preferred;
+ * summing the per-call chat spans is the fallback for a trace that ended before
+ * the agent span closed. Counts are reported rather than hardcoded to zero
+ * because a tool-using turn resends its whole tool catalogue on every cycle —
+ * the difference between one round and three is most of the bill.
+ */
+function extractTraceUsage(records) {
+    const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, llmCalls: 0 };
+    let agent = null;
+    let chatIn = 0;
+    let chatOut = 0;
+
+    for (const record of records) {
+        const attributes = record.attributes || {};
+        const operation = attributes['gen_ai.operation.name'];
+        // Only the model-named chat span is a real round-trip; its unnamed parent
+        // wraps it and would double-count.
+        if (operation === 'chat' && typeof record.name === 'string' && record.name.startsWith('chat ')) {
+            usage.llmCalls += 1;
+            chatIn += Number(attributes['gen_ai.usage.input_tokens'] || 0);
+            chatOut += Number(attributes['gen_ai.usage.output_tokens'] || 0);
+        }
+        if (operation === 'invoke_agent' && attributes['gen_ai.usage.input_tokens'] !== undefined) agent = attributes;
+    }
+
+    usage.inputTokens = Number(agent?.['gen_ai.usage.input_tokens'] ?? chatIn) || 0;
+    usage.outputTokens = Number(agent?.['gen_ai.usage.output_tokens'] ?? chatOut) || 0;
+    usage.totalTokens = Number(agent?.['gen_ai.usage.total_tokens'] || 0) || (usage.inputTokens + usage.outputTokens);
+    usage.cacheReadTokens = Number(agent?.['gen_ai.usage.cache_read_input_tokens'] || 0);
+    usage.cacheWriteTokens = Number(agent?.['gen_ai.usage.cache_write_input_tokens'] || 0);
+    return usage;
 }
 
 /**
@@ -252,6 +326,8 @@ function buildConversationPair(identity, content, logGroup, roleNameToResourceMa
         if (!modelId) modelId = known?.foundationModel;
     }
 
+    const usage = extractTraceUsage(records || []);
+
     return {
         timestamp: identity.startTimeUnixNano ? Math.floor(Number(identity.startTimeUnixNano) / 1e6) : Date.now(),
         requestId: identity.traceId || identity.spanId || '',
@@ -266,8 +342,12 @@ function buildConversationPair(identity, content, logGroup, roleNameToResourceMa
         operation: 'AGENTCORE_TRACE',
         accountId: AWS_ACCOUNT_ID,
         region: AWS_REGION,
-        inputTokenCount: 0,
-        outputTokenCount: 0,
+        inputTokenCount: usage.inputTokens,
+        outputTokenCount: usage.outputTokens,
+        totalTokenCount: usage.totalTokens,
+        cacheReadTokenCount: usage.cacheReadTokens,
+        cacheWriteTokenCount: usage.cacheWriteTokens,
+        llmCallCount: usage.llmCalls,
         userMessage: content.userMessage,
         agentResponse: content.agentResponse,
         traceData: { traceId: identity.traceId, sessionId: identity.sessionId, ...extractAgentCoreExecutionFlow(records || [], resourceName) }

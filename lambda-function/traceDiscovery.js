@@ -9,6 +9,7 @@
  */
 const { ListHarnessesCommand, GetHarnessCommand, ListAgentRuntimesCommand, GetAgentRuntimeCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
+const { getRoleSecurityProfile } = require('./iamPermissions');
 const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, bedrockAgentCoreControlClient, iamClient } = require('./config');
 const { buildAgentMessage } = require('./traceMessageBuilder');
 
@@ -153,11 +154,99 @@ async function addExecutionRoleAndPermissions(tags, executionRoleArn, prefix) {
     if (!executionRoleArn) return tags;
     try {
         const roleName = extractRoleNameFromArn(executionRoleArn);
-        return { ...tags, [`${prefix}-execution-role-arn`]: executionRoleArn, [`${prefix}-execution-role`]: roleName, [`${prefix}-role-policies`]: await getRolePolicies(roleName) };
+        return {
+            ...tags,
+            [`${prefix}-execution-role-arn`]: executionRoleArn,
+            [`${prefix}-execution-role`]: roleName,
+            // Policy names alone say which policies are attached, never what they
+            // permit. The security profile reads the documents behind them plus the
+            // inline policies, trust policy and permissions boundary.
+            ...await getRoleSecurityProfile(executionRoleArn, prefix)
+        };
     } catch (error) {
         console.error(`⚠️ Role lookup failed for role ${executionRoleArn}: ${error.message}`);
         return tags;
     }
+}
+
+
+/**
+ * Security summary of every AgentCore Gateway a harness is wired to.
+ *
+ * The harness's own role says what the harness may do; it says nothing about
+ * where its tool calls actually land. That lives on the gateway: the backend
+ * MCP endpoints, whether those backends are authenticated at all, which Lambda
+ * intercepts the traffic, and what the gateway's own execution role may reach.
+ * Without this, a tool call is a name with no destination.
+ *
+ * gatewayDiscovery is required lazily: it imports this module, so a top-level
+ * require would close a cycle and hand it a half-built exports object.
+ */
+async function summarizeHarnessGateways(gatewayArns) {
+    if (!gatewayArns.length) return {};
+    // eslint-disable-next-line global-require
+    const { getGatewayDetail, listGatewayTargets, getGatewayTargetDetail, readAttachedInterceptors, extractGatewayIdFromArn } = require('./gatewayDiscovery');
+
+    const ids = [];
+    const urls = [];
+    const authTypes = new Set();
+    const endpoints = [];
+    const targetAuth = [];
+    const interceptors = new Set();
+    const points = new Set();
+    let roleProfile = {};
+    let roleArn = '';
+
+    for (const gatewayArn of gatewayArns) {
+        const gatewayId = extractGatewayIdFromArn(gatewayArn);
+        if (!gatewayId) continue;
+        ids.push(gatewayId);
+        try {
+            const gateway = await getGatewayDetail(gatewayId);
+            if (!gateway) continue;
+            if (gateway.gatewayUrl) urls.push(gateway.gatewayUrl);
+            if (gateway.authorizerType) authTypes.add(gateway.authorizerType);
+            const attached = readAttachedInterceptors(gateway);
+            for (const arn of attached.arns) interceptors.add(arn);
+            for (const point of attached.points) points.add(point);
+            // One profile is enough: a harness almost always has a single gateway,
+            // and repeating 19 fields per gateway would swamp the tag set.
+            if (!roleArn && gateway.roleArn) {
+                roleArn = gateway.roleArn;
+                roleProfile = await getRoleSecurityProfile(gateway.roleArn, 'gateway');
+            }
+
+            for (const target of await listGatewayTargets(gatewayId)) {
+                const detail = await getGatewayTargetDetail(gatewayId, target.targetId);
+                const mcp = detail?.targetConfiguration?.mcp || {};
+                const endpoint = mcp?.mcpServer?.endpoint || mcp?.lambda?.arn || mcp?.openApiSchema?.s3?.uri || '';
+                const name = detail?.name || target.name || target.targetId;
+                if (endpoint) endpoints.push(`${name}=${endpoint}`);
+                // An empty credential-provider list means the gateway reaches this
+                // backend unauthenticated — worth stating outright, not by omission.
+                const providers = (detail?.credentialProviderConfigurations || [])
+                    .map((c) => c.credentialProviderType).filter(Boolean).join('|');
+                targetAuth.push(`${name}=${providers || 'none'}`);
+            }
+        } catch (error) {
+            console.error(`⚠️ Gateway summary failed for ${gatewayArn}: ${error.message}`);
+        }
+    }
+
+    return {
+        'gateway-ids': ids.join(','),
+        'gateway-urls': urls.join(','),
+        'gateway-auth-type': [...authTypes].sort().join(','),
+        'gateway-execution-role-arn': roleArn,
+        'gateway-execution-role': roleArn ? roleArn.split('/').pop() : '',
+        'gateway-target-endpoints': endpoints.join(','),
+        'gateway-target-auth': targetAuth.join(','),
+        'gateway-target-count': String(targetAuth.length),
+        'gateway-unauthenticated-targets': String(targetAuth.filter((t) => t.endsWith('=none')).length),
+        'gateway-interceptor-lambdas': [...interceptors].join(','),
+        'gateway-interception-points': [...points].sort().join(','),
+        ...roleProfile
+    };
 }
 
 /** Reads a harness's configured tools/skills and formats them as tag values. */
@@ -169,6 +258,13 @@ async function getHarnessToolsAndSkills(harnessId) {
         if (tools.length > 0) {
             tags['harness-configured-tools'] = tools.map((t) => `${t.toolName || t.name || t.toolSpec?.name || 'unknown'}:${t.type || t.toolSpec?.type || 'unknown'}`).join(',');
         }
+        // Which gateways this harness may call — the door its tool calls go through.
+        const gatewayArns = tools
+            .filter((t) => t.type === 'agentcore_gateway')
+            .map((t) => t.config?.agentCoreGateway?.gatewayArn)
+            .filter(Boolean);
+        Object.assign(tags, await summarizeHarnessGateways(gatewayArns));
+
         const skills = details?.skills || [];
         if (skills.length > 0) {
             tags['harness-configured-skills'] = skills.flatMap((skill) => Object.keys(skill).map((type) => {
@@ -184,20 +280,6 @@ async function getHarnessToolsAndSkills(harnessId) {
     }
 }
 
-/** Lists a role's attached managed policy names, cached per role for the invocation. */
-async function getRolePolicies(roleName) {
-    const cacheKey = `role-policies-${roleName}`;
-    if (tagsCache[cacheKey]) return tagsCache[cacheKey];
-    try {
-        const response = await iamClient.send(new ListAttachedRolePoliciesCommand({ RoleName: roleName }));
-        const policies = response.AttachedPolicies?.map((p) => p.PolicyName).join(',') || '';
-        tagsCache[cacheKey] = policies;
-        return policies;
-    } catch (error) {
-        console.error(`⚠️ Policy list failed for role ${roleName}: ${error.message}`);
-        return '';
-    }
-}
 
 /** Extracts the role name from the end of an IAM role ARN. */
 function extractRoleNameFromArn(roleArn) {
@@ -218,6 +300,22 @@ function getHarnessId(roleSuffix) { return roleSuffix ? (harnessIdCache[roleSuff
 /** Looks up a harness's execution role ARN from its role suffix. */
 function getHarnessExecutionRoleArn(roleSuffix) { return roleSuffix ? (harnessExecutionRoleCache[roleSuffix] || '') : ''; }
 
+
+/**
+ * The role/permission subset of a tag set, for mirroring into awsMetadata.
+ *
+ * Deliberately duplicated: `tag` is a JSON string a consumer has to parse
+ * separately, so anything needed to answer "what could this agent do" is also
+ * placed in the message body next to the trace it describes.
+ */
+function roleFields(tags, prefix) {
+    const picked = {};
+    for (const [key, value] of Object.entries(tags)) {
+        if (key.startsWith(`${prefix}-role-`) || key === `${prefix}-permissions-boundary`) picked[key] = value;
+    }
+    return picked;
+}
+
 /** Builds one AKTO message from a conversation pair: resolves the bot name, fetches and enriches tags, then hands off to buildAgentMessage. */
 async function createStandardMessage(pair) {
     pair.botName = pair.resourceName || (pair.logType === 'HARNESS' ? getHarnessName(pair.harnessRoleSuffix) : '');
@@ -236,20 +334,33 @@ async function createStandardMessage(pair) {
             'harness-configured-skills': toolsAndSkills['harness-configured-skills'] || '',
             model: pair.modelId,
             'harness-execution-role': harnessTags['harness-execution-role'] || '',
+            'harness-execution-role-arn': harnessTags['harness-execution-role-arn'] || '',
+            ...roleFields(harnessTags, 'harness'),
             traceData: pair.traceData || {}
         };
     } else if (pair.logType === 'RUNTIME' && pair.runtimeId) {
         const runtimeArn = `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:runtime/${pair.runtimeId}`;
         runtimeTags = await fetchTagsCached(`runtime-${pair.runtimeId}`, () => getAgentRuntimeTags(runtimeArn));
         runtimeTags = await addRuntimeRoleAndPermissions(runtimeTags, pair.executionRoleArn);
-        if (pair.traceData?.sessionId) runtimeTags['session-id'] = pair.traceData.sessionId;
-        if (pair.traceData?.traceId) runtimeTags['trace-id'] = pair.traceData.traceId;
         awsMetadata = {
             model: pair.modelId,
             'runtime-execution-role': runtimeTags['runtime-execution-role'] || '',
+            'runtime-execution-role-arn': runtimeTags['runtime-execution-role-arn'] || '',
+            ...roleFields(runtimeTags, 'runtime'),
             traceData: pair.traceData || {}
         };
     }
+
+    // The AgentCore session is the only real conversation identifier either pipeline
+    // has (Bedrock's own invocation logs carry none), so it is tagged for every log
+    // type rather than only RUNTIME as it was — a Harness turn is just as much part
+    // of a session as a Runtime turn, and without it multi-turn traffic cannot be
+    // grouped at all.
+    const traceTags = {};
+    if (pair.traceData?.sessionId) traceTags['session-id'] = pair.traceData.sessionId;
+    if (pair.traceData?.traceId) traceTags['trace-id'] = pair.traceData.traceId;
+    if (pair.logType === 'HARNESS') Object.assign(harnessTags, traceTags);
+    else if (pair.logType === 'RUNTIME') Object.assign(runtimeTags, traceTags);
 
     return buildAgentMessage({ ...pair, accountId: pair.accountId || AWS_ACCOUNT_ID, region: pair.region || AWS_REGION, harnessTags, runtimeTags, awsMetadata }, true);
 }
