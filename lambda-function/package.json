@@ -4,8 +4,8 @@
   "description": "AKTO Bedrock Log Processor - Client-side Lambda function for processing AWS Bedrock conversation logs",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "package": "npm install && zip -r ../akto-bedrock-processor.zip . -x '*.git*' 'node_modules/.cache/*'",
+    "test": "node --test test/identityActor.test.js",
+    "package": "npm install && zip -r ../akto-bedrock-processor.zip . -x '*.git*' 'test/*' 'node_modules/.cache/*'",
     "deploy": "npm run package && aws lambda update-function-code --function-name akto-bedrock-log-processor --zip-file fileb://../akto-bedrock-processor.zip"
   },
   "keywords": [
@@ -23,7 +23,8 @@
     "@aws-sdk/client-bedrock-agentcore-control": "^3.682.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.682.0",
     "@aws-sdk/client-iam": "^3.682.0",
-    "@aws-sdk/client-s3": "^3.682.0"
+    "@aws-sdk/client-s3": "^3.682.0",
+    "@aws-sdk/util-arn-parser": "^3.682.0"
   },
   "engines": {
     "node": ">=22.x"

@@ -7,9 +7,20 @@ const { gunzip } = require('zlib');
 const { promisify } = require('util');
 const { s3Client, LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS } = require('./config');
 const { extractConversationPairs, extractTraceData } = require('./extractors');
-const { fetchAgentName, createStandardMessage, findResourceByArn } = require('./discovery');
+const { fetchAgentName, createStandardMessage, findResourceByArn, buildServiceAgentDiscoveryMessage } = require('./discovery');
 
 const gunzipAsync = promisify(gunzip);
+
+const logStats = {
+    agentCalls: 0,              // resolved to a discovered Bedrock Agent — ingested
+    serviceAgentIngested: 0,        // an app or person calling a model directly — ingested, named after the caller
+    serviceAgentCalls: 0,           // dropped: shared role the session couldn't narrow, or ingestion turned off
+    noIdentity: 0,              // no usable identity ARN at all
+    noConversation: 0,          // parsed fine, but carried no complete exchange
+    unparseableLines: 0
+};
+function resetLogStats() { for (const key of Object.keys(logStats)) logStats[key] = 0; }
+function getLogStats() { return { ...logStats }; }
 
 /**
  * Parses an S3 path (s3://bucket/key) into bucket and key components.
@@ -115,6 +126,10 @@ async function getUnprocessedLogFiles(manifest) {
     const startTime = getLogsStartTime(manifest);
     let allFiles = [];
     let continuationToken;
+    let pages = 0;
+
+
+    console.log(`🪣 Listing s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} for .gz logs newer than ${startTime.toISOString()}`);
 
     do {
         const response = await s3Client.send(new ListObjectsV2Command({
@@ -125,19 +140,55 @@ async function getUnprocessedLogFiles(manifest) {
         }));
         allFiles.push(...(response.Contents || []));
         continuationToken = response.NextContinuationToken;
+        pages++;
     } while (continuationToken);
 
+    /*
+     * Bedrock writes large request/response bodies as separate objects under a
+     * `data/` folder in this same prefix, and the log entry that owns one points at
+     * it with inputBodyS3Path. Those bodies are NOT log entries — they carry no
+     * identity, timestamp or model — so reading them as log files costs a GET, a
+     * gunzip and a parse to produce nothing, and inflates the "no usable identity"
+     * count with things that were never identities.
+     *
+     * They are still fully read, just through their owning entry (getInputBodyJson),
+     * which is the only path that has the context to turn them into a message.
+     */
+    const isBodyObject = (key) => key.includes('/data/');
+    const bodyObjects = allFiles.filter((file) => file.Key.endsWith('.gz') && isBodyObject(file.Key)).length;
+
     const logFiles = allFiles
-        .filter((file) => file.Key.endsWith('.gz') && file.Size > 0)
+        .filter((file) => file.Key.endsWith('.gz') && file.Size > 0 && !isBodyObject(file.Key))
         .sort((a, b) => new Date(a.LastModified) - new Date(b.LastModified));
 
     const unprocessed = logFiles.filter((file) => new Date(file.LastModified) > startTime);
-    console.log(`📊 ${allFiles.length} total objects, ${logFiles.length} .gz log files, ${unprocessed.length} newer than checkpoint`);
+    console.log(`📊 ${allFiles.length} object(s) across ${pages} page(s), ${logFiles.length} .gz log file(s), ${unprocessed.length} newer than checkpoint`);
+    if (bodyObjects > 0) {
+        console.log(`📦 ${bodyObjects} large-payload body object(s) under data/ skipped in the listing — they are fetched via inputBodyS3Path by the entries that own them`);
+    }
+
+    // Turn each "nothing to do" case into a specific, actionable reason.
+    if (allFiles.length === 0) {
+        console.warn(`⚠️ Nothing at s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} — check LOGS_PREFIX matches where Bedrock actually delivers, and that model invocation logging is enabled for this account/region`);
+    } else if (logFiles.length === 0) {
+        const sample = allFiles.slice(0, 3).map((f) => f.Key).join(', ');
+        console.warn(`⚠️ Objects exist under the prefix but none are .gz Bedrock logs. First key(s): ${sample} — LOGS_PREFIX may be pointing at the wrong level`);
+    } else if (unprocessed.length === 0) {
+        const newest = logFiles[logFiles.length - 1];
+        console.log(`✅ Up to date — newest log file is ${newest.Key} (${new Date(newest.LastModified).toISOString()}), at or before the checkpoint`);
+    } else {
+        console.log(`📄 Oldest unprocessed: ${unprocessed[0].Key} (${new Date(unprocessed[0].LastModified).toISOString()})`);
+    }
     return unprocessed;
 }
 
-/** Downloads, gunzips, and extracts AKTO messages from every log entry in one S3 object. */
-async function processLogFile(bucket, key) {
+/**
+ * Downloads, gunzips, and extracts AKTO messages from every log entry in one S3 object.
+ * `discoveredAgents` is passed through so a first-seen SERVICE_AGENT caller (no ListAgents-
+ * style API exists to discover those upfront) gets its one-time discovery message the
+ * moment its first log entry is read, and is recorded so it isn't sent again.
+ */
+async function processLogFile(bucket, key, discoveredAgents) {
     const s3Object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const chunks = [];
     for await (const chunk of s3Object.Body) chunks.push(chunk);
@@ -147,8 +198,9 @@ async function processLogFile(bucket, key) {
     const messages = [];
     for (const line of lines) {
         try {
-            messages.push(...await processBedrockLogEntry(JSON.parse(line)));
+            messages.push(...await processBedrockLogEntry(JSON.parse(line), discoveredAgents));
         } catch (parseError) {
+            logStats.unparseableLines++;
             console.warn(`⚠️ Skipping unparseable log line in ${key}: ${parseError.message}`);
         }
     }
@@ -157,13 +209,18 @@ async function processLogFile(bucket, key) {
 }
 
 /** Turns one raw Bedrock log-entry JSON line into zero or more AKTO messages. */
-async function processBedrockLogEntry(logEntry) {
+async function processBedrockLogEntry(logEntry, discoveredAgents) {
     const messages = [];
     try {
-        // Resolve resource from ARN using discovery mappings
+        // Resolve resource from ARN using discovery mappings. Only traffic that maps
+        // to a discovered agent is ingested — a model invoked directly by an
+        // application or a person is out of scope for this pipeline and is skipped.
         const resource = findResourceByArn(logEntry.identity?.arn);
         if (!resource) {
-            console.warn(`⚠️ Skipping log entry - cannot determine resource from ARN`);
+            // Either no identity at all, or a shared role the session couldn't narrow.
+            // Everything else — including traffic no agent owns — comes back resolved.
+            if (logEntry.identity?.arn) logStats.serviceAgentCalls++;
+            else logStats.noIdentity++;
             return messages;
         }
 
@@ -175,13 +232,43 @@ async function processBedrockLogEntry(logEntry) {
         if (resolvedInputBody) logEntry.input = { ...logEntry.input, inputBodyJson: resolvedInputBody };
         if (resolvedOutputBody) logEntry.output = { ...logEntry.output, outputBodyJson: resolvedOutputBody };
 
+        if (resource.type === 'AGENT') logStats.agentCalls++;
+        else if (resource.type === 'SERVICE_AGENT') logStats.serviceAgentIngested++;
+
         const pairs = extractConversationPairs(logEntry);
+        if (pairs.length === 0) logStats.noConversation++;
         for (const pair of pairs) {
             // Populate from discovered resource
             pair.logType = resource.type;
             if (resource.type === 'AGENT') {
                 pair.agentId = resource.agentId;
-                pair.botName = await fetchAgentName(resource.agentId);
+                // Name and execution role both come from the role map (i.e. the
+                // manifest), so neither costs a GetAgent call.
+                pair.botName = await fetchAgentName(resource.agentId, resource.agentName);
+                pair.executionRoleArn = resource.executionRoleArn || '';
+            } else if (resource.type === 'SERVICE_AGENT') {
+                // Direct model invocation: attributed to the calling principal. Reuses
+                // the agent-id tag slot — a caller has no AWS resource ID of its own,
+                // but still needs a stable, non-empty identity to be discovered/grouped by.
+                pair.agentId = resource.callerName;
+                pair.botName = resource.callerName;
+                pair.callerKind = resource.callerKind;
+
+                // No ListAgents-equivalent API enumerates callers upfront, so this is the
+                // only place a SERVICE_AGENT caller can be recognized as first-seen — persisted
+                // into discoveredAgents (same manifest-backed map real agents use) so the
+                // discovery message goes out exactly once per caller, not once per log entry.
+                const serviceAgentKey = `serviceagent-${resource.callerName}`;
+                if (discoveredAgents && !discoveredAgents[serviceAgentKey]) {
+                    messages.push(buildServiceAgentDiscoveryMessage(resource, logEntry));
+                    discoveredAgents[serviceAgentKey] = {
+                        resourceId: resource.callerName,
+                        resourceType: 'SERVICE_AGENT',
+                        resourceName: resource.callerName,
+                        callerKind: resource.callerKind,
+                        discoveredAt: new Date().toISOString()
+                    };
+                }
             } else if (resource.type === 'HARNESS') {
                 pair.harnessId = resource.harnessId;
                 pair.harnessName = resource.harnessName;
@@ -201,4 +288,4 @@ async function processBedrockLogEntry(logEntry) {
     return messages;
 }
 
-module.exports = { getUnprocessedLogFiles, processLogFile };
+module.exports = { getUnprocessedLogFiles, processLogFile, resetLogStats, getLogStats };
