@@ -24,14 +24,14 @@ async function getTraceManifest() {
             + `${Object.keys(manifest.logGroupCheckpoints || {}).length} known log group(s)`
             + (sampleCount ? `, ${sampleCount} trace log sample(s) on record` : '')
         );
-        return { discoveredAgents: {}, logGroupCheckpoints: {}, logGroupSamples: {}, ...manifest };
+        return { discoveredAgents: {}, logGroupCheckpoints: {}, logGroupSamples: {}, logGroupWalkCursor: '', ...manifest };
     } catch (error) {
         if (error.name === 'NoSuchKey') {
             console.log('📝 No trace manifest found — first run');
         } else {
             console.error(`⚠️ Error reading trace manifest, treating as first run: ${error.message}`);
         }
-        return { discoveredAgents: {}, logGroupCheckpoints: {}, logGroupSamples: {} };
+        return { discoveredAgents: {}, logGroupCheckpoints: {}, logGroupSamples: {}, logGroupWalkCursor: '' };
     }
 }
 
@@ -41,19 +41,22 @@ async function getTraceManifest() {
  * tradeoff is that a batch may get reprocessed next run, which is a safe
  * direction to fail in (possible duplicate) versus silently losing data.
  */
-async function updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples) {
+async function updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor) {
     try {
         let mergedSamples = logGroupSamples;
-        if (mergedSamples === undefined) {
+        let mergedCursor = logGroupWalkCursor;
+        if (mergedSamples === undefined || mergedCursor === undefined) {
             const existing = await getTraceManifest();
-            mergedSamples = existing.logGroupSamples || {};
+            if (mergedSamples === undefined) mergedSamples = existing.logGroupSamples || {};
+            if (mergedCursor === undefined) mergedCursor = existing.logGroupWalkCursor || '';
         }
         const manifest = {
             version: '1.0',
             lastManifestUpdate: new Date().toISOString(),
             discoveredAgents: discoveredAgents || {},
             logGroupCheckpoints: logGroupCheckpoints || {},
-            logGroupSamples: mergedSamples || {}
+            logGroupSamples: mergedSamples || {},
+            logGroupWalkCursor: mergedCursor || ''
         };
         await config.markersS3Client.send(new PutObjectCommand({
             Bucket: MARKERS_BUCKET_NAME,
@@ -66,6 +69,7 @@ async function updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGro
             `✅ Trace manifest checkpointed: ${Object.keys(manifest.discoveredAgents).length} known resource(s), `
             + `${Object.keys(manifest.logGroupCheckpoints).length} log group(s) tracked`
             + (sampleKeys ? `, ${sampleKeys} trace log sample(s) indexed` : '')
+            + (manifest.logGroupWalkCursor ? `, walk cursor=${manifest.logGroupWalkCursor}` : '')
         );
     } catch (error) {
         console.error(`❌ Error checkpointing trace manifest: ${error.message}`);

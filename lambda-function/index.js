@@ -23,6 +23,7 @@ const { discoverObservabilityLogGroups, fetchNewLogEvents } = require('./logGrou
 const { classifyRecord, parseLogRecord, resolveTraceIdentity, resolveTraceContent, buildConversationPair } = require('./traceParser');
 const { getTraceManifest, updateTraceManifest } = require('./traceManifest');
 const { captureLogGroupSampleIfNeeded } = require('./traceLogSampleCapture');
+const { orderLogGroupsForWalk, checkpointEmptyLogGroupPoll } = require('./logGroupWalk');
 
 let traceHarnessInitialized = false;
 
@@ -109,7 +110,7 @@ async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, 
 }
 
 /** Same as flush(), but for the AgentCore trace pipeline's manifest shape. */
-async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeLeft, pendingDiscovery = null, logGroupSamples) {
+async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeLeft, pendingDiscovery = null, logGroupSamples, logGroupWalkCursor) {
     if (messages.length === 0) return 0;
     console.log(`📤 Flushing ${messages.length} AgentCore message(s) to AKTO Ingestion API...`);
     const { sent, quarantined } = await sendToDataIngestionService(messages, timeLeft);
@@ -119,12 +120,12 @@ async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeL
     if (pendingDiscovery) {
         applyPendingDiscovery(discoveredAgents, pendingDiscovery, sent, messages.length, quarantined.length);
         if (sent === messages.length && quarantined.length === 0) {
-            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples);
+            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
         }
         console.log(`✅ AgentCore discovery flush: ${sent} message(s) accepted by ingest`);
         return sent;
     }
-    await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples);
+    await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
     console.log(`✅ AgentCore flush: ${sent} message(s) accepted by ingest`);
     return sent;
 }
@@ -293,6 +294,7 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
     const discoveredAgents = { ...(traceManifest.discoveredAgents || {}) };
     const logGroupCheckpoints = { ...(traceManifest.logGroupCheckpoints || {}) };
     let logGroupSamples = { ...(traceManifest.logGroupSamples || {}) };
+    let logGroupWalkCursor = traceManifest.logGroupWalkCursor || '';
     const traceSampleCaptureState = { capturesThisRun: 0 };
     let totalSent = 0;
 
@@ -300,7 +302,7 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
     const { messages: discoveryMessages, pending: discoveryPending } = await discoverNewResources(discoveredAgents, timeLeft);
     console.log(`✅ AgentCore discovery: ${discoveryMessages.length} new harness/runtime resource(s) found`);
     if (discoveryMessages.length > 0) {
-        totalSent += await flushTrace(discoveryMessages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, discoveryPending, logGroupSamples);
+        totalSent += await flushTrace(discoveryMessages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, discoveryPending, logGroupSamples, logGroupWalkCursor);
     }
 
     await backfillExecutionRoleArns(discoveredAgents, timeLeft);
@@ -317,10 +319,16 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
     }
 
     const lookbackMs = Date.now() - config.TRACE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+    const walkPlan = orderLogGroupsForWalk(logGroups, logGroupCheckpoints, logGroupWalkCursor);
+    const orderedLogGroups = walkPlan.groups;
+    console.log(
+        `🧭 Log group walk: ${walkPlan.uncheckedCount} without checkpoint, ${walkPlan.checkedCount} with checkpoint`
+        + (logGroupWalkCursor ? `, resume checked queue after ${logGroupWalkCursor}` : '')
+    );
 
-    for (const logGroup of logGroups) {
+    for (const logGroup of orderedLogGroups) {
         if (timeLeft() < config.TIME_SAFETY_MARGIN_MS) {
-            groupsDeferred = logGroups.length - groupsProcessed;
+            groupsDeferred = orderedLogGroups.length - groupsProcessed;
             console.warn(`⏱️ ${timeLeft()}ms left — stopping early, ${groupsDeferred} AgentCore log group(s) deferred to next run`);
             break;
         }
@@ -328,9 +336,10 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         const sinceMs = logGroupCheckpoints[logGroup.logGroupName]?.lastEventTimestamp || lookbackMs;
         const { events, latestTimestamp, accessDenied } = await fetchNewLogEvents(logGroup.logGroupName, sinceMs, timeLeft, config.TIME_SAFETY_MARGIN_MS);
         groupsProcessed++;
+        logGroupWalkCursor = logGroup.logGroupName;
 
         if (accessDenied) {
-            groupsDeferred = logGroups.length - groupsProcessed;
+            groupsDeferred = orderedLogGroups.length - groupsProcessed;
             console.warn(
                 `🚫 logs:FilterLogEvents denied — skipping trace ingest for ${groupsDeferred} remaining log group(s) this run. `
                 + `AgentCore inventory discovery already ran above. Fix customer IAM Resource to `
@@ -339,7 +348,10 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
             break;
         }
 
-        if (events.length === 0) continue;
+        if (events.length === 0) {
+            checkpointEmptyLogGroupPoll(logGroupCheckpoints, logGroup, Date.now());
+            continue;
+        }
 
         logGroupSamples = await captureLogGroupSampleIfNeeded(
             events,
@@ -355,12 +367,16 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         logGroupCheckpoints[logGroup.logGroupName] = { lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId };
 
         if (messages.length > 0) {
-            totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, null, logGroupSamples);
+            totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, null, logGroupSamples, logGroupWalkCursor);
         } else {
             // No messages built, but there's no unsent data at risk — checkpoint now
             // so this log group doesn't re-scan the same events every run.
-            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples);
+            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
         }
+    }
+
+    if (groupsProcessed > 0) {
+        await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
     }
 
     if (traceSampleCaptureState.capturesThisRun > 0) {
