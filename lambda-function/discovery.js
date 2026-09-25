@@ -244,10 +244,11 @@ function buildServiceAgentDiscoveryMessage(resource, logEntry) {
  */
 async function discoverAllNewAgents(discoveredAgents, timeLeft) {
     const messages = [];
+    const pending = {};
 
     const agents = await listAllAgents();
     for (const agent of agents) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining agent discovery'); return messages; }
+        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining agent discovery'); return { messages, pending }; }
         const key = `agent-${agent.agentId}`;
         if (discoveredAgents[key]) continue;
         try {
@@ -257,11 +258,8 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
             agentTags = await addAgentRoleAndPermissions(agentTags, agent.agentId);
             const arn = metadata.agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`;
             messages.push(buildAgentMessage({ ...metadata, resourceType: 'AGENT', arn, agentTags, harnessTags: {} }, false));
-            // The execution role is persisted with the agent so the role map can be
-            // rebuilt from the manifest instead of re-querying every agent each run —
-            // and so "which role belongs to which agent" is answerable from the
-            // manifest rather than by reading logs.
-            discoveredAgents[key] = {
+            // Checkpointed only after AKTO ingest succeeds (see index.flush pendingDiscovery).
+            pending[key] = {
                 resourceId: agent.agentId,
                 resourceType: 'AGENT',
                 resourceName: agent.agentName,
@@ -293,7 +291,7 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
         }
     }
 
-    return messages;
+    return { messages, pending };
 }
 
 /**

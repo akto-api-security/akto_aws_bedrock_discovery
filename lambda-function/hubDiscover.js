@@ -56,8 +56,15 @@ async function discoverTargets(roleArn, externalId) {
 
     for (const region of REGIONS) {
         const activity = await regionActivity(credentials, region);
-        if (!activity.active || !activity.logsBucket) continue;
-        targets.push({ roleArn, externalId, accountId, region, logsBucket: activity.logsBucket, logsPrefix: activity.logsPrefix });
+        if (!activity.active) continue;
+        targets.push({
+            roleArn,
+            externalId,
+            accountId,
+            region,
+            logsBucket: activity.logsBucket || '',
+            logsPrefix: activity.logsPrefix || 'AWSLogs/'
+        });
     }
     return targets;
 }

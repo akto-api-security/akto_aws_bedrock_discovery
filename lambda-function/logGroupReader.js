@@ -74,9 +74,12 @@ async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarg
             nextToken = response.nextToken;
         } while (nextToken);
     } catch (error) {
+        const accessDenied = error.name === 'AccessDeniedException'
+            || /not authorized to perform:\s*logs:FilterLogEvents/i.test(error.message || '');
         console.error(`❌ FilterLogEvents failed for ${logGroupName}: ${error.message}`);
+        return { events, latestTimestamp, accessDenied };
     }
-    return { events, latestTimestamp };
+    return { events, latestTimestamp, accessDenied: false };
 }
 
 module.exports = { discoverObservabilityLogGroups, fetchNewLogEvents, extractRuntimeIdFromLogGroupName };

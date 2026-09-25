@@ -121,7 +121,7 @@ async function initAwsClients() {
 }
 
 function validateConfig() {
-    const required = { LOGS_BUCKET_NAME, LOGS_PREFIX, MARKERS_BUCKET_NAME, DATA_INGESTION_ENDPOINT, AKTO_API_KEY };
+    const required = { LOGS_PREFIX, MARKERS_BUCKET_NAME, DATA_INGESTION_ENDPOINT, AKTO_API_KEY };
     for (const [key, value] of Object.entries(required)) {
         if (!value || !String(value).trim()) throw new Error(`${key} environment variable is required`);
     }

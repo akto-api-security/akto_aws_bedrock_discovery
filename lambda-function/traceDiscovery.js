@@ -431,10 +431,11 @@ function buildHarnessNameToResourceMap(discoveredAgents) {
  */
 async function discoverNewResources(discoveredAgents, timeLeft) {
     const messages = [];
+    const pending = {};
 
     const harnesses = await listAllHarnesses();
     for (const harness of harnesses) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining harness discovery'); return messages; }
+        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining harness discovery'); return { messages, pending }; }
         const key = `harness-${harness.harnessId}`;
         if (discoveredAgents[key]) continue;
         try {
@@ -448,7 +449,7 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
                 ...metadata, resourceType: 'HARNESS', harnessId: harness.harnessId, harnessName: harness.harnessName, arn,
                 harnessTags, agentStatus: metadata.status || 'PREPARED', foundationModel
             }, false));
-            discoveredAgents[key] = { resourceId: harness.harnessId, resourceType: 'HARNESS', resourceName: harness.harnessName, foundationModel, executionRoleArn: metadata.executionRoleArn || '', discoveredAt: new Date().toISOString() };
+            pending[key] = { resourceId: harness.harnessId, resourceType: 'HARNESS', resourceName: harness.harnessName, foundationModel, executionRoleArn: metadata.executionRoleArn || '', discoveredAt: new Date().toISOString() };
         } catch (error) {
             console.error(`⚠️ Discovery failed for harness ${harness.harnessId}: ${error.message}`);
         }
@@ -456,7 +457,7 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
 
     const runtimes = await listAllAgentRuntimes();
     for (const runtime of runtimes) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining runtime discovery'); return messages; }
+        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining runtime discovery'); return { messages, pending }; }
         const key = `runtime-${runtime.agentRuntimeId}`;
         if (discoveredAgents[key]) continue;
 
@@ -475,15 +476,15 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
                 resourceType: 'RUNTIME', runtimeId: runtime.agentRuntimeId, runtimeName: runtime.agentRuntimeName, arn,
                 description: metadata.description, executionRoleArn: metadata.roleArn,
                 agentStatus: metadata.status || 'UNKNOWN', createdAt: metadata.createdAt, updatedAt: metadata.lastUpdatedAt,
-                harnessTags: {}, runtimeTags
+                harnessTags: {}, runtimeTags, foundationModel: metadata.foundationModel || 'N/A'
             }, false));
-            discoveredAgents[key] = { resourceId: runtime.agentRuntimeId, resourceType: 'RUNTIME', resourceName: runtime.agentRuntimeName, executionRoleArn: metadata.roleArn || '', discoveredAt: new Date().toISOString() };
+            pending[key] = { resourceId: runtime.agentRuntimeId, resourceType: 'RUNTIME', resourceName: runtime.agentRuntimeName, executionRoleArn: metadata.roleArn || '', discoveredAt: new Date().toISOString() };
         } catch (error) {
             console.error(`⚠️ Discovery failed for runtime ${runtime.agentRuntimeId}: ${error.message}`);
         }
     }
 
-    return messages;
+    return { messages, pending };
 }
 
 module.exports = {

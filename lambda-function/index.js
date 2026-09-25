@@ -22,6 +22,7 @@ const {
 const { discoverObservabilityLogGroups, fetchNewLogEvents } = require('./logGroupReader');
 const { classifyRecord, parseLogRecord, resolveTraceIdentity, resolveTraceContent, buildConversationPair } = require('./traceParser');
 const { getTraceManifest, updateTraceManifest } = require('./traceManifest');
+const { captureLogGroupSampleIfNeeded } = require('./traceLogSampleCapture');
 
 let traceHarnessInitialized = false;
 
@@ -45,7 +46,10 @@ function logEffectiveConfig() {
     console.log('⚙️ Effective configuration:');
     console.log(`  ├─ build               ${config.CODE_VERSION}`);
     console.log(`  ├─ region              ${config.AWS_REGION} (account ${config.AWS_ACCOUNT_ID})`);
-    console.log(`  ├─ bedrock logs        s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}`);
+    const logsLoc = config.LOGS_BUCKET_NAME
+        ? `s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}`
+        : '(none — discovery-only until S3 logging is configured)';
+    console.log(`  ├─ bedrock logs        ${logsLoc}`);
     console.log(`  ├─ checkpoints         s3://${config.MARKERS_BUCKET_NAME}/${config.MARKERS_PREFIX}`);
     console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}*`);
     console.log(`  ├─ akto ingest host    ${ingestHost} (api key ${config.AKTO_API_KEY ? 'set' : 'MISSING'})`);
@@ -66,11 +70,26 @@ async function checkpoint(discoveredAgents, filesProcessed, lastTimestamp, faile
     await updateManifest(filesProcessed, discoveredAgents, lastTimestamp, failedFiles, failedMessages);
 }
 
+/** Merges discovery manifest entries only when every discovery message was accepted by ingest. */
+function applyPendingDiscovery(discoveredAgents, pendingDiscovery, sent, totalMessages, quarantinedCount) {
+    if (!pendingDiscovery || Object.keys(pendingDiscovery).length === 0) return;
+    if (quarantinedCount > 0) {
+        console.error(`🚫 Discovery ingest quarantined ${quarantinedCount} message(s) — not marking those resources in manifest (will retry)`);
+        return;
+    }
+    if (sent !== totalMessages) {
+        console.warn(`⚠️ Discovery ingest accepted ${sent}/${totalMessages} — not checkpointing new resources (will retry)`);
+        return;
+    }
+    Object.assign(discoveredAgents, pendingDiscovery);
+    console.log(`✅ Recorded ${Object.keys(pendingDiscovery).length} newly discovered resource(s) in manifest after ingest`);
+}
+
 /**
  * Sends a batch to AKTO, THEN checkpoints — in that order, so a failed send
  * never advances "last processed" past data that was never actually delivered.
  */
-async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, failedFiles, timeLeft, failedMessages = []) {
+async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, failedFiles, timeLeft, failedMessages = [], pendingDiscovery = null) {
     if (messages.length === 0) {
         // Nothing to deliver, but the files were still read — record that.
         console.log(`⏭️ Nothing to send; checkpointing file progress only`);
@@ -83,17 +102,31 @@ async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, 
     // will refuse them identically next run. Checkpointing past them is what stops
     // the run replaying the messages that DID land alongside them.
     if (quarantined.length > 0) failedMessages.push(...quarantined);
+    applyPendingDiscovery(discoveredAgents, pendingDiscovery, sent, messages.length, quarantined.length);
     console.log(`✅ Sent ${sent} message(s) to AKTO${quarantined.length ? `, ${quarantined.length} quarantined` : ''}`);
     await checkpoint(discoveredAgents, filesProcessed, lastTimestamp, failedFiles, failedMessages);
     return sent;
 }
 
 /** Same as flush(), but for the AgentCore trace pipeline's manifest shape. */
-async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeLeft) {
+async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeLeft, pendingDiscovery = null, logGroupSamples) {
     if (messages.length === 0) return 0;
-    await sendToDataIngestionService(messages, timeLeft);
-    await updateTraceManifest(discoveredAgents, logGroupCheckpoints);
-    return messages.length;
+    console.log(`📤 Flushing ${messages.length} AgentCore message(s) to AKTO Ingestion API...`);
+    const { sent, quarantined } = await sendToDataIngestionService(messages, timeLeft);
+    if (quarantined.length > 0) {
+        console.warn(`🚫 ${quarantined.length} AgentCore message(s) permanently rejected by ingest`);
+    }
+    if (pendingDiscovery) {
+        applyPendingDiscovery(discoveredAgents, pendingDiscovery, sent, messages.length, quarantined.length);
+        if (sent === messages.length && quarantined.length === 0) {
+            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples);
+        }
+        console.log(`✅ AgentCore discovery flush: ${sent} message(s) accepted by ingest`);
+        return sent;
+    }
+    await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples);
+    console.log(`✅ AgentCore flush: ${sent} message(s) accepted by ingest`);
+    return sent;
 }
 
 /**
@@ -164,11 +197,26 @@ async function runS3Pipeline(timeLeft, sendTimeLeft) {
     await rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft);
 
     console.log('📋 Discovering agents...');
-    const discoveryMessages = await discoverAllNewAgents(discoveredAgents, timeLeft);
-    console.log(`✅ Discovery: ${discoveryMessages.length} new resource(s) found`);
+    const { messages: discoveryMessages, pending: discoveryPending } = await discoverAllNewAgents(discoveredAgents, timeLeft);
+    console.log(`✅ Discovery: ${discoveryMessages.length} new Bedrock Agent Classic resource(s) found`);
 
     if (discoveryMessages.length > 0) {
-        totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp, [], sendTimeLeft, failedMessages);
+        totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp, [], sendTimeLeft, failedMessages, discoveryPending);
+    }
+
+    const logsBucketConfigured = Boolean(config.LOGS_BUCKET_NAME && String(config.LOGS_BUCKET_NAME).trim());
+    if (!logsBucketConfigured) {
+        console.log('ℹ️ No Bedrock S3 logs bucket — skipping log file processing (agent discovery still ran)');
+        const stats = { ...getLogStats(), ...getIdentityStats() };
+        console.log(`🎉 Bedrock Agent Classic done. Files processed: 0, failed: 0, deferred: 0, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
+        return {
+            filesDone: 0,
+            filesFailed: 0,
+            filesDeferred: 0,
+            totalSent,
+            messagesQuarantined: failedMessages.length,
+            traffic: stats
+        };
     }
 
     const unprocessedFiles = await getUnprocessedLogFiles(manifest);
@@ -244,13 +292,15 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
     const traceManifest = await getTraceManifest();
     const discoveredAgents = { ...(traceManifest.discoveredAgents || {}) };
     const logGroupCheckpoints = { ...(traceManifest.logGroupCheckpoints || {}) };
+    let logGroupSamples = { ...(traceManifest.logGroupSamples || {}) };
+    const traceSampleCaptureState = { capturesThisRun: 0 };
     let totalSent = 0;
 
     console.log('📋 Discovering AgentCore harnesses/runtimes...');
-    const discoveryMessages = await discoverNewResources(discoveredAgents, timeLeft);
-    console.log(`✅ AgentCore discovery: ${discoveryMessages.length} new resource(s) found`);
+    const { messages: discoveryMessages, pending: discoveryPending } = await discoverNewResources(discoveredAgents, timeLeft);
+    console.log(`✅ AgentCore discovery: ${discoveryMessages.length} new harness/runtime resource(s) found`);
     if (discoveryMessages.length > 0) {
-        totalSent += await flushTrace(discoveryMessages, discoveredAgents, logGroupCheckpoints, sendTimeLeft);
+        totalSent += await flushTrace(discoveryMessages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, discoveryPending, logGroupSamples);
     }
 
     await backfillExecutionRoleArns(discoveredAgents, timeLeft);
@@ -276,10 +326,28 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         }
 
         const sinceMs = logGroupCheckpoints[logGroup.logGroupName]?.lastEventTimestamp || lookbackMs;
-        const { events, latestTimestamp } = await fetchNewLogEvents(logGroup.logGroupName, sinceMs, timeLeft, config.TIME_SAFETY_MARGIN_MS);
+        const { events, latestTimestamp, accessDenied } = await fetchNewLogEvents(logGroup.logGroupName, sinceMs, timeLeft, config.TIME_SAFETY_MARGIN_MS);
         groupsProcessed++;
 
+        if (accessDenied) {
+            groupsDeferred = logGroups.length - groupsProcessed;
+            console.warn(
+                `🚫 logs:FilterLogEvents denied — skipping trace ingest for ${groupsDeferred} remaining log group(s) this run. `
+                + `AgentCore inventory discovery already ran above. Fix customer IAM Resource to `
+                + `arn:aws:logs:*:${config.AWS_ACCOUNT_ID}:log-group:${config.RUNTIME_LOG_GROUP_PREFIX}*`
+            );
+            break;
+        }
+
         if (events.length === 0) continue;
+
+        logGroupSamples = await captureLogGroupSampleIfNeeded(
+            events,
+            logGroup,
+            { latestTimestamp, sinceMs },
+            logGroupSamples,
+            traceSampleCaptureState
+        );
 
         // buildTraceMessagesForLogGroup already logs the full event → trace → message
         // accounting for this group, so there's nothing to restate here.
@@ -287,14 +355,20 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         logGroupCheckpoints[logGroup.logGroupName] = { lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId };
 
         if (messages.length > 0) {
-            totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft);
+            totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, null, logGroupSamples);
         } else {
             // No messages built, but there's no unsent data at risk — checkpoint now
             // so this log group doesn't re-scan the same events every run.
-            await updateTraceManifest(discoveredAgents, logGroupCheckpoints);
+            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples);
         }
     }
 
+    if (traceSampleCaptureState.capturesThisRun > 0) {
+        console.log(
+            `📦 Trace log samples: ${traceSampleCaptureState.capturesThisRun} new/updated this run `
+            + `(${Object.keys(logGroupSamples).length} total indexed in trace manifest)`
+        );
+    }
     console.log(`🎉 AgentCore done. Log groups processed: ${groupsProcessed}, deferred: ${groupsDeferred}, messages sent: ${totalSent}`);
     return { logGroupsFound: logGroups.length, groupsProcessed, groupsDeferred, totalSent };
 }

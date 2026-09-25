@@ -33,12 +33,11 @@ function applyTargetEnv(target) {
     process.env.MARKERS_PREFIX = `akto/markers/${target.accountId}/${target.region}/`;
 }
 
-function mockContext() {
-    const deadline = Date.now() + 14 * 60 * 1000;
-    return { getRemainingTimeInMillis: () => Math.max(0, deadline - Date.now()) };
+function processorContext(hubDeadlineMs) {
+    return { getRemainingTimeInMillis: () => Math.max(0, hubDeadlineMs - Date.now()) };
 }
 
-exports.handler = async () => {
+exports.handler = async (event, context) => {
     const roleArns = parseRoleArns();
     if (!EXTERNAL_ID) throw new Error('CROSS_ACCOUNT_EXTERNAL_ID is required');
     if (roleArns.length === 0) throw new Error('CROSS_ACCOUNT_ROLE_ARNS is required');
@@ -46,12 +45,18 @@ exports.handler = async () => {
     const results = [];
     for (const roleArn of roleArns) {
         const targets = await discoverTargets(roleArn, EXTERNAL_ID);
+        if (targets.length === 0) {
+            console.warn(`⚠️ No active Bedrock regions for ${roleArn} (need agents/harnesses/runtimes and/or S3 model invocation logging)`);
+            continue;
+        }
+        console.log(`🔎 ${targets.length} region(s) for ${roleArn}: ${targets.map((t) => `${t.region}${t.logsBucket ? '' : ' (no S3 logs yet)'}`).join(', ')}`);
+        const hubDeadlineMs = Date.now() + (context?.getRemainingTimeInMillis?.() ?? 14 * 60 * 1000);
         for (const target of targets) {
             console.log(`▶️ ${target.accountId} / ${target.region}`);
             applyTargetEnv(target);
             clearProcessorModules();
             const { handler } = require('./index');
-            await handler({ source: 'cross-account' }, mockContext());
+            await handler({ source: 'cross-account' }, processorContext(hubDeadlineMs));
             results.push({ accountId: target.accountId, region: target.region });
         }
     }
