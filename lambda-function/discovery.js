@@ -11,7 +11,7 @@
  */
 const { GetAgentCommand, ListAgentsCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { getRoleSecurityProfile } = require('./iamPermissions');
+const { getRoleSecurityProfile, roleFields } = require('./iamPermissions');
 const config = require('./config');
 const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_SERVICE_AGENT_TRAFFIC } = config;
 const { buildAgentMessage } = require('./messageBuilder');
@@ -232,7 +232,10 @@ function buildServiceAgentDiscoveryMessage(resource, logEntry) {
         agentResourceRoleArn: `arn:aws:iam::${AWS_ACCOUNT_ID}:role/${resource.callerName}`,
         createdAt: logEntry.timestamp,
         updatedAt: logEntry.timestamp,
-        arn: logEntry.identity?.arn || ''
+        arn: logEntry.identity?.arn || '',
+        // Same graph-ready shape as a real agent's discovery message; the caller's
+        // role policies arrive with its conversation messages.
+        awsMetadata: { model: logEntry.modelId || '', 'bedrock-execution-role': resource.callerName, traceData: {} }
     }, false);
 }
 
@@ -257,7 +260,17 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
             let agentTags = await fetchTagsCached(`agent-${agent.agentId}`, () => getBedrockAgentTags(agent.agentId));
             agentTags = await addAgentRoleAndPermissions(agentTags, agent.agentId);
             const arn = metadata.agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`;
-            messages.push(buildAgentMessage({ ...metadata, resourceType: 'AGENT', arn, agentTags, harnessTags: {} }, false));
+            messages.push(buildAgentMessage({
+                ...metadata, resourceType: 'AGENT', arn, agentTags, harnessTags: {},
+                // The shape AKTO's service-graph parser needs (execution role, model,
+                // traceData), so an agent with no traffic yet still draws a graph.
+                awsMetadata: {
+                    model: metadata.foundationModel || '',
+                    'bedrock-execution-role': agentTags['bedrock-execution-role'] || '',
+                    ...roleFields(agentTags, 'bedrock'),
+                    traceData: {}
+                }
+            }, false));
             // Checkpointed only after AKTO ingest succeeds (see index.flush pendingDiscovery).
             pending[key] = {
                 resourceId: agent.agentId,

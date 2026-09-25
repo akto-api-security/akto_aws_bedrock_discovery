@@ -285,4 +285,19 @@ async function getAttachedPolicyNames(roleName) {
     }
 }
 
-module.exports = { getRoleSecurityProfile, getAttachedPolicyNames };
+/**
+ * The role/permission subset of a tag set, for mirroring into awsMetadata.
+ *
+ * Deliberately duplicated: `tag` is a JSON string a consumer has to parse
+ * separately, so anything needed to answer "what could this agent do" is also
+ * placed in the message body next to the trace it describes.
+ */
+function roleFields(tags, prefix) {
+    const picked = {};
+    for (const [key, value] of Object.entries(tags || {})) {
+        if (key.startsWith(`${prefix}-role-`) || key === `${prefix}-permissions-boundary`) picked[key] = value;
+    }
+    return picked;
+}
+
+module.exports = { getRoleSecurityProfile, getAttachedPolicyNames, roleFields };

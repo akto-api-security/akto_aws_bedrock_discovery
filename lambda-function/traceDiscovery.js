@@ -9,7 +9,7 @@
  */
 const { ListHarnessesCommand, GetHarnessCommand, ListAgentRuntimesCommand, GetAgentRuntimeCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { getRoleSecurityProfile } = require('./iamPermissions');
+const { getRoleSecurityProfile, roleFields } = require('./iamPermissions');
 const config = require('./config');
 const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS } = config;
 const { buildAgentMessage } = require('./traceMessageBuilder');
@@ -303,18 +303,31 @@ function getHarnessExecutionRoleArn(roleSuffix) { return roleSuffix ? (harnessEx
 
 
 /**
- * The role/permission subset of a tag set, for mirroring into awsMetadata.
- *
- * Deliberately duplicated: `tag` is a JSON string a consumer has to parse
- * separately, so anything needed to answer "what could this agent do" is also
- * placed in the message body next to the trace it describes.
+ * The awsMetadata a Harness message carries — the shape AKTO's service-graph parser
+ * needs (an execution-role key, `model` and `traceData`). Shared by conversation and
+ * discovery messages so a harness with no traffic yet still draws a graph.
  */
-function roleFields(tags, prefix) {
-    const picked = {};
-    for (const [key, value] of Object.entries(tags)) {
-        if (key.startsWith(`${prefix}-role-`) || key === `${prefix}-permissions-boundary`) picked[key] = value;
-    }
-    return picked;
+function harnessAwsMetadata(harnessTags, model, traceData) {
+    return {
+        'harness-configured-tools': harnessTags['harness-configured-tools'] || '',
+        'harness-configured-skills': harnessTags['harness-configured-skills'] || '',
+        model,
+        'harness-execution-role': harnessTags['harness-execution-role'] || '',
+        'harness-execution-role-arn': harnessTags['harness-execution-role-arn'] || '',
+        ...roleFields(harnessTags, 'harness'),
+        traceData
+    };
+}
+
+/** Runtime counterpart of harnessAwsMetadata. */
+function runtimeAwsMetadata(runtimeTags, model, traceData) {
+    return {
+        model,
+        'runtime-execution-role': runtimeTags['runtime-execution-role'] || '',
+        'runtime-execution-role-arn': runtimeTags['runtime-execution-role-arn'] || '',
+        ...roleFields(runtimeTags, 'runtime'),
+        traceData
+    };
 }
 
 /** Builds one AKTO message from a conversation pair: resolves the bot name, fetches and enriches tags, then hands off to buildAgentMessage. */
@@ -330,26 +343,12 @@ async function createStandardMessage(pair) {
         harnessTags = await addHarnessRoleAndPermissions(harnessTags, getHarnessExecutionRoleArn(pair.harnessRoleSuffix) || pair.executionRoleArn);
         const toolsAndSkills = await getHarnessToolsAndSkills(pair.harnessId);
         harnessTags = { ...harnessTags, ...toolsAndSkills };
-        awsMetadata = {
-            'harness-configured-tools': toolsAndSkills['harness-configured-tools'] || '',
-            'harness-configured-skills': toolsAndSkills['harness-configured-skills'] || '',
-            model: pair.modelId,
-            'harness-execution-role': harnessTags['harness-execution-role'] || '',
-            'harness-execution-role-arn': harnessTags['harness-execution-role-arn'] || '',
-            ...roleFields(harnessTags, 'harness'),
-            traceData: pair.traceData || {}
-        };
+        awsMetadata = harnessAwsMetadata(harnessTags, pair.modelId, pair.traceData || {});
     } else if (pair.logType === 'RUNTIME' && pair.runtimeId) {
         const runtimeArn = `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:runtime/${pair.runtimeId}`;
         runtimeTags = await fetchTagsCached(`runtime-${pair.runtimeId}`, () => getAgentRuntimeTags(runtimeArn));
         runtimeTags = await addRuntimeRoleAndPermissions(runtimeTags, pair.executionRoleArn);
-        awsMetadata = {
-            model: pair.modelId,
-            'runtime-execution-role': runtimeTags['runtime-execution-role'] || '',
-            'runtime-execution-role-arn': runtimeTags['runtime-execution-role-arn'] || '',
-            ...roleFields(runtimeTags, 'runtime'),
-            traceData: pair.traceData || {}
-        };
+        awsMetadata = runtimeAwsMetadata(runtimeTags, pair.modelId, pair.traceData || {});
     }
 
     // The AgentCore session is the only real conversation identifier either pipeline
@@ -443,11 +442,16 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
             if (!metadata) continue;
             let harnessTags = await fetchTagsCached(`harness-${harness.harnessId}`, () => getHarnessTags(harness.harnessId));
             if (metadata.executionRoleArn) harnessTags = await addHarnessRoleAndPermissions(harnessTags, metadata.executionRoleArn);
+            harnessTags = { ...harnessTags, ...await getHarnessToolsAndSkills(harness.harnessId) };
             const arn = metadata.arn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harness.harnessId}`;
-            const foundationModel = extractHarnessModelId(metadata.model) || 'N/A';
+            const modelId = extractHarnessModelId(metadata.model);
+            const foundationModel = modelId || 'N/A';
             messages.push(buildAgentMessage({
                 ...metadata, resourceType: 'HARNESS', harnessId: harness.harnessId, harnessName: harness.harnessName, arn,
-                harnessTags, agentStatus: metadata.status || 'PREPARED', foundationModel
+                harnessTags, agentStatus: metadata.status || 'PREPARED', foundationModel,
+                // Empty traceData: nothing has run yet, but the graph can already show the
+                // agent, its model and its configured tools/skills.
+                awsMetadata: harnessAwsMetadata(harnessTags, modelId, {})
             }, false));
             pending[key] = { resourceId: harness.harnessId, resourceType: 'HARNESS', resourceName: harness.harnessName, foundationModel, executionRoleArn: metadata.executionRoleArn || '', discoveredAt: new Date().toISOString() };
         } catch (error) {
@@ -476,7 +480,10 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
                 resourceType: 'RUNTIME', runtimeId: runtime.agentRuntimeId, runtimeName: runtime.agentRuntimeName, arn,
                 description: metadata.description, executionRoleArn: metadata.roleArn,
                 agentStatus: metadata.status || 'UNKNOWN', createdAt: metadata.createdAt, updatedAt: metadata.lastUpdatedAt,
-                harnessTags: {}, runtimeTags, foundationModel: metadata.foundationModel || 'N/A'
+                harnessTags: {}, runtimeTags, foundationModel: metadata.foundationModel || 'N/A',
+                // '' rather than 'N/A' when no model is known: AKTO then skips the model
+                // edge instead of drawing a node for a model it can't name.
+                awsMetadata: runtimeAwsMetadata(runtimeTags, metadata.foundationModel || '', {})
             }, false));
             pending[key] = { resourceId: runtime.agentRuntimeId, resourceType: 'RUNTIME', resourceName: runtime.agentRuntimeName, executionRoleArn: metadata.roleArn || '', discoveredAt: new Date().toISOString() };
         } catch (error) {

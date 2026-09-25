@@ -73,7 +73,7 @@ function buildAgentMessage(data, isConversation) {
 
     const responsePayload = isConversation
         ? { response: data.agentResponse, awsMetadata: data.awsMetadata || {} }
-        : { awsMetadata: { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt } };
+        : { awsMetadata: { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt, ...(data.awsMetadata || {}) } };
 
     const tags = {
         source: 'AWS_BEDROCK',
