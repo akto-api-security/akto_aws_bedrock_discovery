@@ -9,8 +9,9 @@
  */
 const { ListHarnessesCommand, GetHarnessCommand, ListAgentRuntimesCommand, GetAgentRuntimeCommand, ListTagsForResourceCommand: BedrockCoreListTagsCommand } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { getRoleSecurityProfile } = require('./iamPermissions');
-const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, bedrockAgentCoreControlClient, iamClient } = require('./config');
+const { getRoleSecurityProfile, roleFields } = require('./iamPermissions');
+const config = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS } = config;
 const { buildAgentMessage } = require('./traceMessageBuilder');
 
 const harnessNameCache = {};       // role suffix -> harness name
@@ -34,7 +35,7 @@ async function listAllPages(sendPage, pluck) {
 async function listAllHarnesses() {
     try {
         return await listAllPages(
-            (nextToken) => bedrockAgentCoreControlClient.send(new ListHarnessesCommand({ nextToken })),
+            (nextToken) => config.bedrockAgentCoreControlClient.send(new ListHarnessesCommand({ nextToken })),
             (response) => response.harnesses
         );
     } catch (error) {
@@ -46,7 +47,7 @@ async function listAllHarnesses() {
 /** Fetches full metadata for one harness. Returns null on failure. */
 async function getHarnessMetadata(harnessId) {
     try {
-        return (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
+        return (await config.bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
     } catch (error) {
         console.error(`❌ GetHarness failed for ${harnessId}: ${error.message}`);
         return null;
@@ -62,7 +63,7 @@ async function getHarnessMetadata(harnessId) {
 async function listAllAgentRuntimes() {
     try {
         return await listAllPages(
-            (nextToken) => bedrockAgentCoreControlClient.send(new ListAgentRuntimesCommand({ nextToken })),
+            (nextToken) => config.bedrockAgentCoreControlClient.send(new ListAgentRuntimesCommand({ nextToken })),
             (response) => response.agentRuntimes
         );
     } catch (error) {
@@ -74,7 +75,7 @@ async function listAllAgentRuntimes() {
 /** Fetches full metadata for one AgentCore Runtime. Returns null on failure. */
 async function getAgentRuntimeMetadata(agentRuntimeId) {
     try {
-        return await bedrockAgentCoreControlClient.send(new GetAgentRuntimeCommand({ agentRuntimeId }));
+        return await config.bedrockAgentCoreControlClient.send(new GetAgentRuntimeCommand({ agentRuntimeId }));
     } catch (error) {
         console.error(`❌ GetAgentRuntime failed for ${agentRuntimeId}: ${error.message}`);
         return null;
@@ -84,7 +85,7 @@ async function getAgentRuntimeMetadata(agentRuntimeId) {
 /** Fetches AWS resource tags for one AgentCore Runtime. */
 async function getAgentRuntimeTags(agentRuntimeArn) {
     try {
-        return (await bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: agentRuntimeArn }))).tags || {};
+        return (await config.bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: agentRuntimeArn }))).tags || {};
     } catch (error) {
         console.error(`⚠️ Tag fetch failed for runtime ${agentRuntimeArn}: ${error.message}`);
         return {};
@@ -102,7 +103,7 @@ async function initializeHarnessCache() {
         for (const item of harnesses) {
             if (!item.harnessId || !item.harnessName) continue;
             try {
-                const details = (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId: item.harnessId }))).harness;
+                const details = (await config.bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId: item.harnessId }))).harness;
                 const roleMatch = details?.executionRoleArn?.match(/AmazonBedrockAgentCoreHarnessDefaultServiceRole-([a-z0-9]+)/);
                 if (roleMatch) {
                     const suffix = roleMatch[1];
@@ -132,7 +133,7 @@ async function fetchTagsCached(cacheKey, fetcher) {
 async function getHarnessTags(harnessId) {
     try {
         const arn = `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harnessId}`;
-        return (await bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: arn }))).tags || {};
+        return (await config.bedrockAgentCoreControlClient.send(new BedrockCoreListTagsCommand({ resourceArn: arn }))).tags || {};
     } catch (error) {
         console.error(`⚠️ Tag fetch failed for harness ${harnessId}: ${error.message}`);
         return {};
@@ -252,7 +253,7 @@ async function summarizeHarnessGateways(gatewayArns) {
 /** Reads a harness's configured tools/skills and formats them as tag values. */
 async function getHarnessToolsAndSkills(harnessId) {
     try {
-        const details = (await bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
+        const details = (await config.bedrockAgentCoreControlClient.send(new GetHarnessCommand({ harnessId }))).harness;
         const tags = {};
         const tools = details?.tools || [];
         if (tools.length > 0) {
@@ -302,18 +303,31 @@ function getHarnessExecutionRoleArn(roleSuffix) { return roleSuffix ? (harnessEx
 
 
 /**
- * The role/permission subset of a tag set, for mirroring into awsMetadata.
- *
- * Deliberately duplicated: `tag` is a JSON string a consumer has to parse
- * separately, so anything needed to answer "what could this agent do" is also
- * placed in the message body next to the trace it describes.
+ * The awsMetadata a Harness message carries — the shape AKTO's service-graph parser
+ * needs (an execution-role key, `model` and `traceData`). Shared by conversation and
+ * discovery messages so a harness with no traffic yet still draws a graph.
  */
-function roleFields(tags, prefix) {
-    const picked = {};
-    for (const [key, value] of Object.entries(tags)) {
-        if (key.startsWith(`${prefix}-role-`) || key === `${prefix}-permissions-boundary`) picked[key] = value;
-    }
-    return picked;
+function harnessAwsMetadata(harnessTags, model, traceData) {
+    return {
+        'harness-configured-tools': harnessTags['harness-configured-tools'] || '',
+        'harness-configured-skills': harnessTags['harness-configured-skills'] || '',
+        model,
+        'harness-execution-role': harnessTags['harness-execution-role'] || '',
+        'harness-execution-role-arn': harnessTags['harness-execution-role-arn'] || '',
+        ...roleFields(harnessTags, 'harness'),
+        traceData
+    };
+}
+
+/** Runtime counterpart of harnessAwsMetadata. */
+function runtimeAwsMetadata(runtimeTags, model, traceData) {
+    return {
+        model,
+        'runtime-execution-role': runtimeTags['runtime-execution-role'] || '',
+        'runtime-execution-role-arn': runtimeTags['runtime-execution-role-arn'] || '',
+        ...roleFields(runtimeTags, 'runtime'),
+        traceData
+    };
 }
 
 /** Builds one AKTO message from a conversation pair: resolves the bot name, fetches and enriches tags, then hands off to buildAgentMessage. */
@@ -329,26 +343,12 @@ async function createStandardMessage(pair) {
         harnessTags = await addHarnessRoleAndPermissions(harnessTags, getHarnessExecutionRoleArn(pair.harnessRoleSuffix) || pair.executionRoleArn);
         const toolsAndSkills = await getHarnessToolsAndSkills(pair.harnessId);
         harnessTags = { ...harnessTags, ...toolsAndSkills };
-        awsMetadata = {
-            'harness-configured-tools': toolsAndSkills['harness-configured-tools'] || '',
-            'harness-configured-skills': toolsAndSkills['harness-configured-skills'] || '',
-            model: pair.modelId,
-            'harness-execution-role': harnessTags['harness-execution-role'] || '',
-            'harness-execution-role-arn': harnessTags['harness-execution-role-arn'] || '',
-            ...roleFields(harnessTags, 'harness'),
-            traceData: pair.traceData || {}
-        };
+        awsMetadata = harnessAwsMetadata(harnessTags, pair.modelId, pair.traceData || {});
     } else if (pair.logType === 'RUNTIME' && pair.runtimeId) {
         const runtimeArn = `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:runtime/${pair.runtimeId}`;
         runtimeTags = await fetchTagsCached(`runtime-${pair.runtimeId}`, () => getAgentRuntimeTags(runtimeArn));
         runtimeTags = await addRuntimeRoleAndPermissions(runtimeTags, pair.executionRoleArn);
-        awsMetadata = {
-            model: pair.modelId,
-            'runtime-execution-role': runtimeTags['runtime-execution-role'] || '',
-            'runtime-execution-role-arn': runtimeTags['runtime-execution-role-arn'] || '',
-            ...roleFields(runtimeTags, 'runtime'),
-            traceData: pair.traceData || {}
-        };
+        awsMetadata = runtimeAwsMetadata(runtimeTags, pair.modelId, pair.traceData || {});
     }
 
     // The AgentCore session is the only real conversation identifier either pipeline
@@ -430,10 +430,11 @@ function buildHarnessNameToResourceMap(discoveredAgents) {
  */
 async function discoverNewResources(discoveredAgents, timeLeft) {
     const messages = [];
+    const pending = {};
 
     const harnesses = await listAllHarnesses();
     for (const harness of harnesses) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining harness discovery'); return messages; }
+        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining harness discovery'); return { messages, pending }; }
         const key = `harness-${harness.harnessId}`;
         if (discoveredAgents[key]) continue;
         try {
@@ -441,13 +442,18 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
             if (!metadata) continue;
             let harnessTags = await fetchTagsCached(`harness-${harness.harnessId}`, () => getHarnessTags(harness.harnessId));
             if (metadata.executionRoleArn) harnessTags = await addHarnessRoleAndPermissions(harnessTags, metadata.executionRoleArn);
+            harnessTags = { ...harnessTags, ...await getHarnessToolsAndSkills(harness.harnessId) };
             const arn = metadata.arn || `arn:aws:bedrock-agentcore:${AWS_REGION}:${AWS_ACCOUNT_ID}:harness/${harness.harnessId}`;
-            const foundationModel = extractHarnessModelId(metadata.model) || 'N/A';
+            const modelId = extractHarnessModelId(metadata.model);
+            const foundationModel = modelId || 'N/A';
             messages.push(buildAgentMessage({
                 ...metadata, resourceType: 'HARNESS', harnessId: harness.harnessId, harnessName: harness.harnessName, arn,
-                harnessTags, agentStatus: metadata.status || 'PREPARED', foundationModel
+                harnessTags, agentStatus: metadata.status || 'PREPARED', foundationModel,
+                // Empty traceData: nothing has run yet, but the graph can already show the
+                // agent, its model and its configured tools/skills.
+                awsMetadata: harnessAwsMetadata(harnessTags, modelId, {})
             }, false));
-            discoveredAgents[key] = { resourceId: harness.harnessId, resourceType: 'HARNESS', resourceName: harness.harnessName, foundationModel, executionRoleArn: metadata.executionRoleArn || '', discoveredAt: new Date().toISOString() };
+            pending[key] = { resourceId: harness.harnessId, resourceType: 'HARNESS', resourceName: harness.harnessName, foundationModel, executionRoleArn: metadata.executionRoleArn || '', discoveredAt: new Date().toISOString() };
         } catch (error) {
             console.error(`⚠️ Discovery failed for harness ${harness.harnessId}: ${error.message}`);
         }
@@ -455,7 +461,7 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
 
     const runtimes = await listAllAgentRuntimes();
     for (const runtime of runtimes) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining runtime discovery'); return messages; }
+        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining runtime discovery'); return { messages, pending }; }
         const key = `runtime-${runtime.agentRuntimeId}`;
         if (discoveredAgents[key]) continue;
 
@@ -474,15 +480,18 @@ async function discoverNewResources(discoveredAgents, timeLeft) {
                 resourceType: 'RUNTIME', runtimeId: runtime.agentRuntimeId, runtimeName: runtime.agentRuntimeName, arn,
                 description: metadata.description, executionRoleArn: metadata.roleArn,
                 agentStatus: metadata.status || 'UNKNOWN', createdAt: metadata.createdAt, updatedAt: metadata.lastUpdatedAt,
-                harnessTags: {}, runtimeTags
+                harnessTags: {}, runtimeTags, foundationModel: metadata.foundationModel || 'N/A',
+                // '' rather than 'N/A' when no model is known: AKTO then skips the model
+                // edge instead of drawing a node for a model it can't name.
+                awsMetadata: runtimeAwsMetadata(runtimeTags, metadata.foundationModel || '', {})
             }, false));
-            discoveredAgents[key] = { resourceId: runtime.agentRuntimeId, resourceType: 'RUNTIME', resourceName: runtime.agentRuntimeName, executionRoleArn: metadata.roleArn || '', discoveredAt: new Date().toISOString() };
+            pending[key] = { resourceId: runtime.agentRuntimeId, resourceType: 'RUNTIME', resourceName: runtime.agentRuntimeName, executionRoleArn: metadata.roleArn || '', discoveredAt: new Date().toISOString() };
         } catch (error) {
             console.error(`⚠️ Discovery failed for runtime ${runtime.agentRuntimeId}: ${error.message}`);
         }
     }
 
-    return messages;
+    return { messages, pending };
 }
 
 module.exports = {

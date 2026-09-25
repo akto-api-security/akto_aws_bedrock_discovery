@@ -5,7 +5,8 @@
 const { GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const { gunzip } = require('zlib');
 const { promisify } = require('util');
-const { s3Client, LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS } = require('./config');
+const config = require('./config');
+const { LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS } = config;
 const { extractConversationPairs, extractTraceData } = require('./extractors');
 const { fetchAgentName, createStandardMessage, findResourceByArn, buildServiceAgentDiscoveryMessage } = require('./discovery');
 
@@ -47,7 +48,7 @@ async function fetchJsonFromS3Path(s3Path) {
         }
 
         const { bucket, key } = parsed;
-        const s3Object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+        const s3Object = await config.s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
         const chunks = [];
         for await (const chunk of s3Object.Body) chunks.push(chunk);
         const decompressed = await gunzipAsync(Buffer.concat(chunks));
@@ -133,7 +134,7 @@ async function getUnprocessedLogFiles(manifest) {
     console.log(`🪣 Listing s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} for .gz logs newer than ${startTime.toISOString()}`);
 
     do {
-        const response = await s3Client.send(new ListObjectsV2Command({
+        const response = await config.s3Client.send(new ListObjectsV2Command({
             Bucket: LOGS_BUCKET_NAME,
             Prefix: LOGS_PREFIX,
             ContinuationToken: continuationToken,
@@ -190,7 +191,7 @@ async function getUnprocessedLogFiles(manifest) {
  * moment its first log entry is read, and is recorded so it isn't sent again.
  */
 async function processLogFile(bucket, key, discoveredAgents) {
-    const s3Object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const s3Object = await config.s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const chunks = [];
     for await (const chunk of s3Object.Body) chunks.push(chunk);
     const decompressed = (await gunzipAsync(Buffer.concat(chunks))).toString('utf-8');

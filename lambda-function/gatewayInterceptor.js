@@ -22,10 +22,11 @@ const {
     AddPermissionCommand, RemovePermissionCommand,
     GetFunctionConfigurationCommand, UpdateFunctionConfigurationCommand
 } = require('@aws-sdk/client-lambda');
+const config = require('./config');
 const {
-    bedrockAgentCoreControlClient, lambdaClient, INTERCEPTION_POINTS,
+    lambdaClient, INTERCEPTION_POINTS,
     INCLUDE_GATEWAY_IDS, EXCLUDE_GATEWAY_IDS, GATEWAY_NAME_MAP_MAX_BYTES
-} = require('./config');
+} = config;
 const {
     listAllGateways, getGatewayDetail, buildHarnessGatewayMap, readAttachedInterceptors, buildGatewayProfile
 } = require('./gatewayDiscovery');
@@ -211,7 +212,7 @@ function buildUpdateParams(gateway, interceptorConfigurations) {
 async function sendGatewayUpdate(gateway, interceptorConfigurations) {
     const params = buildUpdateParams(gateway, interceptorConfigurations);
     try {
-        return await bedrockAgentCoreControlClient.send(new UpdateGatewayCommand(params));
+        return await config.bedrockAgentCoreControlClient.send(new UpdateGatewayCommand(params));
     } catch (error) {
         // Only when the API actually complains about protocolType — a bare
         // ValidationException is far more likely to be something else, and
@@ -221,7 +222,7 @@ async function sendGatewayUpdate(gateway, interceptorConfigurations) {
 
         console.warn(`⚠️ ${gateway.gatewayId}: UpdateGateway rejected protocolType (${error.message}) — retrying without it`);
         const { protocolType, ...withoutProtocol } = params;
-        return bedrockAgentCoreControlClient.send(new UpdateGatewayCommand(withoutProtocol));
+        return config.bedrockAgentCoreControlClient.send(new UpdateGatewayCommand(withoutProtocol));
     }
 }
 
