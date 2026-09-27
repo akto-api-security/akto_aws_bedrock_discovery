@@ -42,15 +42,10 @@ function logGroupMatchesDiscoveredRuntime(logGroup, runtimeIds, prefix) {
 
 /**
  * @param {string} logGroupName
- * @param {string[]} includeSubstrings — if non-empty, name must contain at least one
  * @param {string[]} excludeSubstrings
  */
-function passesSubstringFilters(logGroupName, includeSubstrings, excludeSubstrings) {
-    if (excludeSubstrings.some((s) => logGroupName.includes(s))) return false;
-    if (includeSubstrings.length > 0 && !includeSubstrings.some((s) => logGroupName.includes(s))) {
-        return false;
-    }
-    return true;
+function passesExcludeFilter(logGroupName, excludeSubstrings) {
+    return !excludeSubstrings.some((s) => logGroupName.includes(s));
 }
 
 /**
@@ -98,8 +93,8 @@ function filterLogGroupsForIngest(allGroups, options, nowMs = Date.now()) {
         listed: allGroups.length,
         selected: 0,
         skippedOrphan: 0,
-        skippedInclude: 0,
         skippedExclude: 0,
+        includedByPattern: 0,
         skippedEmptyCooldown: 0,
         scope: fallbackToAll ? 'all (no discovered runtimes yet)' : scope,
         discoveredRuntimeIds: runtimeIds.size
@@ -107,19 +102,21 @@ function filterLogGroupsForIngest(allGroups, options, nowMs = Date.now()) {
 
     const groups = [];
     for (const logGroup of allGroups) {
-        if (!passesSubstringFilters(logGroup.logGroupName, includeSubstrings, excludeSubstrings)) {
-            if (excludeSubstrings.some((s) => logGroup.logGroupName.includes(s))) {
-                stats.skippedExclude++;
-            } else {
-                stats.skippedInclude++;
-            }
+        const includedByPattern = includeSubstrings.length > 0
+            && includeSubstrings.some((s) => logGroup.logGroupName.includes(s));
+
+        if (!passesExcludeFilter(logGroup.logGroupName, excludeSubstrings)) {
+            stats.skippedExclude++;
             continue;
         }
 
-        if (useDiscoveredScope && !fallbackToAll
-            && !logGroupMatchesDiscoveredRuntime(logGroup, runtimeIds, RUNTIME_LOG_GROUP_PREFIX)) {
+        const matchesDiscovered = logGroupMatchesDiscoveredRuntime(logGroup, runtimeIds, RUNTIME_LOG_GROUP_PREFIX);
+        if (useDiscoveredScope && !fallbackToAll && !matchesDiscovered && !includedByPattern) {
             stats.skippedOrphan++;
             continue;
+        }
+        if (includedByPattern && !matchesDiscovered) {
+            stats.includedByPattern++;
         }
 
         const checkpoint = logGroupCheckpoints?.[logGroup.logGroupName];
@@ -138,7 +135,7 @@ function filterLogGroupsForIngest(allGroups, options, nowMs = Date.now()) {
 module.exports = {
     buildDiscoveredRuntimeIdSet,
     logGroupMatchesDiscoveredRuntime,
-    passesSubstringFilters,
+    passesExcludeFilter,
     isOnEmptyPollCooldown,
     filterLogGroupsForIngest
 };

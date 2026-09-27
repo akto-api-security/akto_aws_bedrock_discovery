@@ -67,6 +67,24 @@ test('filterLogGroupsForIngest falls back to all when no discovered ids', () => 
     assert.match(stats.scope, /all \(no discovered/);
 });
 
+test('includeSubstrings adds matching orphans without hiding discovered groups', () => {
+    const all = [
+        g(`${PREFIX}eval_test_00-LrMipgDN73-DEFAULT`, 'eval_test_00-LrMipgDN73'),
+        g(`${PREFIX}inttest_foo-bar-DEFAULT`, 'inttest_foo-bar')
+    ];
+    const { groups, stats } = filterLogGroupsForIngest(all, {
+        discoveredAgents: agents,
+        logGroupCheckpoints: {},
+        scope: 'discovered',
+        includeSubstrings: ['inttest_'],
+        excludeSubstrings: [],
+        emptyPollCooldownHours: 0
+    });
+    assert.equal(groups.length, 2);
+    assert.equal(stats.skippedOrphan, 0);
+    assert.equal(stats.includedByPattern, 1);
+});
+
 test('empty poll cooldown skips group', () => {
     const name = `${PREFIX}eval_test_00-LrMipgDN73-DEFAULT`;
     const { groups, stats } = filterLogGroupsForIngest([g(name, 'eval_test_00-LrMipgDN73')], {

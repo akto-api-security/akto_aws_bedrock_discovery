@@ -361,7 +361,7 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         + (scopeStats.skippedOrphan ? `, ${scopeStats.skippedOrphan} orphan historical group(s) skipped` : '')
         + (scopeStats.skippedEmptyCooldown ? `, ${scopeStats.skippedEmptyCooldown} on empty-poll cooldown` : '')
         + (scopeStats.skippedExclude ? `, ${scopeStats.skippedExclude} excluded by substring` : '')
-        + (scopeStats.skippedInclude ? `, ${scopeStats.skippedInclude} filtered by include substring` : '')
+        + (scopeStats.includedByPattern ? `, ${scopeStats.includedByPattern} extra group(s) via include substring` : '')
         + ')'
     );
 
