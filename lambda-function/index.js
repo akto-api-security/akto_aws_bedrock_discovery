@@ -24,6 +24,7 @@ const { classifyRecord, parseLogRecord, resolveTraceIdentity, resolveTraceConten
 const { getTraceManifest, updateTraceManifest } = require('./traceManifest');
 const { captureLogGroupSampleIfNeeded } = require('./traceLogSampleCapture');
 const { orderLogGroupsForWalk, checkpointEmptyLogGroupPoll } = require('./logGroupWalk');
+const { filterLogGroupsForIngest } = require('./logGroupScope');
 
 let traceHarnessInitialized = false;
 
@@ -52,7 +53,7 @@ function logEffectiveConfig() {
         : '(none — discovery-only until S3 logging is configured)';
     console.log(`  ├─ bedrock logs        ${logsLoc}`);
     console.log(`  ├─ checkpoints         s3://${config.MARKERS_BUCKET_NAME}/${config.MARKERS_PREFIX}`);
-    console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}*`);
+    console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}* (scope ${config.TRACE_LOG_GROUP_SCOPE}, cap ${config.TRACE_MAX_EVENTS_PER_LOG_GROUP} events/group)`);
     console.log(`  ├─ akto ingest host    ${ingestHost} (api key ${config.AKTO_API_KEY ? 'set' : 'MISSING'})`);
     console.log(`  └─ lookback            ${config.LOOKBACK_DAYS}d s3 / ${config.TRACE_LOOKBACK_DAYS}d traces`);
 }
@@ -182,6 +183,27 @@ async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourc
     return messages;
 }
 
+function isS3ListAccessDenied(error) {
+    const name = error?.name || '';
+    const message = error?.message || '';
+    return name === 'AccessDenied'
+        || name === 'AccessDeniedException'
+        || /not authorized to perform:\s*s3:ListBucket/i.test(message);
+}
+
+function emptyS3PipelineResult(totalSent, failedMessages, lastTimestamp) {
+    const stats = { ...getLogStats(), ...getIdentityStats() };
+    console.log(`🎉 Bedrock Agent Classic done. Files processed: 0, failed: 0, deferred: 0, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
+    return {
+        filesDone: 0,
+        filesFailed: 0,
+        filesDeferred: 0,
+        totalSent,
+        messagesQuarantined: failedMessages.length,
+        traffic: stats
+    };
+}
+
 /** Bedrock Agent Classic: S3 model-invocation logs → AKTO. Unchanged from before the AgentCore merge. */
 async function runS3Pipeline(timeLeft, sendTimeLeft) {
     resetLogStats();
@@ -208,19 +230,22 @@ async function runS3Pipeline(timeLeft, sendTimeLeft) {
     const logsBucketConfigured = Boolean(config.LOGS_BUCKET_NAME && String(config.LOGS_BUCKET_NAME).trim());
     if (!logsBucketConfigured) {
         console.log('ℹ️ No Bedrock S3 logs bucket — skipping log file processing (agent discovery still ran)');
-        const stats = { ...getLogStats(), ...getIdentityStats() };
-        console.log(`🎉 Bedrock Agent Classic done. Files processed: 0, failed: 0, deferred: 0, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
-        return {
-            filesDone: 0,
-            filesFailed: 0,
-            filesDeferred: 0,
-            totalSent,
-            messagesQuarantined: failedMessages.length,
-            traffic: stats
-        };
+        return emptyS3PipelineResult(totalSent, failedMessages, lastTimestamp);
     }
 
-    const unprocessedFiles = await getUnprocessedLogFiles(manifest);
+    let unprocessedFiles;
+    try {
+        unprocessedFiles = await getUnprocessedLogFiles(manifest);
+    } catch (error) {
+        if (isS3ListAccessDenied(error)) {
+            console.warn(
+                `🚫 S3 ListBucket denied for ${config.LOGS_BUCKET_NAME} — skipping Classic log files; AgentCore CloudWatch ingest continues. `
+                + 'Grant s3:ListBucket and s3:GetObject on the invocation logging bucket to read Classic conversations from S3.'
+            );
+            return emptyS3PipelineResult(totalSent, failedMessages, lastTimestamp);
+        }
+        throw error;
+    }
     console.log(`📁 ${unprocessedFiles.length} unprocessed log file(s)`);
 
     let pending = [];
@@ -309,13 +334,46 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
     const roleNameToResourceMap = buildRoleNameToResourceMap(discoveredAgents);
     const harnessNameToResourceMap = buildHarnessNameToResourceMap(discoveredAgents);
 
-    const logGroups = await discoverObservabilityLogGroups();
+    const allLogGroups = await discoverObservabilityLogGroups();
     let groupsProcessed = 0;
     let groupsDeferred = 0;
+    let logGroupsScoped = 0;
+    let logGroupsSkippedOrphan = 0;
+
+    if (allLogGroups.length === 0) {
+        console.log('✅ No AgentCore observability log groups found — tracing likely not enabled on this account. Discovery still ran above.');
+        return { logGroupsFound: 0, logGroupsScoped: 0, groupsProcessed, groupsDeferred, totalSent };
+    }
+
+    const { groups: logGroups, stats: scopeStats } = filterLogGroupsForIngest(allLogGroups, {
+        discoveredAgents,
+        logGroupCheckpoints,
+        scope: config.TRACE_LOG_GROUP_SCOPE,
+        includeSubstrings: config.TRACE_LOG_GROUP_INCLUDE_SUBSTRINGS,
+        excludeSubstrings: config.TRACE_LOG_GROUP_EXCLUDE_SUBSTRINGS,
+        emptyPollCooldownHours: config.TRACE_EMPTY_LOG_GROUP_COOLDOWN_HOURS
+    });
+    logGroupsScoped = logGroups.length;
+    logGroupsSkippedOrphan = scopeStats.skippedOrphan;
+    console.log(
+        `🎯 Log group scope (${scopeStats.scope}): ${scopeStats.selected} to walk of ${scopeStats.listed} listed`
+        + ` (${scopeStats.discoveredRuntimeIds} discovered runtime/harness id(s)`
+        + (scopeStats.skippedOrphan ? `, ${scopeStats.skippedOrphan} orphan historical group(s) skipped` : '')
+        + (scopeStats.skippedEmptyCooldown ? `, ${scopeStats.skippedEmptyCooldown} on empty-poll cooldown` : '')
+        + (scopeStats.skippedExclude ? `, ${scopeStats.skippedExclude} excluded by substring` : '')
+        + (scopeStats.skippedInclude ? `, ${scopeStats.skippedInclude} filtered by include substring` : '')
+        + ')'
+    );
 
     if (logGroups.length === 0) {
-        console.log('✅ No AgentCore observability log groups found — tracing likely not enabled on this account. Discovery still ran above.');
-        return { logGroupsFound: 0, groupsProcessed, groupsDeferred, totalSent };
+        console.log('✅ No in-scope AgentCore log groups to walk this run (all filtered or on cooldown).');
+        return {
+            logGroupsFound: allLogGroups.length,
+            logGroupsScoped: 0,
+            groupsProcessed,
+            groupsDeferred: 0,
+            totalSent
+        };
     }
 
     const lookbackMs = Date.now() - config.TRACE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
@@ -334,7 +392,13 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         }
 
         const sinceMs = logGroupCheckpoints[logGroup.logGroupName]?.lastEventTimestamp || lookbackMs;
-        const { events, latestTimestamp, accessDenied } = await fetchNewLogEvents(logGroup.logGroupName, sinceMs, timeLeft, config.TIME_SAFETY_MARGIN_MS);
+        const { events, latestTimestamp, accessDenied } = await fetchNewLogEvents(
+            logGroup.logGroupName,
+            sinceMs,
+            timeLeft,
+            config.TIME_SAFETY_MARGIN_MS,
+            config.TRACE_MAX_EVENTS_PER_LOG_GROUP
+        );
         groupsProcessed++;
         logGroupWalkCursor = logGroup.logGroupName;
 
@@ -386,7 +450,14 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         );
     }
     console.log(`🎉 AgentCore done. Log groups processed: ${groupsProcessed}, deferred: ${groupsDeferred}, messages sent: ${totalSent}`);
-    return { logGroupsFound: logGroups.length, groupsProcessed, groupsDeferred, totalSent };
+    return {
+        logGroupsFound: allLogGroups.length,
+        logGroupsScoped,
+        logGroupsSkippedOrphan,
+        groupsProcessed,
+        groupsDeferred,
+        totalSent
+    };
 }
 
 /**

@@ -51,14 +51,20 @@ async function discoverObservabilityLogGroups() {
  * { events, latestTimestamp } so the caller can checkpoint even on a partial
  * fetch cut short by the time budget.
  */
-async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarginMs) {
+async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarginMs, maxEventsPerLogGroup = 0) {
     const events = [];
     let latestTimestamp = sinceMs;
     let nextToken;
+    let truncated = false;
+    const eventCap = maxEventsPerLogGroup > 0 ? maxEventsPerLogGroup : Infinity;
     try {
         do {
             if (timeLeft() < timeSafetyMarginMs) {
                 console.warn(`⏱️ Time budget low — deferring remaining pages for ${logGroupName}`);
+                break;
+            }
+            if (events.length >= eventCap) {
+                truncated = true;
                 break;
             }
             const response = await config.cloudWatchLogsClient.send(new FilterLogEventsCommand({
@@ -70,16 +76,26 @@ async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarg
             for (const event of response.events || []) {
                 events.push(event);
                 if (event.timestamp > latestTimestamp) latestTimestamp = event.timestamp;
+                if (events.length >= eventCap) {
+                    truncated = true;
+                    break;
+                }
             }
-            nextToken = response.nextToken;
+            nextToken = truncated ? undefined : response.nextToken;
         } while (nextToken);
     } catch (error) {
         const accessDenied = error.name === 'AccessDeniedException'
             || /not authorized to perform:\s*logs:FilterLogEvents/i.test(error.message || '');
         console.error(`❌ FilterLogEvents failed for ${logGroupName}: ${error.message}`);
-        return { events, latestTimestamp, accessDenied };
+        return { events, latestTimestamp, accessDenied, truncated };
     }
-    return { events, latestTimestamp, accessDenied: false };
+    if (truncated) {
+        console.warn(
+            `📎 ${logGroupName}: capped at ${events.length} event(s) this run `
+            + `(TRACE_MAX_EVENTS_PER_LOG_GROUP) — checkpoint advances; remaining pages deferred`
+        );
+    }
+    return { events, latestTimestamp, accessDenied: false, truncated };
 }
 
 module.exports = { discoverObservabilityLogGroups, fetchNewLogEvents, extractRuntimeIdFromLogGroupName };
