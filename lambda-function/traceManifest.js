@@ -8,24 +8,30 @@
  * AgentCore runtime).
  */
 const { GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { s3Client, MARKERS_BUCKET_NAME, TRACE_MANIFEST_KEY } = require('./config');
+const config = require('./config');
+const { MARKERS_BUCKET_NAME, TRACE_MANIFEST_KEY } = config;
 
 /** Reads the manifest from S3. Returns {discoveredAgents:{}, logGroupCheckpoints:{}} on first run or any read error — never null, never throws. */
 async function getTraceManifest() {
     try {
-        const response = await s3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: TRACE_MANIFEST_KEY }));
+        const response = await config.markersS3Client.send(new GetObjectCommand({ Bucket: MARKERS_BUCKET_NAME, Key: TRACE_MANIFEST_KEY }));
         const chunks = [];
         for await (const chunk of response.Body) chunks.push(chunk);
         const manifest = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-        console.log(`📖 Trace manifest loaded: ${Object.keys(manifest.discoveredAgents || {}).length} known resource(s), ${Object.keys(manifest.logGroupCheckpoints || {}).length} known log group(s)`);
-        return { discoveredAgents: {}, logGroupCheckpoints: {}, ...manifest };
+        const sampleCount = Object.keys(manifest.logGroupSamples || {}).length;
+        console.log(
+            `📖 Trace manifest loaded: ${Object.keys(manifest.discoveredAgents || {}).length} known resource(s), `
+            + `${Object.keys(manifest.logGroupCheckpoints || {}).length} known log group(s)`
+            + (sampleCount ? `, ${sampleCount} trace log sample(s) on record` : '')
+        );
+        return { discoveredAgents: {}, logGroupCheckpoints: {}, logGroupSamples: {}, logGroupWalkCursor: '', ...manifest };
     } catch (error) {
         if (error.name === 'NoSuchKey') {
             console.log('📝 No trace manifest found — first run');
         } else {
             console.error(`⚠️ Error reading trace manifest, treating as first run: ${error.message}`);
         }
-        return { discoveredAgents: {}, logGroupCheckpoints: {} };
+        return { discoveredAgents: {}, logGroupCheckpoints: {}, logGroupSamples: {}, logGroupWalkCursor: '' };
     }
 }
 
@@ -35,21 +41,36 @@ async function getTraceManifest() {
  * tradeoff is that a batch may get reprocessed next run, which is a safe
  * direction to fail in (possible duplicate) versus silently losing data.
  */
-async function updateTraceManifest(discoveredAgents, logGroupCheckpoints) {
+async function updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor) {
     try {
+        let mergedSamples = logGroupSamples;
+        let mergedCursor = logGroupWalkCursor;
+        if (mergedSamples === undefined || mergedCursor === undefined) {
+            const existing = await getTraceManifest();
+            if (mergedSamples === undefined) mergedSamples = existing.logGroupSamples || {};
+            if (mergedCursor === undefined) mergedCursor = existing.logGroupWalkCursor || '';
+        }
         const manifest = {
             version: '1.0',
             lastManifestUpdate: new Date().toISOString(),
             discoveredAgents: discoveredAgents || {},
-            logGroupCheckpoints: logGroupCheckpoints || {}
+            logGroupCheckpoints: logGroupCheckpoints || {},
+            logGroupSamples: mergedSamples || {},
+            logGroupWalkCursor: mergedCursor || ''
         };
-        await s3Client.send(new PutObjectCommand({
+        await config.markersS3Client.send(new PutObjectCommand({
             Bucket: MARKERS_BUCKET_NAME,
             Key: TRACE_MANIFEST_KEY,
             Body: JSON.stringify(manifest, null, 2),
             ContentType: 'application/json'
         }));
-        console.log(`✅ Trace manifest checkpointed: ${Object.keys(manifest.discoveredAgents).length} known resource(s), ${Object.keys(manifest.logGroupCheckpoints).length} log group(s) tracked`);
+        const sampleKeys = Object.keys(manifest.logGroupSamples).length;
+        console.log(
+            `✅ Trace manifest checkpointed: ${Object.keys(manifest.discoveredAgents).length} known resource(s), `
+            + `${Object.keys(manifest.logGroupCheckpoints).length} log group(s) tracked`
+            + (sampleKeys ? `, ${sampleKeys} trace log sample(s) indexed` : '')
+            + (manifest.logGroupWalkCursor ? `, walk cursor=${manifest.logGroupWalkCursor}` : '')
+        );
     } catch (error) {
         console.error(`❌ Error checkpointing trace manifest: ${error.message}`);
     }

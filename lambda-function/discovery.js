@@ -11,8 +11,9 @@
  */
 const { GetAgentCommand, ListAgentsCommand, ListTagsForResourceCommand: BedrockAgentListTagsCommand } = require('@aws-sdk/client-bedrock-agent');
 const { ListAttachedRolePoliciesCommand } = require('@aws-sdk/client-iam');
-const { getRoleSecurityProfile } = require('./iamPermissions');
-const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_SERVICE_AGENT_TRAFFIC, bedrockAgentClient, iamClient } = require('./config');
+const { getRoleSecurityProfile, roleFields } = require('./iamPermissions');
+const config = require('./config');
+const { AWS_REGION, AWS_ACCOUNT_ID, TIME_SAFETY_MARGIN_MS, INGEST_SERVICE_AGENT_TRAFFIC } = config;
 const { buildAgentMessage } = require('./messageBuilder');
 
 const agentNameCache = {};
@@ -50,7 +51,7 @@ async function listAllPages(sendPage, pluck) {
 async function listAllAgents() {
     try {
         return await listAllPages(
-            (nextToken) => bedrockAgentClient.send(new ListAgentsCommand({ nextToken })),
+            (nextToken) => config.bedrockAgentClient.send(new ListAgentsCommand({ nextToken })),
             (response) => response.agentSummaries
         );
     } catch (error) {
@@ -62,7 +63,7 @@ async function listAllAgents() {
 /** Fetches full metadata for one agent. Returns null on failure. */
 async function getAgentMetadata(agentId) {
     try {
-        return (await bedrockAgentClient.send(new GetAgentCommand({ agentId }))).agent;
+        return (await config.bedrockAgentClient.send(new GetAgentCommand({ agentId }))).agent;
     } catch (error) {
         console.error(`❌ GetAgent failed for ${agentId}: ${error.message}`);
         return null;
@@ -81,7 +82,7 @@ async function fetchTagsCached(cacheKey, fetcher) {
 async function getBedrockAgentTags(agentId) {
     try {
         const arn = `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agentId}`;
-        return (await bedrockAgentClient.send(new BedrockAgentListTagsCommand({ resourceArn: arn }))).tags || {};
+        return (await config.bedrockAgentClient.send(new BedrockAgentListTagsCommand({ resourceArn: arn }))).tags || {};
     } catch (error) {
         console.error(`⚠️ Tag fetch failed for agent ${agentId}: ${error.message}`);
         return {};
@@ -102,7 +103,7 @@ async function addAgentRoleAndPermissions(tags, agentId, knownRoleArn) {
     try {
         let roleArn = knownRoleArn || '';
         if (!roleArn) {
-            const agentDetails = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
+            const agentDetails = await config.bedrockAgentClient.send(new GetAgentCommand({ agentId }));
             roleArn = agentDetails.agent?.agentResourceRoleArn || agentDetails.agent?.executionRoleArn || '';
         }
         if (!roleArn) {
@@ -144,7 +145,7 @@ async function fetchAgentName(agentId, knownName) {
     }
     if (agentNameCache[agentId]) return agentNameCache[agentId];
     try {
-        const details = await bedrockAgentClient.send(new GetAgentCommand({ agentId }));
+        const details = await config.bedrockAgentClient.send(new GetAgentCommand({ agentId }));
         const name = details?.agent?.agentName || details?.agentName || '';
         if (name) agentNameCache[agentId] = name;
         return name;
@@ -231,7 +232,10 @@ function buildServiceAgentDiscoveryMessage(resource, logEntry) {
         agentResourceRoleArn: `arn:aws:iam::${AWS_ACCOUNT_ID}:role/${resource.callerName}`,
         createdAt: logEntry.timestamp,
         updatedAt: logEntry.timestamp,
-        arn: logEntry.identity?.arn || ''
+        arn: logEntry.identity?.arn || '',
+        // Same graph-ready shape as a real agent's discovery message; the caller's
+        // role policies arrive with its conversation messages.
+        awsMetadata: { model: logEntry.modelId || '', 'bedrock-execution-role': resource.callerName, traceData: {} }
     }, false);
 }
 
@@ -243,10 +247,11 @@ function buildServiceAgentDiscoveryMessage(resource, logEntry) {
  */
 async function discoverAllNewAgents(discoveredAgents, timeLeft) {
     const messages = [];
+    const pending = {};
 
     const agents = await listAllAgents();
     for (const agent of agents) {
-        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining agent discovery'); return messages; }
+        if (timeLeft() < TIME_SAFETY_MARGIN_MS) { console.warn('⏱️ Time budget low — deferring remaining agent discovery'); return { messages, pending }; }
         const key = `agent-${agent.agentId}`;
         if (discoveredAgents[key]) continue;
         try {
@@ -255,12 +260,19 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
             let agentTags = await fetchTagsCached(`agent-${agent.agentId}`, () => getBedrockAgentTags(agent.agentId));
             agentTags = await addAgentRoleAndPermissions(agentTags, agent.agentId);
             const arn = metadata.agentArn || `arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent/${agent.agentId}`;
-            messages.push(buildAgentMessage({ ...metadata, resourceType: 'AGENT', arn, agentTags, harnessTags: {} }, false));
-            // The execution role is persisted with the agent so the role map can be
-            // rebuilt from the manifest instead of re-querying every agent each run —
-            // and so "which role belongs to which agent" is answerable from the
-            // manifest rather than by reading logs.
-            discoveredAgents[key] = {
+            messages.push(buildAgentMessage({
+                ...metadata, resourceType: 'AGENT', arn, agentTags, harnessTags: {},
+                // The shape AKTO's service-graph parser needs (execution role, model,
+                // traceData), so an agent with no traffic yet still draws a graph.
+                awsMetadata: {
+                    model: metadata.foundationModel || '',
+                    'bedrock-execution-role': agentTags['bedrock-execution-role'] || '',
+                    ...roleFields(agentTags, 'bedrock'),
+                    traceData: {}
+                }
+            }, false));
+            // Checkpointed only after AKTO ingest succeeds (see index.flush pendingDiscovery).
+            pending[key] = {
                 resourceId: agent.agentId,
                 resourceType: 'AGENT',
                 resourceName: agent.agentName,
@@ -292,7 +304,7 @@ async function discoverAllNewAgents(discoveredAgents, timeLeft) {
         }
     }
 
-    return messages;
+    return { messages, pending };
 }
 
 /**

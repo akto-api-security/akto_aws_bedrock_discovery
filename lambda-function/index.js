@@ -22,6 +22,10 @@ const {
 const { discoverObservabilityLogGroups, fetchNewLogEvents } = require('./logGroupReader');
 const { classifyRecord, parseLogRecord, resolveTraceIdentity, resolveTraceContent, buildConversationPair } = require('./traceParser');
 const { getTraceManifest, updateTraceManifest } = require('./traceManifest');
+const { captureLogGroupSampleIfNeeded } = require('./traceLogSampleCapture');
+const { orderLogGroupsForWalk, checkpointEmptyLogGroupPoll } = require('./logGroupWalk');
+const { filterLogGroupsForIngest } = require('./logGroupScope');
+const { countConversationSignalsInEvents, enrichCheckpointAfterIngest } = require('./logGroupConversationSignal');
 
 let traceHarnessInitialized = false;
 
@@ -45,9 +49,15 @@ function logEffectiveConfig() {
     console.log('⚙️ Effective configuration:');
     console.log(`  ├─ build               ${config.CODE_VERSION}`);
     console.log(`  ├─ region              ${config.AWS_REGION} (account ${config.AWS_ACCOUNT_ID})`);
-    console.log(`  ├─ bedrock logs        s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}`);
+    const logsLoc = config.LOGS_BUCKET_NAME
+        ? `s3://${config.LOGS_BUCKET_NAME}/${config.LOGS_PREFIX}`
+        : '(none — discovery-only until S3 logging is configured)';
+    console.log(`  ├─ bedrock logs        ${logsLoc}`);
     console.log(`  ├─ checkpoints         s3://${config.MARKERS_BUCKET_NAME}/${config.MARKERS_PREFIX}`);
-    console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}*`);
+    const includeHint = config.TRACE_LOG_GROUP_INCLUDE_SUBSTRINGS.length
+        ? `, include ${config.TRACE_LOG_GROUP_INCLUDE_SUBSTRINGS.join('|')}`
+        : '';
+    console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}* (scope ${config.TRACE_LOG_GROUP_SCOPE}${includeHint}, cap ${config.TRACE_MAX_EVENTS_PER_LOG_GROUP} events/group)`);
     console.log(`  ├─ akto ingest host    ${ingestHost} (api key ${config.AKTO_API_KEY ? 'set' : 'MISSING'})`);
     console.log(`  └─ lookback            ${config.LOOKBACK_DAYS}d s3 / ${config.TRACE_LOOKBACK_DAYS}d traces`);
 }
@@ -66,11 +76,26 @@ async function checkpoint(discoveredAgents, filesProcessed, lastTimestamp, faile
     await updateManifest(filesProcessed, discoveredAgents, lastTimestamp, failedFiles, failedMessages);
 }
 
+/** Merges discovery manifest entries only when every discovery message was accepted by ingest. */
+function applyPendingDiscovery(discoveredAgents, pendingDiscovery, sent, totalMessages, quarantinedCount) {
+    if (!pendingDiscovery || Object.keys(pendingDiscovery).length === 0) return;
+    if (quarantinedCount > 0) {
+        console.error(`🚫 Discovery ingest quarantined ${quarantinedCount} message(s) — not marking those resources in manifest (will retry)`);
+        return;
+    }
+    if (sent !== totalMessages) {
+        console.warn(`⚠️ Discovery ingest accepted ${sent}/${totalMessages} — not checkpointing new resources (will retry)`);
+        return;
+    }
+    Object.assign(discoveredAgents, pendingDiscovery);
+    console.log(`✅ Recorded ${Object.keys(pendingDiscovery).length} newly discovered resource(s) in manifest after ingest`);
+}
+
 /**
  * Sends a batch to AKTO, THEN checkpoints — in that order, so a failed send
  * never advances "last processed" past data that was never actually delivered.
  */
-async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, failedFiles, timeLeft, failedMessages = []) {
+async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, failedFiles, timeLeft, failedMessages = [], pendingDiscovery = null) {
     if (messages.length === 0) {
         // Nothing to deliver, but the files were still read — record that.
         console.log(`⏭️ Nothing to send; checkpointing file progress only`);
@@ -83,17 +108,31 @@ async function flush(messages, discoveredAgents, filesProcessed, lastTimestamp, 
     // will refuse them identically next run. Checkpointing past them is what stops
     // the run replaying the messages that DID land alongside them.
     if (quarantined.length > 0) failedMessages.push(...quarantined);
+    applyPendingDiscovery(discoveredAgents, pendingDiscovery, sent, messages.length, quarantined.length);
     console.log(`✅ Sent ${sent} message(s) to AKTO${quarantined.length ? `, ${quarantined.length} quarantined` : ''}`);
     await checkpoint(discoveredAgents, filesProcessed, lastTimestamp, failedFiles, failedMessages);
     return sent;
 }
 
 /** Same as flush(), but for the AgentCore trace pipeline's manifest shape. */
-async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeLeft) {
+async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeLeft, pendingDiscovery = null, logGroupSamples, logGroupWalkCursor) {
     if (messages.length === 0) return 0;
-    await sendToDataIngestionService(messages, timeLeft);
-    await updateTraceManifest(discoveredAgents, logGroupCheckpoints);
-    return messages.length;
+    console.log(`📤 Flushing ${messages.length} AgentCore message(s) to AKTO Ingestion API...`);
+    const { sent, quarantined } = await sendToDataIngestionService(messages, timeLeft);
+    if (quarantined.length > 0) {
+        console.warn(`🚫 ${quarantined.length} AgentCore message(s) permanently rejected by ingest`);
+    }
+    if (pendingDiscovery) {
+        applyPendingDiscovery(discoveredAgents, pendingDiscovery, sent, messages.length, quarantined.length);
+        if (sent === messages.length && quarantined.length === 0) {
+            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
+        }
+        console.log(`✅ AgentCore discovery flush: ${sent} message(s) accepted by ingest`);
+        return sent;
+    }
+    await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
+    console.log(`✅ AgentCore flush: ${sent} message(s) accepted by ingest`);
+    return sent;
 }
 
 /**
@@ -101,7 +140,7 @@ async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeL
  * messages — one message per trace, not per record. Records are grouped by
  * traceId first, then identity+content resolved jointly per trace.
  */
-async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap) {
+async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap, parseStatsOut) {
     // Counted rather than logged per record: a busy log group holds thousands of
     // spans, and the useful question is "where did they all go", not "what was
     // record 4,812". One summary line per log group answers that.
@@ -145,7 +184,31 @@ async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourc
                 : `${stats.failed} trace(s) failed to build`;
         console.warn(`⚠️ ${logGroup.logGroupName}: no messages produced — ${reason}`);
     }
+    if (parseStatsOut) {
+        Object.assign(parseStatsOut, stats);
+    }
     return messages;
+}
+
+function isS3ListAccessDenied(error) {
+    const name = error?.name || '';
+    const message = error?.message || '';
+    return name === 'AccessDenied'
+        || name === 'AccessDeniedException'
+        || /not authorized to perform:\s*s3:ListBucket/i.test(message);
+}
+
+function emptyS3PipelineResult(totalSent, failedMessages, lastTimestamp) {
+    const stats = { ...getLogStats(), ...getIdentityStats() };
+    console.log(`🎉 Bedrock Agent Classic done. Files processed: 0, failed: 0, deferred: 0, messages sent: ${totalSent}, checkpoint: ${lastTimestamp || 'unchanged'}`);
+    return {
+        filesDone: 0,
+        filesFailed: 0,
+        filesDeferred: 0,
+        totalSent,
+        messagesQuarantined: failedMessages.length,
+        traffic: stats
+    };
 }
 
 /** Bedrock Agent Classic: S3 model-invocation logs → AKTO. Unchanged from before the AgentCore merge. */
@@ -164,14 +227,32 @@ async function runS3Pipeline(timeLeft, sendTimeLeft) {
     await rebuildRoleMapFromDiscoveredAgents(discoveredAgents, timeLeft);
 
     console.log('📋 Discovering agents...');
-    const discoveryMessages = await discoverAllNewAgents(discoveredAgents, timeLeft);
-    console.log(`✅ Discovery: ${discoveryMessages.length} new resource(s) found`);
+    const { messages: discoveryMessages, pending: discoveryPending } = await discoverAllNewAgents(discoveredAgents, timeLeft);
+    console.log(`✅ Discovery: ${discoveryMessages.length} new Bedrock Agent Classic resource(s) found`);
 
     if (discoveryMessages.length > 0) {
-        totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp, [], sendTimeLeft, failedMessages);
+        totalSent += await flush(discoveryMessages, discoveredAgents, 0, lastTimestamp, [], sendTimeLeft, failedMessages, discoveryPending);
     }
 
-    const unprocessedFiles = await getUnprocessedLogFiles(manifest);
+    const logsBucketConfigured = Boolean(config.LOGS_BUCKET_NAME && String(config.LOGS_BUCKET_NAME).trim());
+    if (!logsBucketConfigured) {
+        console.log('ℹ️ No Bedrock S3 logs bucket — skipping log file processing (agent discovery still ran)');
+        return emptyS3PipelineResult(totalSent, failedMessages, lastTimestamp);
+    }
+
+    let unprocessedFiles;
+    try {
+        unprocessedFiles = await getUnprocessedLogFiles(manifest);
+    } catch (error) {
+        if (isS3ListAccessDenied(error)) {
+            console.warn(
+                `🚫 S3 ListBucket denied for ${config.LOGS_BUCKET_NAME} — skipping Classic log files; AgentCore CloudWatch ingest continues. `
+                + 'Grant s3:ListBucket and s3:GetObject on the invocation logging bucket to read Classic conversations from S3.'
+            );
+            return emptyS3PipelineResult(totalSent, failedMessages, lastTimestamp);
+        }
+        throw error;
+    }
     console.log(`📁 ${unprocessedFiles.length} unprocessed log file(s)`);
 
     let pending = [];
@@ -244,59 +325,168 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
     const traceManifest = await getTraceManifest();
     const discoveredAgents = { ...(traceManifest.discoveredAgents || {}) };
     const logGroupCheckpoints = { ...(traceManifest.logGroupCheckpoints || {}) };
+    let logGroupSamples = { ...(traceManifest.logGroupSamples || {}) };
+    let logGroupWalkCursor = traceManifest.logGroupWalkCursor || '';
+    const traceSampleCaptureState = { capturesThisRun: 0 };
     let totalSent = 0;
 
     console.log('📋 Discovering AgentCore harnesses/runtimes...');
-    const discoveryMessages = await discoverNewResources(discoveredAgents, timeLeft);
-    console.log(`✅ AgentCore discovery: ${discoveryMessages.length} new resource(s) found`);
+    const { messages: discoveryMessages, pending: discoveryPending } = await discoverNewResources(discoveredAgents, timeLeft);
+    console.log(`✅ AgentCore discovery: ${discoveryMessages.length} new harness/runtime resource(s) found`);
     if (discoveryMessages.length > 0) {
-        totalSent += await flushTrace(discoveryMessages, discoveredAgents, logGroupCheckpoints, sendTimeLeft);
+        totalSent += await flushTrace(discoveryMessages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, discoveryPending, logGroupSamples, logGroupWalkCursor);
     }
 
     await backfillExecutionRoleArns(discoveredAgents, timeLeft);
     const roleNameToResourceMap = buildRoleNameToResourceMap(discoveredAgents);
     const harnessNameToResourceMap = buildHarnessNameToResourceMap(discoveredAgents);
 
-    const logGroups = await discoverObservabilityLogGroups();
+    const allLogGroups = await discoverObservabilityLogGroups();
     let groupsProcessed = 0;
     let groupsDeferred = 0;
+    let logGroupsScoped = 0;
+    let logGroupsSkippedOrphan = 0;
+
+    if (allLogGroups.length === 0) {
+        console.log('✅ No AgentCore observability log groups found — tracing likely not enabled on this account. Discovery still ran above.');
+        return { logGroupsFound: 0, logGroupsScoped: 0, groupsProcessed, groupsDeferred, totalSent };
+    }
+
+    const { groups: logGroups, stats: scopeStats } = filterLogGroupsForIngest(allLogGroups, {
+        discoveredAgents,
+        logGroupCheckpoints,
+        scope: config.TRACE_LOG_GROUP_SCOPE,
+        includeSubstrings: config.TRACE_LOG_GROUP_INCLUDE_SUBSTRINGS,
+        excludeSubstrings: config.TRACE_LOG_GROUP_EXCLUDE_SUBSTRINGS,
+        emptyPollCooldownHours: config.TRACE_EMPTY_LOG_GROUP_COOLDOWN_HOURS,
+        lowValueEmptyStreak: config.TRACE_LOW_VALUE_EMPTY_STREAK,
+        lowValueSkipHours: config.TRACE_LOW_VALUE_SKIP_HOURS
+    });
+    logGroupsScoped = logGroups.length;
+    logGroupsSkippedOrphan = scopeStats.skippedOrphan;
+    console.log(
+        `🎯 Log group scope (${scopeStats.scope}): ${scopeStats.selected} to walk of ${scopeStats.listed} listed`
+        + ` (${scopeStats.discoveredRuntimeIds} discovered runtime/harness id(s)`
+        + (scopeStats.skippedOrphan ? `, ${scopeStats.skippedOrphan} orphan historical group(s) skipped` : '')
+        + (scopeStats.skippedEmptyCooldown ? `, ${scopeStats.skippedEmptyCooldown} on empty-poll cooldown` : '')
+        + (scopeStats.skippedExclude ? `, ${scopeStats.skippedExclude} excluded by substring` : '')
+        + (scopeStats.includedByPattern ? `, ${scopeStats.includedByPattern} extra group(s) via include substring` : '')
+        + (scopeStats.skippedLowValue ? `, ${scopeStats.skippedLowValue} infra-only on low-value skip` : '')
+        + ')'
+    );
 
     if (logGroups.length === 0) {
-        console.log('✅ No AgentCore observability log groups found — tracing likely not enabled on this account. Discovery still ran above.');
-        return { logGroupsFound: 0, groupsProcessed, groupsDeferred, totalSent };
+        console.log('✅ No in-scope AgentCore log groups to walk this run (all filtered or on cooldown).');
+        return {
+            logGroupsFound: allLogGroups.length,
+            logGroupsScoped: 0,
+            groupsProcessed,
+            groupsDeferred: 0,
+            totalSent
+        };
     }
 
     const lookbackMs = Date.now() - config.TRACE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+    const walkPlan = orderLogGroupsForWalk(logGroups, logGroupCheckpoints, logGroupWalkCursor);
+    const orderedLogGroups = walkPlan.groups;
+    console.log(
+        `🧭 Log group walk: ${walkPlan.uncheckedCount} without checkpoint, ${walkPlan.checkedCount} with checkpoint`
+        + `, ordered by conversation signal priority`
+    );
 
-    for (const logGroup of logGroups) {
+    for (const logGroup of orderedLogGroups) {
         if (timeLeft() < config.TIME_SAFETY_MARGIN_MS) {
-            groupsDeferred = logGroups.length - groupsProcessed;
+            groupsDeferred = orderedLogGroups.length - groupsProcessed;
             console.warn(`⏱️ ${timeLeft()}ms left — stopping early, ${groupsDeferred} AgentCore log group(s) deferred to next run`);
             break;
         }
 
         const sinceMs = logGroupCheckpoints[logGroup.logGroupName]?.lastEventTimestamp || lookbackMs;
-        const { events, latestTimestamp } = await fetchNewLogEvents(logGroup.logGroupName, sinceMs, timeLeft, config.TIME_SAFETY_MARGIN_MS);
+        const { events, latestTimestamp, accessDenied } = await fetchNewLogEvents(
+            logGroup.logGroupName,
+            sinceMs,
+            timeLeft,
+            config.TIME_SAFETY_MARGIN_MS,
+            config.TRACE_MAX_EVENTS_PER_LOG_GROUP
+        );
         groupsProcessed++;
+        logGroupWalkCursor = logGroup.logGroupName;
 
-        if (events.length === 0) continue;
+        if (accessDenied) {
+            groupsDeferred = orderedLogGroups.length - groupsProcessed;
+            console.warn(
+                `🚫 logs:FilterLogEvents denied — skipping trace ingest for ${groupsDeferred} remaining log group(s) this run. `
+                + `AgentCore inventory discovery already ran above. Fix customer IAM Resource to `
+                + `arn:aws:logs:*:${config.AWS_ACCOUNT_ID}:log-group:${config.RUNTIME_LOG_GROUP_PREFIX}*`
+            );
+            break;
+        }
+
+        if (events.length === 0) {
+            checkpointEmptyLogGroupPoll(logGroupCheckpoints, logGroup, Date.now());
+            continue;
+        }
+
+        logGroupSamples = await captureLogGroupSampleIfNeeded(
+            events,
+            logGroup,
+            { latestTimestamp, sinceMs },
+            logGroupSamples,
+            traceSampleCaptureState
+        );
 
         // buildTraceMessagesForLogGroup already logs the full event → trace → message
         // accounting for this group, so there's nothing to restate here.
-        const messages = await buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap);
-        logGroupCheckpoints[logGroup.logGroupName] = { lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId };
+        const signalCount = countConversationSignalsInEvents(events);
+        const parseStats = {};
+        const messages = await buildTraceMessagesForLogGroup(
+            events, logGroup, roleNameToResourceMap, harnessNameToResourceMap, parseStats
+        );
+        const prior = logGroupCheckpoints[logGroup.logGroupName] || {};
+        let checkpoint = enrichCheckpointAfterIngest(
+            { ...prior, lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId },
+            messages.length,
+            signalCount,
+            parseStats
+        );
+        if (
+            config.TRACE_LOW_VALUE_EMPTY_STREAK > 0
+            && config.TRACE_LOW_VALUE_SKIP_HOURS > 0
+            && (checkpoint.emptyMessageStreak || 0) >= config.TRACE_LOW_VALUE_EMPTY_STREAK
+            && !(checkpoint.lastConversationSignalCount > 0)
+        ) {
+            checkpoint.skipUntilMs = Date.now() + config.TRACE_LOW_VALUE_SKIP_HOURS * 60 * 60 * 1000;
+        }
+        logGroupCheckpoints[logGroup.logGroupName] = checkpoint;
 
         if (messages.length > 0) {
-            totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft);
+            totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, null, logGroupSamples, logGroupWalkCursor);
         } else {
             // No messages built, but there's no unsent data at risk — checkpoint now
             // so this log group doesn't re-scan the same events every run.
-            await updateTraceManifest(discoveredAgents, logGroupCheckpoints);
+            await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
         }
     }
 
+    if (groupsProcessed > 0) {
+        await updateTraceManifest(discoveredAgents, logGroupCheckpoints, logGroupSamples, logGroupWalkCursor);
+    }
+
+    if (traceSampleCaptureState.capturesThisRun > 0) {
+        console.log(
+            `📦 Trace log samples: ${traceSampleCaptureState.capturesThisRun} new/updated this run `
+            + `(${Object.keys(logGroupSamples).length} total indexed in trace manifest)`
+        );
+    }
     console.log(`🎉 AgentCore done. Log groups processed: ${groupsProcessed}, deferred: ${groupsDeferred}, messages sent: ${totalSent}`);
-    return { logGroupsFound: logGroups.length, groupsProcessed, groupsDeferred, totalSent };
+    return {
+        logGroupsFound: allLogGroups.length,
+        logGroupsScoped,
+        logGroupsSkippedOrphan,
+        groupsProcessed,
+        groupsDeferred,
+        totalSent
+    };
 }
 
 /**
@@ -360,6 +550,7 @@ exports.handler = async (event, context) => {
 
     try {
         config.validateConfig();
+        await config.initAwsClients();
         logEffectiveConfig();
         console.log(`  └─ run budget          ${(config.RUN_BUDGET_MS / 1000).toFixed(0)}s of work (schedule is ${(config.SCHEDULE_INTERVAL_MS / 60000).toFixed(0)}min; finishing inside it keeps runs from overlapping)`);
         console.log(`  └─ budget split        S3 holds up to ${(config.S3_BUDGET_MS / 1000).toFixed(0)}s (${Math.round(config.S3_BUDGET_SHARE * 100)}%), AgentCore gets the rest plus anything S3 leaves`);

@@ -3,6 +3,7 @@
  */
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
 const { actorIp } = require('./identityActor');
+const { resolveMirrorHost } = require('./mirrorHost');
 
 /**
  * Maps a Bedrock log entry's operation to the real Runtime API path suffix it hit.
@@ -26,15 +27,15 @@ function operationToPath(operation) {
  */
 function buildAgentMessage(data, isConversation) {
     const timestamp = isConversation ? Math.floor(new Date(data.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
-    const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+    const originalHost = resolveMirrorHost(data, isConversation, AWS_REGION);
 
     const modelId = isConversation ? data.modelId : (data.foundationModel || 'unknown-model');
     const resourceId = isConversation
         ? data.agentId
-        : (data.resourceType === 'HARNESS' ? data.harnessId : data.agentId);
+        : (data.resourceType === 'HARNESS' ? data.harnessId : (data.resourceType === 'RUNTIME' ? data.runtimeId : data.agentId));
     const resourceName = isConversation
         ? data.botName
-        : (data.resourceType === 'HARNESS' ? data.harnessName : data.agentName);
+        : (data.resourceType === 'HARNESS' ? data.harnessName : (data.resourceType === 'RUNTIME' ? data.runtimeName : data.agentName));
 
     const requestHeaders = isConversation
         ? {
@@ -97,7 +98,7 @@ function buildAgentMessage(data, isConversation) {
             },
             awsMetadata: data.awsMetadata || {}
         }
-        : { awsMetadata: { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt } };
+        : { awsMetadata: { agentStatus: data.agentStatus, createdAt: data.createdAt, updatedAt: data.updatedAt, ...(data.awsMetadata || {}) } };
 
     const tags = {
         source: 'AWS_BEDROCK',
@@ -116,14 +117,14 @@ function buildAgentMessage(data, isConversation) {
         // resource; it never leaks into what's sent to AKTO.
         agentType: isConversation
             ? (data.logType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.logType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : (data.logType === 'AGENT' || data.logType === 'SERVICE_AGENT' ? 'BEDROCK_AGENT' : 'UNKNOWN')))
-            : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.resourceType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'BEDROCK_AGENT')),
+            : (data.resourceType === 'HARNESS' ? 'AGENTCORE_AGENT' : (data.resourceType === 'RUNTIME' ? 'AGENTCORE_RUNTIME' : (data.resourceType === 'STANDALONE_RUNTIME' ? 'AGENTCORE_STANDALONE_RUNTIME' : 'BEDROCK_AGENT'))),
         'bot-name': resourceName || '',
         // SERVICE_AGENT has no AWS resource ID of its own — the calling principal's name
         // (already in resourceId/resourceName) fills this slot instead, so a caller
         // still has a stable, non-empty identity tag to be grouped/deduped on.
         'agent-id': (isConversation ? data.logType === 'AGENT' || data.logType === 'STANDALONE_RUNTIME' || data.logType === 'SERVICE_AGENT' : data.resourceType === 'AGENT' || data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
         'harness-id': (isConversation ? data.logType === 'HARNESS' : data.resourceType === 'HARNESS') ? (data.harnessId || '') : '',
-        'runtime-id': (isConversation ? data.logType === 'STANDALONE_RUNTIME' : data.resourceType === 'STANDALONE_RUNTIME') ? (data.agentId || '') : '',
+        'runtime-id': (isConversation ? data.logType === 'STANDALONE_RUNTIME' : (data.resourceType === 'RUNTIME' || data.resourceType === 'STANDALONE_RUNTIME')) ? (data.runtimeId || data.agentId || '') : '',
         model: modelId,
         'bedrock-identity-arn': data.arn || '',
         ...(isConversation
@@ -146,7 +147,11 @@ function buildAgentMessage(data, isConversation) {
                 // Agent API.
                 ...(data.logType === 'AGENT' || data.logType === 'SERVICE_AGENT' ? data.agentTags : data.harnessTags)
             }
-            : { 'discovery-type': 'METADATA_ONLY', 'has-conversations': 'false', ...(data.resourceType === 'AGENT' ? data.agentTags : data.harnessTags) })
+            : {
+                'discovery-type': 'METADATA_ONLY',
+                'has-conversations': 'false',
+                ...(data.resourceType === 'AGENT' ? data.agentTags : (data.resourceType === 'RUNTIME' ? data.runtimeTags : data.harnessTags))
+            })
     };
 
     const path = `/model/${modelId}/${operationToPath(isConversation ? data.operation : null)}`;

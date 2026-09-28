@@ -58,7 +58,7 @@ function extractIdentityFromRecord(record) {
         harnessId: attributes['harness.id'] || '',
         serviceName: resourceAttrs['service.name'] || '',
         sessionId: attributes['session.id'] || attributes['gen_ai.conversation.id'] || resourceAttrs['session.id'] || '',
-        modelId: attributes['gen_ai.request.model'] || attributes['gen_ai.response.model'] || '',
+        modelId: attributes['gen_ai.request.model'] || attributes['llm.model_name'] || attributes['gen_ai.response.model'] || '',
         startTimeUnixNano: record.startTimeUnixNano || record.timeUnixNano || null
     };
 }
@@ -154,6 +154,99 @@ function extractUserMessageFromHarnessConversationEvent(records) {
     return event ? extractTextFromContentBlocks(event.body?.content) : '';
 }
 
+/** Whether a SPAN carries OpenInference / Strands-on-spans conversation fields. */
+function isOpenInferenceConversationSpan(record) {
+    if (classifyRecord(record) !== 'SPAN') return false;
+    const attrs = record.attributes || {};
+    return Boolean(
+        attrs['openinference.span.kind']
+        || attrs['llm.input_messages.0.message.content']
+        || attrs['llm.output_messages.0.message.content']
+        || attrs['input.value']
+        || attrs['output.value']
+        || attrs['llm.input_messages']
+        || attrs['llm.output_messages']
+    );
+}
+
+function lastMessageTextFromOpenInferenceJsonList(raw, role) {
+    if (!raw || typeof raw !== 'string') return '';
+    try {
+        const list = JSON.parse(raw);
+        if (!Array.isArray(list)) return '';
+        for (let i = list.length - 1; i >= 0; i--) {
+            const entry = list[i];
+            const entryRole = entry?.['message.role'] || entry?.role;
+            const text = entry?.['message.content'] ?? entry?.content;
+            if (typeof text !== 'string') continue;
+            if (role && entryRole !== role) continue;
+            const trimmed = text.trim();
+            if (trimmed) return trimmed;
+        }
+    } catch {
+        return '';
+    }
+    return '';
+}
+
+function indexedLlmMessageTexts(attrs, prefix, role) {
+    const texts = [];
+    for (let i = 0; i < 64; i++) {
+        const content = attrs[`${prefix}.${i}.message.content`];
+        if (content === undefined || content === null || content === '') break;
+        const entryRole = attrs[`${prefix}.${i}.message.role`];
+        if (!role || entryRole === role) texts.push(String(content).trim());
+    }
+    return texts;
+}
+
+function scoreOpenInferenceSpan(record) {
+    const attrs = record.attributes || {};
+    let score = 0;
+    if (record.name === 'chat') score += 60;
+    if (record.name === 'execute_event_loop_cycle') score += 45;
+    if (record.name === 'invoke_agent Strands Agents') score += 55;
+    if (attrs['openinference.span.kind'] === 'LLM') score += 50;
+    if (attrs['gen_ai.operation.name'] === 'chat') score += 40;
+    if (attrs['gen_ai.operation.name'] === 'invoke_agent') score += 35;
+    if (attrs['openinference.span.kind'] === 'AGENT') score += 25;
+    if (attrs['llm.output_messages.0.message.content']) score += 15;
+    if (attrs['output.value']) score += 10;
+    if (attrs['input.value']) score += 5;
+    return score;
+}
+
+/** Strands + OpenInference export conversation on OTEL span attributes (not gen_ai.* log events). */
+function extractConversationContentFromOpenInferenceSpans(records) {
+    const spans = records
+        .filter(isOpenInferenceConversationSpan)
+        .sort((a, b) => scoreOpenInferenceSpan(b) - scoreOpenInferenceSpan(a));
+
+    let best = { userMessage: '', agentResponse: '' };
+    for (const record of spans) {
+        const attrs = record.attributes || {};
+        let userMessage = indexedLlmMessageTexts(attrs, 'llm.input_messages', 'user').pop()
+            || lastMessageTextFromOpenInferenceJsonList(attrs['llm.input_messages'], 'user')
+            || String(attrs['input.value'] || '').trim();
+        let agentResponse = indexedLlmMessageTexts(attrs, 'llm.output_messages', 'assistant').pop()
+            || lastMessageTextFromOpenInferenceJsonList(attrs['llm.output_messages'], 'assistant')
+            || String(attrs['llm.output_messages.0.message.content'] || attrs['output.value'] || '').trim();
+
+        if (userMessage.startsWith('<user_context>')) userMessage = '';
+
+        if (userMessage && agentResponse) {
+            return { userMessage, agentResponse };
+        }
+        if ((userMessage && !best.userMessage) || (agentResponse && !best.agentResponse)) {
+            best = {
+                userMessage: userMessage || best.userMessage,
+                agentResponse: agentResponse || best.agentResponse
+            };
+        }
+    }
+    return best;
+}
+
 /** Resolves conversation content for one trace, preferring the most reliable source per field with fallbacks. */
 function resolveTraceContent(records) {
     let userMessage = extractUserMessageFromHarnessConversationEvent(records);
@@ -173,6 +266,12 @@ function resolveTraceContent(records) {
             if (!userMessage) userMessage = fromEvents.userMessage;
             if (!agentResponse) agentResponse = fromEvents.agentResponse;
         }
+    }
+
+    if (!userMessage || !agentResponse) {
+        const fromSpans = extractConversationContentFromOpenInferenceSpans(records);
+        if (!userMessage) userMessage = fromSpans.userMessage;
+        if (!agentResponse) agentResponse = fromSpans.agentResponse;
     }
 
     return { userMessage, agentResponse: stripThinkingBlock(agentResponse) };
@@ -270,12 +369,17 @@ function extractTraceUsage(records) {
         const operation = attributes['gen_ai.operation.name'];
         // Only the model-named chat span is a real round-trip; its unnamed parent
         // wraps it and would double-count.
-        if (operation === 'chat' && typeof record.name === 'string' && record.name.startsWith('chat ')) {
+        const isChatSpan = operation === 'chat'
+            && (record.name === 'chat' || (typeof record.name === 'string' && record.name.startsWith('chat ')));
+        if (isChatSpan) {
             usage.llmCalls += 1;
-            chatIn += Number(attributes['gen_ai.usage.input_tokens'] || 0);
-            chatOut += Number(attributes['gen_ai.usage.output_tokens'] || 0);
+            chatIn += Number(attributes['gen_ai.usage.input_tokens'] || attributes['gen_ai.usage.prompt_tokens'] || 0);
+            chatOut += Number(attributes['gen_ai.usage.output_tokens'] || attributes['gen_ai.usage.completion_tokens'] || 0);
         }
-        if (operation === 'invoke_agent' && attributes['gen_ai.usage.input_tokens'] !== undefined) agent = attributes;
+        if ((operation === 'invoke_agent' || record.name === 'invoke_agent Strands Agents')
+            && attributes['gen_ai.usage.input_tokens'] !== undefined) {
+            agent = attributes;
+        }
     }
 
     usage.inputTokens = Number(agent?.['gen_ai.usage.input_tokens'] ?? chatIn) || 0;
@@ -355,5 +459,11 @@ function buildConversationPair(identity, content, logGroup, roleNameToResourceMa
 }
 
 module.exports = {
-    classifyRecord, parseLogRecord, resolveTraceIdentity, resolveTraceContent, buildConversationPair
+    classifyRecord,
+    parseLogRecord,
+    resolveTraceIdentity,
+    resolveTraceContent,
+    buildConversationPair,
+    extractConversationContentFromOpenInferenceSpans,
+    isOpenInferenceConversationSpan
 };

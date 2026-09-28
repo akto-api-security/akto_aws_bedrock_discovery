@@ -4,7 +4,8 @@
  * parsing/classification is traceParser.js's job.
  */
 const { DescribeLogGroupsCommand, FilterLogEventsCommand } = require('@aws-sdk/client-cloudwatch-logs');
-const { cloudWatchLogsClient, RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH } = require('./config');
+const config = require('./config');
+const { RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH } = config;
 
 /**
  * Pulls the runtime ID out of a per-runtime log group name:
@@ -26,7 +27,7 @@ async function discoverObservabilityLogGroups() {
     try {
         let nextToken;
         do {
-            const response = await cloudWatchLogsClient.send(new DescribeLogGroupsCommand({
+            const response = await config.cloudWatchLogsClient.send(new DescribeLogGroupsCommand({
                 logGroupNamePrefix: RUNTIME_LOG_GROUP_PREFIX,
                 nextToken
             }));
@@ -50,17 +51,23 @@ async function discoverObservabilityLogGroups() {
  * { events, latestTimestamp } so the caller can checkpoint even on a partial
  * fetch cut short by the time budget.
  */
-async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarginMs) {
+async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarginMs, maxEventsPerLogGroup = 0) {
     const events = [];
     let latestTimestamp = sinceMs;
     let nextToken;
+    let truncated = false;
+    const eventCap = maxEventsPerLogGroup > 0 ? maxEventsPerLogGroup : Infinity;
     try {
         do {
             if (timeLeft() < timeSafetyMarginMs) {
                 console.warn(`⏱️ Time budget low — deferring remaining pages for ${logGroupName}`);
                 break;
             }
-            const response = await cloudWatchLogsClient.send(new FilterLogEventsCommand({
+            if (events.length >= eventCap) {
+                truncated = true;
+                break;
+            }
+            const response = await config.cloudWatchLogsClient.send(new FilterLogEventsCommand({
                 logGroupName,
                 startTime: sinceMs + 1, // +1ms: startTime is inclusive, avoids re-fetching the last event already processed
                 limit: MAX_LOG_EVENTS_PER_FETCH,
@@ -69,13 +76,26 @@ async function fetchNewLogEvents(logGroupName, sinceMs, timeLeft, timeSafetyMarg
             for (const event of response.events || []) {
                 events.push(event);
                 if (event.timestamp > latestTimestamp) latestTimestamp = event.timestamp;
+                if (events.length >= eventCap) {
+                    truncated = true;
+                    break;
+                }
             }
-            nextToken = response.nextToken;
+            nextToken = truncated ? undefined : response.nextToken;
         } while (nextToken);
     } catch (error) {
+        const accessDenied = error.name === 'AccessDeniedException'
+            || /not authorized to perform:\s*logs:FilterLogEvents/i.test(error.message || '');
         console.error(`❌ FilterLogEvents failed for ${logGroupName}: ${error.message}`);
+        return { events, latestTimestamp, accessDenied, truncated };
     }
-    return { events, latestTimestamp };
+    if (truncated) {
+        console.warn(
+            `📎 ${logGroupName}: capped at ${events.length} event(s) this run `
+            + `(TRACE_MAX_EVENTS_PER_LOG_GROUP) — checkpoint advances; remaining pages deferred`
+        );
+    }
+    return { events, latestTimestamp, accessDenied: false, truncated };
 }
 
 module.exports = { discoverObservabilityLogGroups, fetchNewLogEvents, extractRuntimeIdFromLogGroupName };

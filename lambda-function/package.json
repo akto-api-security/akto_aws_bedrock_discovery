@@ -20,12 +20,14 @@
   "author": "AKTO",
   "license": "MIT",
   "dependencies": {
+    "@aws-sdk/client-bedrock": "^3.1129.0",
     "@aws-sdk/client-bedrock-agent": "^3.682.0",
     "@aws-sdk/client-bedrock-agentcore-control": "^3.1071.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.682.0",
     "@aws-sdk/client-iam": "^3.682.0",
     "@aws-sdk/client-lambda": "^3.1071.0",
     "@aws-sdk/client-s3": "^3.682.0",
+    "@aws-sdk/client-sts": "^3.1129.0",
     "@aws-sdk/util-arn-parser": "^3.682.0"
   },
   "engines": {
