@@ -5,6 +5,7 @@
  */
 const { AWS_REGION, AWS_ACCOUNT_ID } = require('./config');
 const { actorIp } = require('./identityActor');
+const { resolveMirrorHost } = require('./mirrorHost');
 
 /** Normalizes discovery-message identity across HARNESS/RUNTIME, which use different field names for the same concept. */
 function resolveDiscoveryIdentity(data) {
@@ -29,7 +30,7 @@ function operationToPath(operation) {
  */
 function buildAgentMessage(data, isConversation) {
     const timestamp = isConversation ? Math.floor(new Date(data.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
-    const originalHost = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+    const originalHost = resolveMirrorHost(data, isConversation, AWS_REGION);
 
     const modelId = isConversation ? data.modelId : (data.foundationModel || 'unknown-model');
     const discoveryIdentity = isConversation ? null : resolveDiscoveryIdentity(data);

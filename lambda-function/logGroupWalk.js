@@ -1,8 +1,9 @@
 /**
- * Orders AgentCore observability log groups for each run: never-checkpointed
- * groups first, then checkpointed groups rotated from logGroupWalkCursor so we
- * do not re-walk the full list from index 0 every invocation.
+ * Orders AgentCore observability log groups for each run by conversation
+ * signal priority (manifest hints + inttest boost), then name.
  */
+
+const { computeWalkPriority } = require('./logGroupConversationSignal');
 
 function byLogGroupName(a, b) {
     return a.logGroupName.localeCompare(b.logGroupName);
@@ -11,30 +12,21 @@ function byLogGroupName(a, b) {
 /**
  * @param {Array<{logGroupName: string}>} allGroups
  * @param {Record<string, object>} logGroupCheckpoints
- * @param {string} walkCursor — last logGroupName processed on the checked queue (may be empty)
+ * @param {string} _walkCursor — retained for manifest compatibility; ordering is priority-based
  */
-function orderLogGroupsForWalk(allGroups, logGroupCheckpoints, walkCursor = '') {
-    const unchecked = [];
-    const checked = [];
-    for (const group of allGroups) {
-        if (logGroupCheckpoints[group.logGroupName]) checked.push(group);
-        else unchecked.push(group);
-    }
-    unchecked.sort(byLogGroupName);
-    checked.sort(byLogGroupName);
-
-    let rotatedChecked = checked;
-    if (walkCursor) {
-        const idx = checked.findIndex((g) => g.logGroupName === walkCursor);
-        if (idx >= 0) {
-            rotatedChecked = checked.slice(idx + 1).concat(checked.slice(0, idx + 1));
-        }
-    }
+function orderLogGroupsForWalk(allGroups, logGroupCheckpoints, _walkCursor = '') {
+    const groups = [...allGroups].sort((a, b) => {
+        const pa = computeWalkPriority(a, logGroupCheckpoints[a.logGroupName]);
+        const pb = computeWalkPriority(b, logGroupCheckpoints[b.logGroupName]);
+        if (pb !== pa) return pb - pa;
+        return byLogGroupName(a, b);
+    });
+    const uncheckedCount = allGroups.filter((g) => !logGroupCheckpoints[g.logGroupName]).length;
 
     return {
-        groups: unchecked.concat(rotatedChecked),
-        uncheckedCount: unchecked.length,
-        checkedCount: checked.length
+        groups,
+        uncheckedCount,
+        checkedCount: allGroups.length - uncheckedCount
     };
 }
 

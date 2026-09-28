@@ -70,6 +70,8 @@ function isOnEmptyPollCooldown(checkpoint, nowMs, cooldownHours) {
  * @param {string[]} options.includeSubstrings
  * @param {string[]} options.excludeSubstrings
  * @param {number} options.emptyPollCooldownHours
+ * @param {number} [options.lowValueEmptyStreak]
+ * @param {number} [options.lowValueSkipHours]
  * @param {number} nowMs
  */
 function filterLogGroupsForIngest(allGroups, options, nowMs = Date.now()) {
@@ -79,7 +81,9 @@ function filterLogGroupsForIngest(allGroups, options, nowMs = Date.now()) {
         scope,
         includeSubstrings,
         excludeSubstrings,
-        emptyPollCooldownHours
+        emptyPollCooldownHours,
+        lowValueEmptyStreak = 0,
+        lowValueSkipHours = 0
     } = options;
 
     const runtimeIds = buildDiscoveredRuntimeIdSet(discoveredAgents);
@@ -96,6 +100,7 @@ function filterLogGroupsForIngest(allGroups, options, nowMs = Date.now()) {
         skippedExclude: 0,
         includedByPattern: 0,
         skippedEmptyCooldown: 0,
+        skippedLowValue: 0,
         scope: fallbackToAll ? 'all (no discovered runtimes yet)' : scope,
         discoveredRuntimeIds: runtimeIds.size
     };
@@ -123,6 +128,15 @@ function filterLogGroupsForIngest(allGroups, options, nowMs = Date.now()) {
         if (isOnEmptyPollCooldown(checkpoint, nowMs, emptyPollCooldownHours)) {
             stats.skippedEmptyCooldown++;
             continue;
+        }
+        if (lowValueEmptyStreak > 0 && lowValueSkipHours > 0 && checkpoint?.skipUntilMs) {
+            const skipUntil = Number(checkpoint.skipUntilMs);
+            const streak = Number(checkpoint.emptyMessageStreak) || 0;
+            const hadSignals = (Number(checkpoint.lastConversationSignalCount) || 0) > 0;
+            if (streak >= lowValueEmptyStreak && !hadSignals && !Number.isNaN(skipUntil) && nowMs < skipUntil) {
+                stats.skippedLowValue++;
+                continue;
+            }
         }
 
         groups.push(logGroup);

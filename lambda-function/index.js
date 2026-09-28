@@ -25,6 +25,7 @@ const { getTraceManifest, updateTraceManifest } = require('./traceManifest');
 const { captureLogGroupSampleIfNeeded } = require('./traceLogSampleCapture');
 const { orderLogGroupsForWalk, checkpointEmptyLogGroupPoll } = require('./logGroupWalk');
 const { filterLogGroupsForIngest } = require('./logGroupScope');
+const { countConversationSignalsInEvents, enrichCheckpointAfterIngest } = require('./logGroupConversationSignal');
 
 let traceHarnessInitialized = false;
 
@@ -53,7 +54,10 @@ function logEffectiveConfig() {
         : '(none — discovery-only until S3 logging is configured)';
     console.log(`  ├─ bedrock logs        ${logsLoc}`);
     console.log(`  ├─ checkpoints         s3://${config.MARKERS_BUCKET_NAME}/${config.MARKERS_PREFIX}`);
-    console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}* (scope ${config.TRACE_LOG_GROUP_SCOPE}, cap ${config.TRACE_MAX_EVENTS_PER_LOG_GROUP} events/group)`);
+    const includeHint = config.TRACE_LOG_GROUP_INCLUDE_SUBSTRINGS.length
+        ? `, include ${config.TRACE_LOG_GROUP_INCLUDE_SUBSTRINGS.join('|')}`
+        : '';
+    console.log(`  ├─ agentcore logs      ${config.RUNTIME_LOG_GROUP_PREFIX}* (scope ${config.TRACE_LOG_GROUP_SCOPE}${includeHint}, cap ${config.TRACE_MAX_EVENTS_PER_LOG_GROUP} events/group)`);
     console.log(`  ├─ akto ingest host    ${ingestHost} (api key ${config.AKTO_API_KEY ? 'set' : 'MISSING'})`);
     console.log(`  └─ lookback            ${config.LOOKBACK_DAYS}d s3 / ${config.TRACE_LOOKBACK_DAYS}d traces`);
 }
@@ -136,7 +140,7 @@ async function flushTrace(messages, discoveredAgents, logGroupCheckpoints, timeL
  * messages — one message per trace, not per record. Records are grouped by
  * traceId first, then identity+content resolved jointly per trace.
  */
-async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap) {
+async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap, parseStatsOut) {
     // Counted rather than logged per record: a busy log group holds thousands of
     // spans, and the useful question is "where did they all go", not "what was
     // record 4,812". One summary line per log group answers that.
@@ -179,6 +183,9 @@ async function buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourc
                 ? `no usable records: ${stats.other} unrecognised, ${stats.noTraceId} without a traceId, ${stats.unparseable} unparseable`
                 : `${stats.failed} trace(s) failed to build`;
         console.warn(`⚠️ ${logGroup.logGroupName}: no messages produced — ${reason}`);
+    }
+    if (parseStatsOut) {
+        Object.assign(parseStatsOut, stats);
     }
     return messages;
 }
@@ -351,7 +358,9 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         scope: config.TRACE_LOG_GROUP_SCOPE,
         includeSubstrings: config.TRACE_LOG_GROUP_INCLUDE_SUBSTRINGS,
         excludeSubstrings: config.TRACE_LOG_GROUP_EXCLUDE_SUBSTRINGS,
-        emptyPollCooldownHours: config.TRACE_EMPTY_LOG_GROUP_COOLDOWN_HOURS
+        emptyPollCooldownHours: config.TRACE_EMPTY_LOG_GROUP_COOLDOWN_HOURS,
+        lowValueEmptyStreak: config.TRACE_LOW_VALUE_EMPTY_STREAK,
+        lowValueSkipHours: config.TRACE_LOW_VALUE_SKIP_HOURS
     });
     logGroupsScoped = logGroups.length;
     logGroupsSkippedOrphan = scopeStats.skippedOrphan;
@@ -362,6 +371,7 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
         + (scopeStats.skippedEmptyCooldown ? `, ${scopeStats.skippedEmptyCooldown} on empty-poll cooldown` : '')
         + (scopeStats.skippedExclude ? `, ${scopeStats.skippedExclude} excluded by substring` : '')
         + (scopeStats.includedByPattern ? `, ${scopeStats.includedByPattern} extra group(s) via include substring` : '')
+        + (scopeStats.skippedLowValue ? `, ${scopeStats.skippedLowValue} infra-only on low-value skip` : '')
         + ')'
     );
 
@@ -381,7 +391,7 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
     const orderedLogGroups = walkPlan.groups;
     console.log(
         `🧭 Log group walk: ${walkPlan.uncheckedCount} without checkpoint, ${walkPlan.checkedCount} with checkpoint`
-        + (logGroupWalkCursor ? `, resume checked queue after ${logGroupWalkCursor}` : '')
+        + `, ordered by conversation signal priority`
     );
 
     for (const logGroup of orderedLogGroups) {
@@ -427,8 +437,27 @@ async function runAgentCorePipeline(timeLeft, sendTimeLeft) {
 
         // buildTraceMessagesForLogGroup already logs the full event → trace → message
         // accounting for this group, so there's nothing to restate here.
-        const messages = await buildTraceMessagesForLogGroup(events, logGroup, roleNameToResourceMap, harnessNameToResourceMap);
-        logGroupCheckpoints[logGroup.logGroupName] = { lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId };
+        const signalCount = countConversationSignalsInEvents(events);
+        const parseStats = {};
+        const messages = await buildTraceMessagesForLogGroup(
+            events, logGroup, roleNameToResourceMap, harnessNameToResourceMap, parseStats
+        );
+        const prior = logGroupCheckpoints[logGroup.logGroupName] || {};
+        let checkpoint = enrichCheckpointAfterIngest(
+            { ...prior, lastEventTimestamp: latestTimestamp, runtimeId: logGroup.runtimeId },
+            messages.length,
+            signalCount,
+            parseStats
+        );
+        if (
+            config.TRACE_LOW_VALUE_EMPTY_STREAK > 0
+            && config.TRACE_LOW_VALUE_SKIP_HOURS > 0
+            && (checkpoint.emptyMessageStreak || 0) >= config.TRACE_LOW_VALUE_EMPTY_STREAK
+            && !(checkpoint.lastConversationSignalCount > 0)
+        ) {
+            checkpoint.skipUntilMs = Date.now() + config.TRACE_LOW_VALUE_SKIP_HOURS * 60 * 60 * 1000;
+        }
+        logGroupCheckpoints[logGroup.logGroupName] = checkpoint;
 
         if (messages.length > 0) {
             totalSent += await flushTrace(messages, discoveredAgents, logGroupCheckpoints, sendTimeLeft, null, logGroupSamples, logGroupWalkCursor);

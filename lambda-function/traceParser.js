@@ -204,6 +204,8 @@ function scoreOpenInferenceSpan(record) {
     const attrs = record.attributes || {};
     let score = 0;
     if (record.name === 'chat') score += 60;
+    if (record.name === 'execute_event_loop_cycle') score += 45;
+    if (record.name === 'invoke_agent Strands Agents') score += 55;
     if (attrs['openinference.span.kind'] === 'LLM') score += 50;
     if (attrs['gen_ai.operation.name'] === 'chat') score += 40;
     if (attrs['gen_ai.operation.name'] === 'invoke_agent') score += 35;
