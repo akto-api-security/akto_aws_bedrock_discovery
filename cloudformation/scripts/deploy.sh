@@ -4,7 +4,7 @@
 # Creates/updates the akto-bedrock-discovery stack from templates/client-aws-cf-template.yaml.
 # Lambda code itself is NOT built/uploaded here - the template pulls a pre-published,
 # versioned zip from the AKTO-managed bucket (lambda-code-akto-<region>), keyed by the
-# LambdaCodeVersion parameter. See admin-deploy.sh for how that bucket gets populated.
+# LambdaCodeVersion parameter. See release.sh for how that bucket gets populated.
 
 set -e
 
@@ -128,7 +128,7 @@ OUTPUTS=$(aws cloudformation describe-stacks \
 
 echo "$OUTPUTS"
 
-LAMBDA_FUNCTION_NAME="akto-bedrock-log-processor-cf-${ACCOUNT_ID}"
+LAMBDA_FUNCTION_NAME="akto-bedrock-log-processor-unified-${ACCOUNT_ID}"
 
 echo ""
 echo "Deployment completed successfully!"

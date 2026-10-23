@@ -1,0 +1,58 @@
+{
+  "batchData": [
+    {
+      "path": "/mcp",
+      "requestHeaders": "{\"Content-Type\": \"application/json\", \"host\": \"mac-akto-api-mcp.asl-http-gateway-demo\"}",
+      "responseHeaders": "{\"Content-Type\": \"application/json\"}",
+      "method": "POST",
+      "requestPayload": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": \"mac-akto-api-mcp___searchDocumentation\", \"arguments\": {\"query\": \"demo\"}}}",
+      "responsePayload": "{\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"ok\"}]}, \"awsMetadata\": {\"gateway-role-resources\": \"*\", \"gateway-role-is-admin\": \"false\", \"gateway-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-gateway-service-role-demo\", \"harness-execution-role\": \"asl-demo-agent-execution-demo-karan\", \"harness-role-policies\": \"AmazonBedrockAgentCoreRuntimePolicy,AktoDemoS3Read\", \"harness-role-is-admin\": \"false\", \"harness-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan\", \"model\": \"\", \"traceData\": {\"toolsSummary\": {\"tools\": [\"mac-akto-api-mcp___searchDocumentation\"], \"totalToolCalls\": 1}}}}",
+      "ip": "",
+      "time": "1791884914",
+      "statusCode": "200",
+      "type": "HTTP/1.1",
+      "status": "OK",
+      "akto_account_id": "1000000",
+      "akto_vxlan_id": "0",
+      "is_pending": "false",
+      "source": "MIRRORING",
+      "tag": "{\"source\": \"AWS_BEDROCK\", \"mcp-server\": \"MCP Server\", \"service\": \"agentcore_gateway\", \"agentType\": \"RUNTIME\", \"bot-name\": \"mac-akto-api-mcp.asl-http-gateway-demo\", \"agent-name\": \"asl_demo_agent_demo\", \"caller-role\": \"asl-demo-agent-execution-demo-karan\", \"caller-principal\": \"arn:aws:sts::041877753357:assumed-role/asl-demo-agent-execution-demo-karan/BedrockAgentCore-9f2c\", \"gateway-id\": \"asl-http-gateway-demo-lfexb4ol0c\", \"gateway-name\": \"asl-http-gateway-demo\", \"account-id\": \"041877753357\", \"region\": \"us-east-1\", \"gateway-role-resources\": \"*\", \"gateway-role-is-admin\": \"false\", \"gateway-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-gateway-service-role-demo\", \"harness-execution-role\": \"asl-demo-agent-execution-demo-karan\", \"harness-role-policies\": \"AmazonBedrockAgentCoreRuntimePolicy,AktoDemoS3Read\", \"harness-role-is-admin\": \"false\", \"harness-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan\", \"mcp-server-name\": \"mac-akto-api-mcp\", \"mcp-server-target-id\": \"3YAFQQEOOA\", \"mcp-server-kind\": \"mcpServer\", \"mcp-server-endpoint\": \"https://docs.akto.io/~gitbook/mcp\", \"mcp-server-host\": \"docs.akto.io\", \"mcp-server-auth\": \"none\", \"mcp-server-status\": \"READY\", \"mcp-server-listing-mode\": \"DEFAULT\", \"mcp-server-private\": \"false\"}"
+    },
+    {
+      "path": "/mcp",
+      "requestHeaders": "{\"Content-Type\": \"application/json\", \"host\": \"mac-akto-ai-mcp.asl-http-gateway-demo\"}",
+      "responseHeaders": "{\"Content-Type\": \"application/json\"}",
+      "method": "POST",
+      "requestPayload": "{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/call\", \"params\": {\"name\": \"mac-akto-ai-mcp___getPage\", \"arguments\": {\"query\": \"demo\"}}}",
+      "responsePayload": "{\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"ok\"}]}, \"awsMetadata\": {\"gateway-role-resources\": \"*\", \"gateway-role-is-admin\": \"false\", \"gateway-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-gateway-service-role-demo\", \"harness-execution-role\": \"asl-demo-agent-execution-demo-karan\", \"harness-role-policies\": \"AmazonBedrockAgentCoreRuntimePolicy,AktoDemoS3Read\", \"harness-role-is-admin\": \"false\", \"harness-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan\", \"model\": \"\", \"traceData\": {\"toolsSummary\": {\"tools\": [\"mac-akto-ai-mcp___getPage\"], \"totalToolCalls\": 1}}}}",
+      "ip": "",
+      "time": "1791884915",
+      "statusCode": "200",
+      "type": "HTTP/1.1",
+      "status": "OK",
+      "akto_account_id": "1000000",
+      "akto_vxlan_id": "0",
+      "is_pending": "false",
+      "source": "MIRRORING",
+      "tag": "{\"source\": \"AWS_BEDROCK\", \"mcp-server\": \"MCP Server\", \"service\": \"agentcore_gateway\", \"agentType\": \"RUNTIME\", \"bot-name\": \"mac-akto-ai-mcp.asl-http-gateway-demo\", \"agent-name\": \"asl_demo_agent_demo\", \"caller-role\": \"asl-demo-agent-execution-demo-karan\", \"caller-principal\": \"arn:aws:sts::041877753357:assumed-role/asl-demo-agent-execution-demo-karan/BedrockAgentCore-9f2c\", \"gateway-id\": \"asl-http-gateway-demo-lfexb4ol0c\", \"gateway-name\": \"asl-http-gateway-demo\", \"account-id\": \"041877753357\", \"region\": \"us-east-1\", \"gateway-role-resources\": \"*\", \"gateway-role-is-admin\": \"false\", \"gateway-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-gateway-service-role-demo\", \"harness-execution-role\": \"asl-demo-agent-execution-demo-karan\", \"harness-role-policies\": \"AmazonBedrockAgentCoreRuntimePolicy,AktoDemoS3Read\", \"harness-role-is-admin\": \"false\", \"harness-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan\", \"mcp-server-name\": \"mac-akto-ai-mcp\", \"mcp-server-target-id\": \"913O5G8MS4\", \"mcp-server-kind\": \"mcpServer\", \"mcp-server-endpoint\": \"https://ai-security-docs.akto.io/~gitbook/mcp\", \"mcp-server-host\": \"ai-security-docs.akto.io\", \"mcp-server-auth\": \"none\", \"mcp-server-status\": \"READY\", \"mcp-server-listing-mode\": \"DEFAULT\", \"mcp-server-private\": \"false\"}"
+    },
+    {
+      "path": "/mcp",
+      "requestHeaders": "{\"Content-Type\": \"application/json\", \"host\": \"demo-guardrails-mcp.asl-http-gateway-demo\"}",
+      "responseHeaders": "{\"Content-Type\": \"application/json\"}",
+      "method": "POST",
+      "requestPayload": "{\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\", \"params\": {\"name\": \"demo-guardrails-mcp___send_email\", \"arguments\": {\"query\": \"demo\"}}}",
+      "responsePayload": "{\"result\": {\"content\": [{\"type\": \"text\", \"text\": \"ok\"}]}, \"awsMetadata\": {\"gateway-role-resources\": \"*\", \"gateway-role-is-admin\": \"false\", \"gateway-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-gateway-service-role-demo\", \"harness-execution-role\": \"asl-demo-agent-execution-demo-karan\", \"harness-role-policies\": \"AmazonBedrockAgentCoreRuntimePolicy,AktoDemoS3Read\", \"harness-role-is-admin\": \"false\", \"harness-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan\", \"model\": \"\", \"traceData\": {\"toolsSummary\": {\"tools\": [\"demo-guardrails-mcp___send_email\"], \"totalToolCalls\": 1}}}}",
+      "ip": "",
+      "time": "1791884916",
+      "statusCode": "200",
+      "type": "HTTP/1.1",
+      "status": "OK",
+      "akto_account_id": "1000000",
+      "akto_vxlan_id": "0",
+      "is_pending": "false",
+      "source": "MIRRORING",
+      "tag": "{\"source\": \"AWS_BEDROCK\", \"mcp-server\": \"MCP Server\", \"service\": \"agentcore_gateway\", \"agentType\": \"RUNTIME\", \"bot-name\": \"demo-guardrails-mcp.asl-http-gateway-demo\", \"agent-name\": \"asl_demo_agent_demo\", \"caller-role\": \"asl-demo-agent-execution-demo-karan\", \"caller-principal\": \"arn:aws:sts::041877753357:assumed-role/asl-demo-agent-execution-demo-karan/BedrockAgentCore-9f2c\", \"gateway-id\": \"asl-http-gateway-demo-lfexb4ol0c\", \"gateway-name\": \"asl-http-gateway-demo\", \"account-id\": \"041877753357\", \"region\": \"us-east-1\", \"gateway-role-resources\": \"*\", \"gateway-role-is-admin\": \"false\", \"gateway-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-gateway-service-role-demo\", \"harness-execution-role\": \"asl-demo-agent-execution-demo-karan\", \"harness-role-policies\": \"AmazonBedrockAgentCoreRuntimePolicy,AktoDemoS3Read\", \"harness-role-is-admin\": \"false\", \"harness-execution-role-arn\": \"arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan\", \"mcp-server-name\": \"demo-guardrails-mcp\", \"mcp-server-target-id\": \"7KQ2M1XZ0B\", \"mcp-server-kind\": \"mcpServer\", \"mcp-server-endpoint\": \"https://snznup9btp.us-east-1.awsapprunner.com/mcp\", \"mcp-server-host\": \"snznup9btp.us-east-1.awsapprunner.com\", \"mcp-server-auth\": \"none\", \"mcp-server-status\": \"READY\", \"mcp-server-listing-mode\": \"DEFAULT\", \"mcp-server-private\": \"false\"}"
+    }
+  ]
+}

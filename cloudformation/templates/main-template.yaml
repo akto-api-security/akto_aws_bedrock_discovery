@@ -63,13 +63,28 @@ Resources:
                   - 'iam:GetRole'
                   - 'iam:ListAttachedRolePolicies'
                   - 'iam:ListRolePolicies'
-                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*bedrock*'
+                  - 'iam:GetRolePolicy'
+                # Widened from *bedrock* because gateway and harness execution roles
+                # are not required to carry 'bedrock' in their name (this account's is
+                # asl-gateway-service-role-*). Read-only IAM, own account only.
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              # Policy documents behind the attached policy names. GetPolicy and
+              # GetPolicyVersion address a policy ARN, not a role ARN, so they cannot
+              # share the role statement above. AWS-managed policies live under the
+              # fixed aws account alias and need their own entry.
+              - Effect: Allow
+                Action:
+                  - 'iam:GetPolicy'
+                  - 'iam:GetPolicyVersion'
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                  - 'arn:aws:iam::aws:policy/*'
 
   # Lambda Function
   AktoBedrocklambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'akto-bedrock-log-processor-cf-${AWS::AccountId}'
+      FunctionName: !Sub 'akto-bedrock-log-processor-unified-${AWS::AccountId}'
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn

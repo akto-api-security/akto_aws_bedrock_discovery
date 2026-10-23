@@ -1,1 +1,7 @@
 node_modules/
+.DS_Store
+.idea/
+gateway-backups/
+# Build output of `npm run package`. Releases live in S3, not git.
+*.zip
+!akto-bedrock-processor.zip
