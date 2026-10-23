@@ -2,6 +2,7 @@
  * Shared configuration, tunables, and AWS SDK client instances.
  * Every other module in this function reads its settings from here.
  */
+const { BedrockClient } = require('@aws-sdk/client-bedrock');
 const { BedrockAgentClient } = require('@aws-sdk/client-bedrock-agent');
 const { BedrockAgentCoreControlClient } = require('@aws-sdk/client-bedrock-agentcore-control');
 const { CloudWatchLogsClient } = require('@aws-sdk/client-cloudwatch-logs');
@@ -34,8 +35,63 @@ const LOGS_PREFIX = process.env.LOGS_PREFIX || 'AWSLogs/';
 const MARKERS_BUCKET_NAME = process.env.MARKERS_BUCKET_NAME;
 const AWS_REGION = process.env.BEDROCK_AWS_REGION || process.env.AWS_REGION;
 const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID;
-const MARKERS_PREFIX = 'akto/markers/';
+
+/**
+ * How this function was deployed, which decides where checkpoints live and whether the
+ * logs bucket is configured or discovered.
+ *
+ *   single   (default) - one stack in one account. The markers bucket belongs to that
+ *                        account alone, so checkpoints sit at a fixed path and
+ *                        LOGS_BUCKET_NAME names the bucket outright.
+ *   stackset           - one stack per account and region across an organization, all
+ *                        sharing ONE markers bucket in the management account.
+ *                        Checkpoints are keyed by account and region, and the logs bucket
+ *                        is read off each account's own Bedrock logging configuration,
+ *                        because one StackSet parameter cannot name a different bucket in
+ *                        every account.
+ *
+ * Defaulting to 'single' keeps every existing deployment unchanged: the single-account
+ * template never sets this variable, so none of its paths move.
+ */
+const DEPLOYMENT_MODE = (process.env.DEPLOYMENT_MODE || 'single').trim().toLowerCase();
+const IS_STACKSET = DEPLOYMENT_MODE === 'stackset';
+
+/**
+ * Checkpoint location. The S3, trace and gateway manifests all live beneath it.
+ *
+ * In stackset mode every account in the organization writes into the same bucket, so the
+ * account id and region lead the key. Without that the second account to run would
+ * overwrite the first one's manifest. The markers bucket policy enforces the same shape
+ * independently - it only permits writes under ${aws:PrincipalAccount}/.
+ */
+const MARKERS_PREFIX = IS_STACKSET ? `${AWS_ACCOUNT_ID}/${AWS_REGION}/` : 'akto/markers/';
 const MANIFEST_KEY = `${MARKERS_PREFIX}bedrock-logs/manifest.json`;
+
+/**
+ * Is Bedrock model invocation logging already enabled in this account and region?
+ *
+ *   discover (default) - assume yes. Read the bucket off the existing configuration and
+ *                        never modify it. An account with no S3 logging is reported and
+ *                        skipped.
+ *   create             - if, and only if, NOTHING is configured, create the bucket and
+ *                        turn S3 logging on.
+ *
+ * Deliberately narrow: PutModelInvocationLoggingConfiguration REPLACES the account's one
+ * configuration wholesale, so an account already logging to CloudWatch would have that
+ * silently switched off by a naive write. See bedrockDelivery.js.
+ */
+const BEDROCK_LOGGING_MODE = (process.env.BEDROCK_LOGGING_MODE || 'discover').trim().toLowerCase();
+
+/**
+ * Base name for the bucket created in 'create' mode. Account id AND region are appended:
+ * bucket names are global, so one account running Bedrock in two regions would otherwise
+ * collide on the second CreateBucket.
+ *   'akto-bedrock-logs' -> akto-bedrock-logs-123456789012-us-east-1
+ */
+const BEDROCK_BUCKET_BASE_NAME = (process.env.BEDROCK_BUCKET_BASE_NAME || '').trim();
+const BEDROCK_CREATED_BUCKET_NAME = BEDROCK_BUCKET_BASE_NAME
+    ? `${BEDROCK_BUCKET_BASE_NAME}-${AWS_ACCOUNT_ID}-${AWS_REGION}`
+    : '';
 
 /**
  * Messages per AKTO POST.
@@ -143,9 +199,33 @@ function parseIdList(value) {
 
 /** Throws if any required environment variable is missing or blank. Call this first, before touching AWS. */
 function validateConfig() {
-    const required = { LOGS_BUCKET_NAME, LOGS_PREFIX, MARKERS_BUCKET_NAME, DATA_INGESTION_ENDPOINT, AKTO_API_KEY };
+    const required = { LOGS_PREFIX, MARKERS_BUCKET_NAME, DATA_INGESTION_ENDPOINT, AKTO_API_KEY };
+
+    // Under a StackSet the logs bucket is resolved per account at runtime instead.
+    // Supplying it anyway still works and overrides discovery.
+    if (!IS_STACKSET) required.LOGS_BUCKET_NAME = LOGS_BUCKET_NAME;
+
     for (const [key, value] of Object.entries(required)) {
         if (!value || !String(value).trim()) throw new Error(`${key} environment variable is required`);
+    }
+
+    if (!['single', 'stackset'].includes(DEPLOYMENT_MODE)) {
+        throw new Error(`DEPLOYMENT_MODE must be 'single' or 'stackset', got '${DEPLOYMENT_MODE}'`);
+    }
+
+    // In stackset mode the account id and region lead every checkpoint key. Blank would
+    // write a manifest at 'undefined/...', silently.
+    if (IS_STACKSET && (!String(AWS_ACCOUNT_ID || '').trim() || !String(AWS_REGION || '').trim())) {
+        throw new Error('AWS_ACCOUNT_ID and BEDROCK_AWS_REGION environment variables are required when DEPLOYMENT_MODE=stackset');
+    }
+
+    if (!['discover', 'create'].includes(BEDROCK_LOGGING_MODE)) {
+        throw new Error(`BEDROCK_LOGGING_MODE must be 'discover' or 'create', got '${BEDROCK_LOGGING_MODE}'`);
+    }
+
+    // Failing here beats failing at CreateBucket with a name like '-1234-us-east-1'.
+    if (BEDROCK_LOGGING_MODE === 'create' && !BEDROCK_BUCKET_BASE_NAME) {
+        throw new Error('BEDROCK_BUCKET_BASE_NAME environment variable is required when BEDROCK_LOGGING_MODE=create');
     }
 }
 
@@ -153,16 +233,21 @@ module.exports = {
     CODE_VERSION,
     DATA_INGESTION_ENDPOINT, AKTO_API_KEY, LOGS_BUCKET_NAME, LOGS_PREFIX, MARKERS_BUCKET_NAME,
     AWS_REGION, AWS_ACCOUNT_ID, MARKERS_PREFIX, MANIFEST_KEY,
+    DEPLOYMENT_MODE, IS_STACKSET, BEDROCK_LOGGING_MODE, BEDROCK_BUCKET_BASE_NAME, BEDROCK_CREATED_BUCKET_NAME,
     SEND_BATCH_SIZE, MAX_BATCH_BYTES, MAX_TRACE_BYTES, SEND_DEADLINE_MARGIN_MS, FLUSH_THRESHOLD, TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, LOOKBACK_DAYS,
     SCHEDULE_INTERVAL_MS, RUN_BUDGET_MS, S3_BUDGET_SHARE, S3_BUDGET_MS, INGEST_SERVICE_AGENT_TRAFFIC,
     RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH, TRACE_LOOKBACK_DAYS, TRACE_MARKERS_PREFIX, TRACE_MANIFEST_KEY,
     INTERCEPTOR_LAMBDA_ARN, INTERCEPTION_POINTS, INCLUDE_GATEWAY_IDS, EXCLUDE_GATEWAY_IDS, INTERCEPTOR_DRY_RUN,
     GATEWAY_MARKERS_PREFIX, GATEWAY_MANIFEST_KEY, GATEWAY_NAME_MAP_MAX_BYTES,
     validateConfig,
+    bedrockClient: new BedrockClient({ region: AWS_REGION }),
     bedrockAgentClient: new BedrockAgentClient({ region: AWS_REGION }),
     bedrockAgentCoreControlClient: new BedrockAgentCoreControlClient({ region: AWS_REGION }),
     cloudWatchLogsClient: new CloudWatchLogsClient({ region: AWS_REGION }),
-    s3Client: new S3Client({ region: AWS_REGION }),
+    // followRegionRedirects: under a StackSet the central markers bucket sits in the
+    // management account's region, not necessarily this one. Without it every
+    // cross-region checkpoint read or write fails with a PermanentRedirect.
+    s3Client: new S3Client({ region: AWS_REGION, followRegionRedirects: true }),
     iamClient: new IAMClient({ region: AWS_REGION }),
     lambdaClient: new LambdaClient({ region: AWS_REGION })
 };

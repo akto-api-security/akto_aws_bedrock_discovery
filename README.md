@@ -14,6 +14,17 @@ client's AKTO instance.
 | [CLIENT_DEPLOYMENT.md](CLIENT_DEPLOYMENT.md) | Clients: deploying and operating the CloudFormation stack |
 | [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) | AKTO developers: making a change, testing it and releasing it |
 
+It comes in two forms, built from the same code:
+
+| | Single account | Organization (StackSet) |
+|---|---|---|
+| Template | `cloudformation/templates/client-aws-cf-template.yaml` | `cloudformation/stackset/client-aws-cf-stackset-template.yaml` |
+| Deployed | One stack per account and region | Once, from the management account, to OUs and regions |
+| Logs bucket | Parameter | Read from each account's Bedrock logging config (optionally created) |
+| Checkpoints | `<markers-bucket>/akto/markers/` in the account | Central bucket, `<account>/<region>/` |
+| Code / updates | `unified_bedrock/` | `unified_bedrock_stackset/` |
+| Lambda switch | `DEPLOYMENT_MODE` unset (`single`) | `DEPLOYMENT_MODE=stackset` |
+
 ## What it does
 
 One zip, three handlers, plus a small self-updater.
@@ -102,6 +113,7 @@ lambda-function/                  the Lambda code (one zip, three handlers)
   gatewayMessageBuilder.js gatewayNaming.js cfnResponse.js
                                   gateway discovery + interceptor attachment
   interceptor*.js                 the real-time interceptor (no AWS SDK)
+  bedrockDelivery.js              finds (or, in create mode, enables) the account's Bedrock log bucket
   identityActor.js iamPermissions.js
                                   which agent / role a call belongs to
   aktoClient.js config.js         AKTO HTTP client, all settings and env vars
@@ -113,6 +125,8 @@ cloudformation/
   templates/main-template.yaml            older discovery-only template (not used by the scripts)
   versions.json                           mirror of the published update channels
   parameters/                             parameter files for our own dev/prod stacks
+  stackset/                               organization deployment: StackSet template,
+                                          central markers bucket, its own versions.json
   scripts/deploy.sh                       deploy the client template to our own account
   scripts/release.sh                      publish a build / promote a channel (AKTO only)
   scripts/detach-interceptors.js          one-off: remove named interceptors from gateways

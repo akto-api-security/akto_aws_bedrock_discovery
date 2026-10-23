@@ -61,6 +61,7 @@ function load(state, env = {}) {
 
     state.posts = [];
     state.awsCalls = {};
+    state.putKeys = [];
     const count = (name) => { state.awsCalls[name] = (state.awsCalls[name] || 0) + 1; };
 
     const s3Client = { async send(command) {
@@ -68,6 +69,7 @@ function load(state, env = {}) {
         count(type);
         if (type === 'ListObjectsV2Command') return { Contents: state.files || [] };
         if (type === 'PutObjectCommand') {
+            state.putKeys.push(command.input.Key);
             if (String(command.input.Key).includes('agentcore-tracing')) state.traceManifest = command.input.Body;
             else state.manifest = command.input.Body;
             return {};
@@ -149,6 +151,9 @@ function load(state, env = {}) {
             if (state.loggingConfig === 'NOTFOUND') throw awsError('ResourceNotFoundException');
             if (state.loggingConfig) return { loggingConfig: state.loggingConfig };
             return { loggingConfig: { s3Config: { bucketName: 'b', keyPrefix: '' } } };
+        }
+        if (type === 'PutModelInvocationLoggingConfigurationCommand') {
+            state.putLoggingConfig = command.input.loggingConfig;
         }
         return {};
     } };

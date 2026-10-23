@@ -183,6 +183,90 @@ CloudFormation → Update stack → *Use current template* → edit parameters.
 
 When contacting AKTO support, include the CloudWatch logs of the Lambda in question.
 
+## Multi-account deployment (AWS Organizations StackSet)
+
+Use this to cover many accounts and regions from the Organization management account
+with one deployment, instead of one stack per account. It installs the same Lambdas as
+above in every targeted account and region, with three differences:
+
+- **No logs bucket to supply.** Each account's processor reads the bucket from that
+  account's own Bedrock logging configuration, so accounts can use different buckets.
+- **One central checkpoint bucket** in the management account, with each account
+  writing under `<account-id>/<region>/`. Its bucket policy lets every account in your
+  organization touch only its own prefix.
+- **Optional logging setup** (`BedrockLoggingMode=create`). In accounts with no Bedrock
+  logging at all, the processor creates `<BedrockBucketBaseName>-<account>-<region>` and
+  turns S3 logging on (text only). An account that already logs to S3 is read as it is.
+  An account that logs only to CloudWatch is **never modified**; it is reported as
+  skipped and keeps its agent discovery and AgentCore traces.
+
+Files (AKTO will give you the version):
+```
+https://lambda-code-akto-us-east-1.s3.us-east-1.amazonaws.com/unified_bedrock_stackset/<version>/akto-markers-bucket.yaml
+https://lambda-code-akto-us-east-1.s3.us-east-1.amazonaws.com/unified_bedrock_stackset/<version>/client-aws-cf-stackset-template.yaml
+```
+
+**1. Enable trusted access for StackSets** (once, in the management account):
+CloudFormation console → StackSets → *Activate trusted access with AWS Organizations*.
+
+**2. Create the central markers bucket** as a normal stack in the management account:
+```bash
+ORG_ID=$(aws organizations describe-organization --query Organization.Id --output text)
+aws cloudformation create-stack --stack-name akto-markers-bucket \
+  --template-url <akto-markers-bucket.yaml URL> \
+  --parameters ParameterKey=OrgId,ParameterValue=$ORG_ID
+aws cloudformation wait stack-create-complete --stack-name akto-markers-bucket
+aws cloudformation describe-stacks --stack-name akto-markers-bucket \
+  --query "Stacks[0].Outputs[?OutputKey=='MarkersBucketName'].OutputValue" --output text
+```
+The bucket is kept if the stack is deleted, because it holds every account's checkpoints.
+
+**3. Create the StackSet and deploy it to your OUs and regions:**
+```bash
+aws cloudformation create-stack-set --stack-set-name akto-bedrock \
+  --template-url <client-aws-cf-stackset-template.yaml URL> \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=MarkersBucketName,ParameterValue=<from step 2> \
+    ParameterKey=DataIngestionEndpoint,ParameterValue=https://<your-akto>/api/ingestData \
+    ParameterKey=AktoApiKey,ParameterValue=<api-key> \
+    ParameterKey=BedrockLoggingMode,ParameterValue=discover \
+    ParameterKey=LambdaCodeVersion,ParameterValue=<version>
+
+aws cloudformation create-stack-instances --stack-set-name akto-bedrock \
+  --deployment-targets OrganizationalUnitIds=<ou-id> \
+  --regions us-east-1 \
+  --operation-preferences FailureTolerancePercentage=10,MaxConcurrentPercentage=25
+```
+With auto-deployment on, accounts that later join those OUs get it automatically.
+
+| StackSet parameter | Description |
+|---|---|
+| `MarkersBucketName` | Output of step 2 |
+| `DataIngestionEndpoint`, `AktoApiKey` | As for a single account |
+| `BedrockLoggingMode` | `discover` (default): read existing logging, change nothing. `create`: also enable logging where none exists |
+| `BedrockBucketBaseName` | Only for `create`, max 35 characters |
+| `EnableGatewayInterception` | As for a single account, applied in every account |
+| `LogsBucketName` / `LogsPrefix` | Leave blank; only for fleets where every account logs to one shared bucket |
+| `RuntimeLogGroupPrefix`, `LambdaCodeVersion` | As for a single account |
+
+**Things to know**
+- Service-managed StackSets **don't deploy to the management account itself**. If it
+  runs Bedrock too, deploy the single-account template there.
+- Each account's logs bucket must be in **that same account**, and not encrypted with a
+  customer-managed KMS key.
+- All resources are named `akto-bedrock-org-*-<account>-<region>`, so they can't clash
+  with a single-account stack.
+- **Verify:** `aws s3 ls s3://<markers-bucket>/ --recursive` shows
+  `<account>/<region>/bedrock-logs/manifest.json` for each account after its first run
+  (within 10 minutes). Each account's processor log says which bucket it discovered, or
+  why it skipped.
+- **Updates** are automatic in every account, the same as for a single account.
+- **Uninstall:** delete the stack instances, then the StackSet, then (optionally) the
+  markers bucket.
+
 ## Uninstall
 
 Delete the stack. With interception on, the gateway interceptor is detached before the

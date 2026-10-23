@@ -41,6 +41,7 @@ APIs and `fetch`, then drive the real handlers.
 | `extraction.test.js` | Only the final exchange is emitted; a tool result is not a user question |
 | `message-format.test.js` | `tag.source` and `tag['bot-name']` are always set (AKTO drops messages without them) |
 | `pipeline.test.js` | The run budget prevents overlapping invocations; S3 can't starve AgentCore |
+| `stackset.test.js` | Single mode is unchanged; stackset checkpoints sit under `<account>/<region>/`; the logs bucket is discovered; a CloudWatch-only account is never modified; `create` mode provisions only when nothing exists |
 
 Sample payloads live in `test/payloads/`. To write a new scenario, use `test/harness.js`:
 
@@ -58,6 +59,24 @@ restore();
 Two gotchas: `failPlan` is keyed by requestId, not POST index (otherwise a retry
 succeeds and the test lies), and `mkFiles()` is relative to `Date.now()`, so don't
 regenerate it between runs of one scenario.
+
+## Single account vs StackSet
+
+One codebase, two templates, two release lines. `DEPLOYMENT_MODE=stackset` (set only by
+the StackSet template) is the only switch in the code:
+- it changes `MARKERS_PREFIX` in `config.js` to `<account>/<region>/`, which moves all
+  three manifests (S3, traces, gateways)
+- it makes `LOGS_BUCKET_NAME` optional; `bedrockDelivery.js` then resolves the bucket
+  from `GetModelInvocationLoggingConfiguration`
+
+Unset, everything behaves exactly as in the single-account build. A change to shared
+code therefore ships on both lines, and must pass `stackset.test.js` as well.
+
+The StackSet template is the single-account template plus StackSet-specific changes:
+resource names, permissions scoped by account prefix and log key, discovery and create
+parameters, and the `unified_bedrock_stackset/` code folder. When you change
+`client-aws-cf-template.yaml` (a permission, a resource, the updater), make the same
+change in `cloudformation/stackset/client-aws-cf-stackset-template.yaml`.
 
 ## Making a change
 
@@ -90,6 +109,12 @@ those functions too.
 
 Our dev stack's updater will put the channel build back within 15 minutes. For a longer
 test, disable `akto-bedrock-updater-schedule-<acct>-<region>` and re-enable it afterwards.
+
+**StackSet changes.** Run `DEPLOYMENT_MODE=stackset` locally through
+`test/stackset.test.js` first. Then publish to the StackSet line, promote `canary`, and
+deploy the StackSet to a test OU with one or two member accounts. Check
+`s3://<markers-bucket>/<account>/<region>/` fills for each account, and that an account
+with CloudWatch-only logging is reported as skipped.
 
 **Template changes.** Deploy the template to our own account:
 
@@ -132,6 +157,11 @@ cd cloudformation/scripts
 Regions default to `us-east-1`. For more regions, run
 `REGIONS="us-east-1 eu-west-1" ./release.sh ...`. Every region where a client runs needs
 the zip **and** `versions.json`.
+
+**StackSet line:** the same commands with `--stackset`, for example
+`./release.sh --stackset publish v1.1`. They publish to `unified_bedrock_stackset/` with
+`cloudformation/stackset/versions.json`. Publish to **every region the StackSet targets**,
+because each stack instance pulls its code from its own region's bucket.
 
 **Rollback:** `./release.sh promote stable v4.5`. The updater moves everyone back on its
 next check, so no client action is needed.

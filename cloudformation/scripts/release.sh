@@ -2,30 +2,46 @@
 #
 # AKTO-internal release script. Never run by clients.
 #
-#   ./release.sh publish <version>            build the zip and upload it, with the client
-#                                             template, to unified_bedrock/<version>/
-#   ./release.sh promote <channel> <version>  point a channel in versions.json at a
-#                                             published version and upload versions.json
+#   ./release.sh [--stackset] publish <version>            build the zip and upload it,
+#                                                          with the templates, to
+#                                                          <folder>/<version>/
+#   ./release.sh [--stackset] promote <channel> <version>  point a channel in
+#                                                          versions.json at a published
+#                                                          version and upload it
 #
-# Every deployed stack runs an updater that reads unified_bedrock/versions.json every 15
+# Two independent release lines share one codebase:
+#   default     unified_bedrock/           single-account clients
+#   --stackset  unified_bedrock_stackset/  StackSet (multi-account) clients
+# Each has its own versions.json, so promoting one never touches the other.
+#
+# Every deployed stack runs an updater that reads its line's versions.json every 15
 # minutes and installs the build its channel names. So `publish` affects nobody, and
-# `promote stable ...` updates EVERY client on its next check. Promote canary first.
+# `promote stable ...` updates EVERY client on that line. Promote canary first.
 #
 # Regions default to us-east-1. Override with REGIONS="us-east-1 eu-west-1" ./release.sh ...
 set -euo pipefail
 
-PREFIX="unified_bedrock"
 BUCKET_BASE="lambda-code-akto"
 ZIP_NAME="akto-bedrock-processor.zip"
 REGIONS="${REGIONS:-us-east-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-TEMPLATE="$REPO_ROOT/cloudformation/templates/client-aws-cf-template.yaml"
-VERSIONS_FILE="$REPO_ROOT/cloudformation/versions.json"
+
+if [[ "${1:-}" == "--stackset" ]]; then
+  shift
+  PREFIX="unified_bedrock_stackset"
+  TEMPLATES=("$REPO_ROOT/cloudformation/stackset/client-aws-cf-stackset-template.yaml"
+             "$REPO_ROOT/cloudformation/stackset/akto-markers-bucket.yaml")
+  VERSIONS_FILE="$REPO_ROOT/cloudformation/stackset/versions.json"
+else
+  PREFIX="unified_bedrock"
+  TEMPLATES=("$REPO_ROOT/cloudformation/templates/client-aws-cf-template.yaml")
+  VERSIONS_FILE="$REPO_ROOT/cloudformation/versions.json"
+fi
 
 usage() {
-  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -56,12 +72,14 @@ publish() {
     local dest="s3://$BUCKET_BASE-$region/$PREFIX/$version"
     echo "📤 $region -> $dest/"
     aws s3 cp "$REPO_ROOT/$ZIP_NAME" "$dest/$ZIP_NAME" --region "$region"
-    aws s3 cp "$TEMPLATE" "$dest/client-aws-cf-template.yaml" --region "$region"
+    for template in "${TEMPLATES[@]}"; do
+      aws s3 cp "$template" "$dest/$(basename "$template")" --region "$region"
+    done
   done
 
   echo ""
   echo "✅ Published $version. No client is affected until a channel is promoted:"
-  echo "   ./release.sh promote canary $version"
+  echo "   ./release.sh $([[ $PREFIX == *stackset ]] && echo '--stackset ')promote canary $version"
 }
 
 promote() {
@@ -90,7 +108,7 @@ promote() {
 
   echo ""
   cat "$VERSIONS_FILE"
-  echo "✅ '$channel' now points to $version. Commit cloudformation/versions.json so the repo matches S3."
+  echo "✅ '$channel' now points to $version. Commit ${VERSIONS_FILE#$REPO_ROOT/} so the repo matches S3."
 }
 
 case "${1:-}" in
