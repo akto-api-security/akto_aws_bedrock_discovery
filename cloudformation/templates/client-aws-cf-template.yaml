@@ -41,7 +41,7 @@ Parameters:
       latest version. Gateway interception requires v4.1 or later. After the
       stack is created the updater keeps this current on its own, so this value
       only decides which build the account STARTS on.
-    Default: 'v4.3'
+    Default: 'v4.5'
     AllowedPattern: '^v[0-9]+\.[0-9]+$'
     ConstraintDescription: 'Must be in format: v1.0, v1.1, v2.0, etc.'
 
