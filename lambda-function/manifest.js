@@ -27,6 +27,9 @@ async function getManifest() {
 
 
 const MAX_FAILED_FILES = 50;
+// Files sharing one LastModified second are few; a cap keeps a pathological burst from
+// bloating the manifest. Past it, the overflow is re-read (a duplicate), never skipped.
+const MAX_KEYS_AT_CHECKPOINT = 1000;
 
 function buildRoleToAgentsIndex(discoveredAgents) {
     const index = {};
@@ -42,15 +45,21 @@ function buildRoleToAgentsIndex(discoveredAgents) {
     return index;
 }
 
-async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTimestamp, failedFiles = [], failedMessages = []) {
+/**
+ * `keysAtCheckpoint` are the files already read whose LastModified equals the
+ * checkpoint (see getResumePoint in s3Logs.js). Omitted, the stored list is kept as-is.
+ */
+async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTimestamp, failedFiles = [], failedMessages = [], keysAtCheckpoint) {
     try {
         const existing = await getManifest();
         const previous = existing.lastProcessedTimestamp;
 
         let checkpoint = lastProcessedTimestamp || previous || null;
+        let checkpointKeys = keysAtCheckpoint || existing.processedKeysAtCheckpoint;
         if (previous && checkpoint && new Date(checkpoint) < new Date(previous)) {
             console.warn(`⚠️ Refusing to move the checkpoint backwards (${checkpoint} < stored ${previous}) — another run likely wrote a newer position. Keeping ${previous}.`);
             checkpoint = previous;
+            checkpointKeys = existing.processedKeysAtCheckpoint;
         }
 
         // Newest first, de-duplicated by key, capped — a recurring bad file stays
@@ -91,6 +100,7 @@ async function updateManifest(filesProcessed, discoveredAgents, lastProcessedTim
             // its own, this is the record of what was actually running at the time.
             codeVersion: CODE_VERSION,
             lastProcessedTimestamp: checkpoint || new Date().toISOString(),
+            ...(Array.isArray(checkpointKeys) && { processedKeysAtCheckpoint: checkpointKeys.slice(0, MAX_KEYS_AT_CHECKPOINT) }),
             filesProcessedCount: filesProcessed,
             lastManifestUpdate: new Date().toISOString(),
             agentCount: Object.keys(discoveredAgents || {}).length,

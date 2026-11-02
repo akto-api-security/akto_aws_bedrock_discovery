@@ -1,9 +1,9 @@
 # AKTO × AWS Bedrock Integration — Release Notes
 
-> **Latest version: v4.5** (September 2026)
+> **Latest version: v4.6** (November 2026)
 > Discovers AI agents running on AWS Bedrock, sends their conversations to AKTO for security analysis, and applies AKTO guardrails in real time to AgentCore Gateway traffic. Deployed with one CloudFormation template in your own AWS account.
 
-**Latest template:** `https://lambda-code-akto-us-east-1.s3.us-east-1.amazonaws.com/unified_bedrock/v4.5/client-aws-cf-template.yaml`
+**Latest template:** `https://lambda-code-akto-us-east-1.s3.us-east-1.amazonaws.com/unified_bedrock/v4.6/client-aws-cf-template.yaml`
 
 ---
 
@@ -11,6 +11,7 @@
 
 | Version | Released | Highlights | Template update |
 |---|---|---|---|
+| **v4.6** | Nov 2, 2026 | Large log bucket support, faster delivery, overlap protection | — |
 | **v4.5** | Sep 10, 2026 | Automatic updates, IAM permission analysis, session and token insights | Required |
 | **v4.4** | Sep 8, 2026 | Unified build, versioned releases, message quarantine, cleaner conversations | — |
 | **v4.3** | Sep 7, 2026 | Consistent gateway naming | — |
@@ -28,6 +29,29 @@
 | **v1.1** | Jul 14, 2026 | Initial release | — |
 
 *v3.x and v4.x shipped in parallel during August: v3.x carried discovery improvements, v4.x added Gateway Guardrails. v4.4 combines both lines.*
+
+---
+
+## v4.6 — November 2, 2026
+
+**Improved**
+- **Large log buckets:** Only the date folders Bedrock wrote since the last run are read, not the whole bucket. Each run's time and memory now depend on recent traffic, not on how much history the bucket holds. Tested on a 300,000-file bucket: a run finished in 96 seconds using 146 MB, where v4.5 timed out.
+- **Faster delivery to AKTO:** Up to 10 requests are sent in parallel and log files are read 4 at a time, still one message per request.
+- **Faster first sync:** A new deployment starts from the last 1 day of logs. After an outage, up to 3 days are recovered from the last checkpoint.
+- **AgentCore traces** are processed and checkpointed in batches, so busy runtimes are handled without high memory use.
+- Log files are decompressed and read as a stream.
+
+**Fixed**
+- Processor runs on buckets with millions of log files no longer time out before saving progress.
+- Log files written in the same second as the last checkpoint are no longer skipped.
+- Overlapping runs, and Lambda's automatic retries of a failed run, no longer process the same files twice.
+
+**Changed**
+- **Run lock:** The checkpoint folder now holds a small `run-lock.json` file next to the manifests (`akto/markers/bedrock-logs/run-lock.json`). It ensures only one processor run works at a time. It is managed automatically and should not be edited or deleted while a run is in progress.
+- The checkpoint manifest records the files read at the checkpoint second (`processedKeysAtCheckpoint`).
+- Optional Lambda environment variables, read on every run: `LOOKBACK_DAYS` (default 1), `MAX_CATCHUP_DAYS` (default 3), `SEND_CONCURRENCY` (default 10), `FILE_CONCURRENCY` (default 4).
+
+**Template:** No change. Delivered through automatic updates.
 
 ---
 

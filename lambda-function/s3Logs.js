@@ -3,9 +3,13 @@
  * each raw log entry into AKTO messages via extractors.js + discovery.js.
  */
 const { GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
-const { gunzip } = require('zlib');
+const { pipeline } = require('stream/promises');
+const { StringDecoder } = require('string_decoder');
+const { gunzip, createGunzip } = require('zlib');
 const { promisify } = require('util');
-const { s3Client, LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS } = require('./config');
+const {
+    s3Client, LOGS_BUCKET_NAME, LOGS_PREFIX, LOOKBACK_DAYS, MAX_CATCHUP_DAYS, LISTING_SLACK_MS, TIME_SAFETY_MARGIN_MS
+} = require('./config');
 const { extractConversationPairs, extractTraceData } = require('./extractors');
 const { fetchAgentName, createStandardMessage, findResourceByArn, buildServiceAgentDiscoveryMessage } = require('./discovery');
 
@@ -103,84 +107,325 @@ async function getOutputBodyJson(logEntry) {
     return { output: { message: { content: [] } } };
 }
 
-/** Resumes from the manifest checkpoint, or falls back to LOOKBACK_DAYS ago if there's no checkpoint or it's stale. */
-function getLogsStartTime(manifest) {
-    const lookbackCutoff = new Date(Date.now() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
-    if (manifest?.lastProcessedTimestamp) {
-        const lastRun = new Date(manifest.lastProcessedTimestamp);
-        if (lastRun > lookbackCutoff) {
-            console.log(`▶️ Resuming from checkpoint: ${manifest.lastProcessedTimestamp}`);
-            return lastRun;
-        }
-        console.warn(`⚠️ Checkpoint ${manifest.lastProcessedTimestamp} is older than ${LOOKBACK_DAYS} days — resetting to ${lookbackCutoff.toISOString()}`);
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+/*
+ * Bedrock writes large request/response bodies as separate objects under a `data/`
+ * folder in this same prefix, and the log entry that owns one points at it with
+ * inputBodyS3Path. Those bodies are NOT log entries — they carry no identity, timestamp
+ * or model — so reading them as log files costs a GET, a gunzip and a parse to produce
+ * nothing, and inflates the "no usable identity" count with things that were never
+ * identities.
+ *
+ * They are still fully read, just through their owning entry (getInputBodyJson), which
+ * is the only path that has the context to turn them into a message.
+ */
+const isBodyObject = (key) => key.includes('/data/');
+const isLogFile = (object) => object.Key.endsWith('.gz') && object.Size > 0 && !isBodyObject(object.Key);
+const lastModifiedMs = (object) => new Date(object.LastModified).getTime();
+// Oldest first, key as the tie-break so files sharing one second come out in a stable order.
+const byLastModified = (a, b) => lastModifiedMs(a) - lastModifiedMs(b) || (a.Key < b.Key ? -1 : a.Key > b.Key ? 1 : 0);
+
+/**
+ * Where reading resumes: the manifest checkpoint, or LOOKBACK_DAYS ago when there is
+ * none, or MAX_CATCHUP_DAYS ago when the checkpoint is older than that.
+ *
+ * S3's LastModified has one-second resolution, and a busy account writes several files
+ * in the same second. `keysAtCheckpoint` are the files already read at exactly the
+ * checkpoint second, so a file sharing that second is still picked up instead of being
+ * skipped by a strict "newer than" test. A manifest written before this field existed
+ * has none, and keeps the original strict comparison — upgrading never re-reads a file.
+ */
+function getResumePoint(manifest) {
+    const now = Date.now();
+    const checkpoint = manifest?.lastProcessedTimestamp ? new Date(manifest.lastProcessedTimestamp).getTime() : NaN;
+
+    if (Number.isNaN(checkpoint)) {
+        const startMs = now - LOOKBACK_DAYS * DAY_MS;
+        console.log(`🆕 No checkpoint — reading the last ${LOOKBACK_DAYS} day(s), from ${new Date(startMs).toISOString()}`);
+        return { startMs, keysAtCheckpoint: null };
     }
-    return lookbackCutoff;
+    const catchupFloor = now - MAX_CATCHUP_DAYS * DAY_MS;
+    if (checkpoint < catchupFloor) {
+        console.warn(`⚠️ Checkpoint ${manifest.lastProcessedTimestamp} is older than ${MAX_CATCHUP_DAYS} days — resetting to ${new Date(catchupFloor).toISOString()}; logs in between are NOT read`);
+        return { startMs: catchupFloor, keysAtCheckpoint: null };
+    }
+    console.log(`▶️ Resuming from checkpoint: ${manifest.lastProcessedTimestamp}`);
+    const keys = Array.isArray(manifest.processedKeysAtCheckpoint) ? new Set(manifest.processedKeysAtCheckpoint) : null;
+    return { startMs: checkpoint, keysAtCheckpoint: keys };
+}
+
+/** Is this log file after the resume point — including a same-second file not yet read? */
+function isUnprocessed(file, { startMs, keysAtCheckpoint }) {
+    const modified = lastModifiedMs(file);
+    if (modified > startMs) return true;
+    return modified === startMs && keysAtCheckpoint !== null && !keysAtCheckpoint.has(file.Key);
+}
+
+/** Runs out of time between S3 calls rather than mid-call. */
+const outOfTime = (timeLeft) => timeLeft() < TIME_SAFETY_MARGIN_MS;
+
+/** One ListObjectsV2 page. */
+function listPage(prefix, continuationToken, delimiter) {
+    return s3Client.send(new ListObjectsV2Command({
+        Bucket: LOGS_BUCKET_NAME,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+        Delimiter: delimiter,
+        MaxKeys: 1000
+    }));
+}
+
+// A level of a Bedrock layout has a handful of sub-folders (accounts, regions, years),
+// all on the first page. More than this many pages means a flat prefix of files, which
+// is not a dated layout — stop rather than page through it.
+const MAX_FOLDER_LISTING_PAGES = 3;
+
+/** The immediate sub-folders of a prefix, or null if it is too large to be a folder level. */
+async function listSubFolders(prefix) {
+    const folders = [];
+    let continuationToken;
+    for (let page = 0; page < MAX_FOLDER_LISTING_PAGES; page++) {
+        const response = await listPage(prefix, continuationToken, '/');
+        for (const common of response.CommonPrefixes || []) folders.push(common.Prefix);
+        continuationToken = response.NextContinuationToken;
+        if (!continuationToken) return folders;
+    }
+    return null;
+}
+
+const YEAR_FOLDER = /^\d{4}\/$/;
+const TWO_DIGIT_FOLDER = /^\d{2}\/$/;
+const childName = (parent, folder) => folder.slice(parent.length);
+// Deep enough for <keyPrefix>/AWSLogs/<account>/BedrockModelInvocationLogs/<region>/.
+const MAX_LAYOUT_DEPTH = 5;
+const MAX_FOLDERS_PER_LEVEL = 50;
+
+/**
+ * Finds the folders under LOGS_PREFIX that directly contain year folders — for
+ * Bedrock, `…/AWSLogs/<account>/BedrockModelInvocationLogs/<region>/` — and whether
+ * each day below them is split into hour folders.
+ *
+ * A few small listings, independent of how many log files exist. Returns [] when the
+ * prefix does not look like Bedrock's dated layout, so the caller can fall back.
+ */
+async function findDatedRoots(timeLeft) {
+    const roots = [];
+    let level = [LOGS_PREFIX];
+    for (let depth = 0; depth <= MAX_LAYOUT_DEPTH && level.length > 0; depth++) {
+        const next = [];
+        for (const prefix of level) {
+            if (outOfTime(timeLeft)) return [];
+            const folders = await listSubFolders(prefix);
+            if (!folders) continue;
+            const years = folders.filter((folder) => YEAR_FOLDER.test(childName(prefix, folder))).sort();
+            if (years.length > 0) roots.push({ prefix, latestYear: years[years.length - 1] });
+            else next.push(...folders.filter((folder) => childName(prefix, folder) !== 'data/'));
+        }
+        if (next.length > MAX_FOLDERS_PER_LEVEL) break;
+        level = next;
+    }
+
+    // An AWSLogs/ prefix also holds other services' dated logs (CloudTrail, ELB, …).
+    // When Bedrock's own folders are there, read only those.
+    const bedrockRoots = roots.filter((root) => root.prefix.includes('/BedrockModelInvocationLogs/'));
+    const chosen = bedrockRoots.length > 0 ? bedrockRoots : roots;
+
+    const resolved = [];
+    for (const root of chosen) {
+        const unitMs = await detectFolderUnit(root.latestYear);
+        if (unitMs) resolved.push({ prefix: root.prefix, unitMs });
+    }
+    return resolved;
+}
+
+/** Follows the newest year → month → day and reports whether days hold hour folders. */
+async function detectFolderUnit(yearFolder) {
+    let folder = yearFolder;
+    for (const level of ['month', 'day']) {
+        const children = ((await listSubFolders(folder)) || []).filter((f) => TWO_DIGIT_FOLDER.test(childName(folder, f))).sort();
+        if (children.length === 0) {
+            console.warn(`⚠️ ${yearFolder} has no ${level} folders — not treating it as a dated log layout`);
+            return null;
+        }
+        folder = children[children.length - 1];
+    }
+    const hours = ((await listSubFolders(folder)) || []).filter((f) => TWO_DIGIT_FOLDER.test(childName(folder, f)));
+    return hours.length > 0 ? HOUR_MS : DAY_MS;
+}
+
+const pad = (n) => String(n).padStart(2, '0');
+
+/** The dated folder (UTC, like Bedrock's key names) that holds time `ms`. */
+function folderFor(rootPrefix, ms, unitMs) {
+    const d = new Date(ms);
+    const day = `${rootPrefix}${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/`;
+    return unitMs === HOUR_MS ? `${day}${pad(d.getUTCHours())}/` : day;
 }
 
 /**
- * Lists every .gz Bedrock log file under LOGS_PREFIX newer than the checkpoint,
- * sorted oldest-first so processing (and the manifest timestamp it advances) is
- * chronological. Paginates through the full bucket listing via ContinuationToken.
+ * A log file may sit in a folder up to this much LATER than its LastModified suggests
+ * (clock skew between the writer and S3). Files are only handed out once every folder
+ * that could hold them has been listed.
  */
-async function getUnprocessedLogFiles(manifest) {
-    const startTime = getLogsStartTime(manifest);
-    let allFiles = [];
-    let continuationToken;
-    let pages = 0;
+const FOLDER_SKEW_MS = 15 * 60 * 1000;
 
-    // Name the exact location being read: a wrong LOGS_PREFIX is the single most
-    // common reason discovery finds nothing, and it is invisible from counts alone.
-    console.log(`🪣 Listing s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} for .gz logs newer than ${startTime.toISOString()}`);
+/**
+ * Opens a cursor over the unprocessed log files, handed out oldest first in batches.
+ *
+ * Bedrock's dated layout lets this read only the folders between the checkpoint and
+ * now, one hour (or day) at a time: memory and S3 calls depend on how much traffic
+ * arrived since the checkpoint, never on how much history the bucket holds. Listing a
+ * multi-year bucket in full is what used to exhaust the Lambda before it read a file.
+ *
+ *   next()      — the next batch of files in LastModified order, or null when there are
+ *                 no more or time ran out (see `complete`)
+ *   buffered()  — files already listed but not yet handed out
+ *   complete    — true once every folder up to now has been listed
+ *
+ * Batches come out in strict LastModified order across folders: a file is held back
+ * until every folder that could contain an earlier file has been listed, because a
+ * late-delivered file can sit in the previous hour's folder. That ordering is what lets
+ * the checkpoint be a single timestamp.
+ *
+ * A prefix that does not follow the dated layout falls back to listing it once in full,
+ * keeping only unprocessed files and stopping at the time budget.
+ */
+async function openLogFileCursor(manifest, timeLeft) {
+    const resume = getResumePoint(manifest);
+    const roots = await findDatedRoots(timeLeft);
+    if (roots.length === 0) return openFullListingCursor(resume, timeLeft);
 
-    do {
-        const response = await s3Client.send(new ListObjectsV2Command({
-            Bucket: LOGS_BUCKET_NAME,
-            Prefix: LOGS_PREFIX,
-            ContinuationToken: continuationToken,
-            MaxKeys: 1000
-        }));
-        allFiles.push(...(response.Contents || []));
-        continuationToken = response.NextContinuationToken;
-        pages++;
-    } while (continuationToken);
+    const now = Date.now();
+    const unitMs = Math.min(...roots.map((root) => root.unitMs));
+    let folderTime = Math.floor((resume.startMs - LISTING_SLACK_MS) / unitMs) * unitMs;
+    let held = [];
+    let objectsSeen = 0;
+    let filesFound = 0;
+    let foldersListed = 0;
 
-    /*
-     * Bedrock writes large request/response bodies as separate objects under a
-     * `data/` folder in this same prefix, and the log entry that owns one points at
-     * it with inputBodyS3Path. Those bodies are NOT log entries — they carry no
-     * identity, timestamp or model — so reading them as log files costs a GET, a
-     * gunzip and a parse to produce nothing, and inflates the "no usable identity"
-     * count with things that were never identities.
-     *
-     * They are still fully read, just through their owning entry (getInputBodyJson),
-     * which is the only path that has the context to turn them into a message.
-     */
-    const isBodyObject = (key) => key.includes('/data/');
-    const bodyObjects = allFiles.filter((file) => file.Key.endsWith('.gz') && isBodyObject(file.Key)).length;
+    console.log(`🪣 Reading ${roots.length > 1 ? `${roots.length} dated log folders` : 'dated log folders'} under s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} by ${unitMs === HOUR_MS ? 'hour' : 'day'}: ${roots.map((root) => root.prefix).join(', ')}`);
+    console.log(`📅 Window: ${folderFor(roots[0].prefix, folderTime, unitMs).slice(roots[0].prefix.length)} → now (unprocessed files newer than ${new Date(resume.startMs).toISOString()})`);
 
-    const logFiles = allFiles
-        .filter((file) => file.Key.endsWith('.gz') && file.Size > 0 && !isBodyObject(file.Key))
-        .sort((a, b) => new Date(a.LastModified) - new Date(b.LastModified));
+    const cursor = {
+        complete: false,
+        buffered: () => held.length,
+        async next() {
+            while (folderTime <= now) {
+                for (const root of roots) {
+                    const folder = folderFor(root.prefix, folderTime, root.unitMs);
+                    // A day-foldered root next to an hour-foldered one: list its day once.
+                    if (folder === root.lastFolder) continue;
+                    let continuationToken;
+                    do {
+                        if (outOfTime(timeLeft)) {
+                            console.warn(`⏱️ Time budget reached while listing ${folder} — the remaining folders are read next run`);
+                            return null;
+                        }
+                        const response = await listPage(folder, continuationToken);
+                        for (const object of response.Contents || []) {
+                            objectsSeen++;
+                            if (isLogFile(object) && isUnprocessed(object, resume)) {
+                                held.push({ Key: object.Key, LastModified: object.LastModified, Size: object.Size });
+                                filesFound++;
+                            }
+                        }
+                        continuationToken = response.NextContinuationToken;
+                    } while (continuationToken);
+                    root.lastFolder = folder;
+                }
+                foldersListed++;
+                folderTime += unitMs;
 
-    const unprocessed = logFiles.filter((file) => new Date(file.LastModified) > startTime);
-    console.log(`📊 ${allFiles.length} object(s) across ${pages} page(s), ${logFiles.length} .gz log file(s), ${unprocessed.length} newer than checkpoint`);
-    if (bodyObjects > 0) {
-        console.log(`📦 ${bodyObjects} large-payload body object(s) under data/ skipped in the listing — they are fetched via inputBodyS3Path by the entries that own them`);
-    }
+                // Everything modified before this point is now listed: no later folder can hold it.
+                const settledBefore = folderTime - FOLDER_SKEW_MS;
+                const ready = held.filter((file) => lastModifiedMs(file) < settledBefore);
+                if (ready.length > 0) {
+                    held = held.filter((file) => lastModifiedMs(file) >= settledBefore);
+                    return ready.sort(byLastModified);
+                }
+            }
 
-    // Turn each "nothing to do" case into a specific, actionable reason.
-    if (allFiles.length === 0) {
-        console.warn(`⚠️ Nothing at s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} — check LOGS_PREFIX matches where Bedrock actually delivers, and that model invocation logging is enabled for this account/region`);
-    } else if (logFiles.length === 0) {
-        const sample = allFiles.slice(0, 3).map((f) => f.Key).join(', ');
-        console.warn(`⚠️ Objects exist under the prefix but none are .gz Bedrock logs. First key(s): ${sample} — LOGS_PREFIX may be pointing at the wrong level`);
-    } else if (unprocessed.length === 0) {
-        const newest = logFiles[logFiles.length - 1];
-        console.log(`✅ Up to date — newest log file is ${newest.Key} (${new Date(newest.LastModified).toISOString()}), at or before the checkpoint`);
-    } else {
-        console.log(`📄 Oldest unprocessed: ${unprocessed[0].Key} (${new Date(unprocessed[0].LastModified).toISOString()})`);
-    }
-    return unprocessed;
+            if (!cursor.complete) {
+                cursor.complete = true;
+                console.log(`📊 Listed ${foldersListed} folder(s), ${objectsSeen} object(s), ${filesFound} unprocessed log file(s)`);
+                if (objectsSeen === 0) {
+                    console.warn(`⚠️ No log objects in the folders since ${new Date(resume.startMs).toISOString()} — check model invocation logging is still enabled and delivering to s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX}`);
+                }
+            }
+            if (held.length === 0) return null;
+            const rest = held.sort(byLastModified);
+            held = [];
+            return rest;
+        }
+    };
+    return cursor;
+}
+
+/**
+ * The fallback for a prefix that is not laid out in dated folders: one full listing,
+ * holding only the unprocessed files (not every object) and stopping at the time
+ * budget. Files can only be ordered once the listing is complete, so a listing the
+ * budget cuts short processes nothing — and says so — rather than checkpointing out of
+ * order.
+ */
+function openFullListingCursor(resume, timeLeft) {
+    let consumed = false;
+    const cursor = {
+        complete: false,
+        buffered: () => 0,
+        async next() {
+            if (consumed) return null;
+            consumed = true;
+
+            // Name the exact location being read: a wrong LOGS_PREFIX is the single most
+            // common reason discovery finds nothing, and it is invisible from counts alone.
+            console.log(`🪣 Listing s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} in full (no dated folders found) for .gz logs newer than ${new Date(resume.startMs).toISOString()}`);
+            const unprocessed = [];
+            let objects = 0, logFiles = 0, bodyObjects = 0, pages = 0;
+            let newest = null;
+            const sample = [];
+            let continuationToken;
+            do {
+                if (outOfTime(timeLeft)) {
+                    console.warn(`⏱️ Time budget reached after listing ${objects} object(s) across ${pages} page(s) of s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} — nothing is processed this run. This prefix is too large to list without Bedrock's dated folders; point LogsPrefix at the folder Bedrock delivers to (…/AWSLogs/).`);
+                    return null;
+                }
+                const response = await listPage(LOGS_PREFIX, continuationToken);
+                for (const object of response.Contents || []) {
+                    objects++;
+                    if (sample.length < 3) sample.push(object.Key);
+                    if (object.Key.endsWith('.gz') && isBodyObject(object.Key)) bodyObjects++;
+                    if (!isLogFile(object)) continue;
+                    logFiles++;
+                    if (!newest || lastModifiedMs(object) > lastModifiedMs(newest)) newest = object;
+                    if (isUnprocessed(object, resume)) unprocessed.push({ Key: object.Key, LastModified: object.LastModified, Size: object.Size });
+                }
+                continuationToken = response.NextContinuationToken;
+                pages++;
+            } while (continuationToken);
+            cursor.complete = true;
+
+            unprocessed.sort(byLastModified);
+            console.log(`📊 ${objects} object(s) across ${pages} page(s), ${logFiles} .gz log file(s), ${unprocessed.length} newer than checkpoint`);
+            if (bodyObjects > 0) {
+                console.log(`📦 ${bodyObjects} large-payload body object(s) under data/ skipped in the listing — they are fetched via inputBodyS3Path by the entries that own them`);
+            }
+            // Turn each "nothing to do" case into a specific, actionable reason.
+            if (objects === 0) {
+                console.warn(`⚠️ Nothing at s3://${LOGS_BUCKET_NAME}/${LOGS_PREFIX} — check LOGS_PREFIX matches where Bedrock actually delivers, and that model invocation logging is enabled for this account/region`);
+            } else if (logFiles === 0) {
+                console.warn(`⚠️ Objects exist under the prefix but none are .gz Bedrock logs. First key(s): ${sample.join(', ')} — LOGS_PREFIX may be pointing at the wrong level`);
+            } else if (unprocessed.length === 0) {
+                console.log(`✅ Up to date — newest log file is ${newest.Key} (${new Date(newest.LastModified).toISOString()}), at or before the checkpoint`);
+            } else {
+                console.log(`📄 Oldest unprocessed: ${unprocessed[0].Key} (${new Date(unprocessed[0].LastModified).toISOString()})`);
+            }
+            return unprocessed.length > 0 ? unprocessed : null;
+        }
+    };
+    return cursor;
 }
 
 /**
@@ -188,24 +433,43 @@ async function getUnprocessedLogFiles(manifest) {
  * `discoveredAgents` is passed through so a first-seen SERVICE_AGENT caller (no ListAgents-
  * style API exists to discover those upfront) gets its one-time discovery message the
  * moment its first log entry is read, and is recorded so it isn't sent again.
+ *
+ * The object is decompressed and split into lines as it streams in, so memory holds one
+ * log entry at a time rather than the compressed file, the whole decompressed text and
+ * an array of its lines together.
  */
 async function processLogFile(bucket, key, discoveredAgents) {
     const s3Object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-    const chunks = [];
-    for await (const chunk of s3Object.Body) chunks.push(chunk);
-    const decompressed = (await gunzipAsync(Buffer.concat(chunks))).toString('utf-8');
 
-    const lines = decompressed.split('\n').filter((line) => line.trim());
     const messages = [];
-    for (const line of lines) {
+    let entries = 0;
+    const processLine = async (line) => {
+        if (!line.trim()) return;
+        entries++;
         try {
             messages.push(...await processBedrockLogEntry(JSON.parse(line), discoveredAgents));
         } catch (parseError) {
             logStats.unparseableLines++;
             console.warn(`⚠️ Skipping unparseable log line in ${key}: ${parseError.message}`);
         }
-    }
-    console.log(`✅ ${key}: ${lines.length} entries → ${messages.length} message(s)`);
+    };
+
+    // The pipeline rejects on any stage's error — a truncated download or a corrupt
+    // gzip fails the whole file, as reading it in one piece did, rather than yielding
+    // whatever lines decoded before the damage.
+    const decoder = new StringDecoder('utf8');
+    let partial = '';
+    await pipeline(s3Object.Body, createGunzip(), async (decompressed) => {
+        for await (const chunk of decompressed) {
+            const lines = (partial + decoder.write(chunk)).split('\n');
+            partial = lines.pop();
+            for (const line of lines) await processLine(line);
+        }
+        partial += decoder.end();
+    });
+    await processLine(partial);
+
+    console.log(`✅ ${key}: ${entries} entries → ${messages.length} message(s)`);
     return messages;
 }
 
@@ -289,4 +553,4 @@ async function processBedrockLogEntry(logEntry, discoveredAgents) {
     return messages;
 }
 
-module.exports = { getUnprocessedLogFiles, processLogFile, resetLogStats, getLogStats };
+module.exports = { openLogFileCursor, processLogFile, resetLogStats, getLogStats };

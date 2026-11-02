@@ -117,12 +117,15 @@ aws lambda invoke --function-name akto-bedrock-log-processor-unified-$ACCOUNT \
 # Watch its logs
 aws logs tail /aws/lambda/akto-bedrock-log-processor-unified-$ACCOUNT --follow --region <region>
 
-# Checkpoints appear after the first run
+# Checkpoints appear after the first run: manifest.json files, plus run-lock.json,
+# which keeps runs from overlapping (managed automatically, don't edit it)
 aws s3 ls s3://<markers-bucket>/akto/markers/ --recursive
 ```
 
 Then check AKTO for new traffic with source `AWS_BEDROCK`. The first run back-fills the
-last 3 days. Later runs pick up only new data.
+last day. Later runs pick up only new data; if the processor is stopped for a while, it
+catches up on up to 3 days when it resumes. Both windows can be changed with the
+`LOOKBACK_DAYS` and `MAX_CATCHUP_DAYS` environment variables on the processor Lambda.
 
 If interception is on, the `GatewayAttachmentResult` stack output summarises what
 happened at deploy time, and `/aws/lambda/akto-bedrock-gw-attacher-cf-<account>` logs

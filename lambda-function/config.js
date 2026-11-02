@@ -36,6 +36,9 @@ const AWS_REGION = process.env.BEDROCK_AWS_REGION || process.env.AWS_REGION;
 const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID;
 const MARKERS_PREFIX = 'akto/markers/';
 const MANIFEST_KEY = `${MARKERS_PREFIX}bedrock-logs/manifest.json`;
+// Single-flight guard for the processor (runLock.js). Under the same prefix as the
+// manifests, so the role's existing markers permissions already cover it.
+const RUN_LOCK_KEY = `${MARKERS_PREFIX}bedrock-logs/run-lock.json`;
 
 /**
  * Messages per AKTO POST.
@@ -103,14 +106,59 @@ const MAX_TRACE_BYTES = Number(process.env.MAX_TRACE_BYTES || 64 * 1024);
 
 const FETCH_TIMEOUT_MS = 25000;       // abort a stuck HTTP call instead of silently eating the whole invocation
 const MAX_SEND_ATTEMPTS = 3;
-const LOOKBACK_DAYS = 3;
+
+/** A positive number from the environment, or the default when unset or invalid. */
+function positiveNumberEnv(name, fallback) {
+    const value = Number(process.env[name]);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * How many AKTO POSTs are in flight at once. Each POST still carries SEND_BATCH_SIZE
+ * messages, so the per-request size guarantee above is unchanged — this only stops a
+ * busy account's throughput being capped by one round trip at a time. 1 restores the
+ * strictly sequential behaviour.
+ */
+const SEND_CONCURRENCY = Math.floor(positiveNumberEnv('SEND_CONCURRENCY', 10));
+
+/**
+ * How many log files are downloaded and parsed at once. Results are still applied in
+ * file order, so the checkpoint semantics are the same as reading them one by one.
+ */
+const FILE_CONCURRENCY = Math.floor(positiveNumberEnv('FILE_CONCURRENCY', 4));
+
+/**
+ * How far back a pipeline reads when it has no checkpoint yet (a new deployment).
+ * Kept short so a new client sees current traffic quickly instead of first working
+ * through days of history.
+ */
+const LOOKBACK_DAYS = positiveNumberEnv('LOOKBACK_DAYS', 1);
+
+/**
+ * The furthest back an EXISTING checkpoint is honoured. A deployment that was stopped
+ * or failing resumes where it left off as long as that is within this window, so an
+ * outage shorter than this loses nothing; anything older is skipped with a warning.
+ * Never shorter than LOOKBACK_DAYS.
+ */
+const MAX_CATCHUP_DAYS = Math.max(LOOKBACK_DAYS, positiveNumberEnv('MAX_CATCHUP_DAYS', 3));
+
+/**
+ * Bedrock writes logs into dated folders (…/YYYY/MM/DD/HH/), but a file can land in a
+ * folder a little earlier than its LastModified time — delivery lags the event. When
+ * resuming from a checkpoint, folders this far before it are re-listed so a late file
+ * is still found; anything already read is filtered out by the checkpoint.
+ */
+const LISTING_SLACK_MS = 3 * 60 * 60 * 1000;
 
 // AgentCore Harness/Runtime conversation data (separate pipeline, see traceDiscovery.js/
 // logGroupReader.js/traceParser.js) — CloudWatch observability logs instead of S3, so it
-// gets its own lookback/manifest rather than sharing the S3 pipeline's above.
+// gets its own manifest rather than sharing the S3 pipeline's above.
 const RUNTIME_LOG_GROUP_PREFIX = process.env.RUNTIME_LOG_GROUP_PREFIX || '/aws/bedrock-agentcore/runtimes/';
 const MAX_LOG_EVENTS_PER_FETCH = 1000; // CloudWatch FilterLogEvents page size cap
-const TRACE_LOOKBACK_DAYS = 3;
+const TRACE_LOOKBACK_DAYS = LOOKBACK_DAYS;
+// Events are turned into messages and checkpointed in chunks of this size, so a busy
+// log group never has to be held in memory in full.
+const TRACE_CHUNK_EVENTS = 5000;
 const TRACE_MARKERS_PREFIX = `${MARKERS_PREFIX}agentcore-tracing/`;
 const TRACE_MANIFEST_KEY = `${TRACE_MARKERS_PREFIX}manifest.json`;
 
@@ -152,10 +200,11 @@ function validateConfig() {
 module.exports = {
     CODE_VERSION,
     DATA_INGESTION_ENDPOINT, AKTO_API_KEY, LOGS_BUCKET_NAME, LOGS_PREFIX, MARKERS_BUCKET_NAME,
-    AWS_REGION, AWS_ACCOUNT_ID, MARKERS_PREFIX, MANIFEST_KEY,
+    AWS_REGION, AWS_ACCOUNT_ID, MARKERS_PREFIX, MANIFEST_KEY, RUN_LOCK_KEY,
     SEND_BATCH_SIZE, MAX_BATCH_BYTES, MAX_TRACE_BYTES, SEND_DEADLINE_MARGIN_MS, FLUSH_THRESHOLD, TIME_SAFETY_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, LOOKBACK_DAYS,
+    SEND_CONCURRENCY, FILE_CONCURRENCY, MAX_CATCHUP_DAYS, LISTING_SLACK_MS,
     SCHEDULE_INTERVAL_MS, RUN_BUDGET_MS, S3_BUDGET_SHARE, S3_BUDGET_MS, INGEST_SERVICE_AGENT_TRAFFIC,
-    RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH, TRACE_LOOKBACK_DAYS, TRACE_MARKERS_PREFIX, TRACE_MANIFEST_KEY,
+    RUNTIME_LOG_GROUP_PREFIX, MAX_LOG_EVENTS_PER_FETCH, TRACE_LOOKBACK_DAYS, TRACE_CHUNK_EVENTS, TRACE_MARKERS_PREFIX, TRACE_MANIFEST_KEY,
     INTERCEPTOR_LAMBDA_ARN, INTERCEPTION_POINTS, INCLUDE_GATEWAY_IDS, EXCLUDE_GATEWAY_IDS, INTERCEPTOR_DRY_RUN,
     GATEWAY_MARKERS_PREFIX, GATEWAY_MANIFEST_KEY, GATEWAY_NAME_MAP_MAX_BYTES,
     validateConfig,

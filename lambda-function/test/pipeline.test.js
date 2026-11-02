@@ -16,6 +16,9 @@ const state = {
     failPlan: () => null
 };
 const reset = () => { state.manifest = null; state.traceManifest = null; state.fileDelayMs = 0; state.groupDelayMs = 0; };
+// The budget scenarios size their backlog for one file at a time; reading files in
+// parallel would finish them inside the budget and leave nothing to observe.
+const SEQUENTIAL = { FILE_CONCURRENCY: '1' };
 
 (async () => {
     section('the budget is derived from the schedule');
@@ -52,7 +55,7 @@ const reset = () => { state.manifest = null; state.traceManifest = null; state.f
     // keeps this about the budget rather than the send deadline (see below).
     state.entriesFor = (key) => [logEntry({ i: Number(String(key).match(/f(\d+)/)[1]), output: {} })];
     restore = quiet();
-    ({ handler } = load(state, { RUN_BUDGET_MS: '300' }));
+    ({ handler } = load(state, { RUN_BUDGET_MS: '300', ...SEQUENTIAL }));
     res = await invoke(handler);
     restore();
     body = JSON.parse(res.body);
@@ -144,7 +147,7 @@ const reset = () => { state.manifest = null; state.traceManifest = null; state.f
         return [i % 40 === 0 ? logEntry({ i }) : logEntry({ i, output: {} })];
     };
     restore = quiet();
-    ({ handler } = load(state, { RUN_BUDGET_MS: '1200' }));
+    ({ handler } = load(state, { RUN_BUDGET_MS: '1200', ...SEQUENTIAL }));
     res = await invoke(handler);
     restore();
     body = JSON.parse(res.body);
@@ -163,7 +166,7 @@ const reset = () => { state.manifest = null; state.traceManifest = null; state.f
     for (let run = 0; run < 3; run++) {
         state.traceManifest = null;
         restore = quiet();
-        ({ handler } = load(state, { RUN_BUDGET_MS: '1200' }));
+        ({ handler } = load(state, { RUN_BUDGET_MS: '1200', ...SEQUENTIAL }));
         res = await invoke(handler);
         restore();
         drained.push(JSON.parse(res.body).s3.filesDone);

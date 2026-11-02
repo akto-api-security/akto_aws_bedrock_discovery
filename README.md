@@ -49,8 +49,14 @@ checkpoint (manifest), so one never blocks the other.
 | Bedrock Agent Classic | Bedrock model invocation logs in S3 (`LogsBucketName`/`LogsPrefix`) | `akto/markers/bedrock-logs/manifest.json` |
 | AgentCore Harness/Runtime | CloudWatch observability traces (`RuntimeLogGroupPrefix`) | `akto/markers/agentcore-tracing/manifest.json` |
 
+Next to the manifests, `akto/markers/bedrock-logs/run-lock.json` makes sure only one run
+works at a time: a scheduled run that overlaps a long one, or a Lambda retry of a failed
+run, sees the lock and exits.
+
 Each run:
-- reads only data newer than its checkpoint (the first run goes back 3 days)
+- reads only data newer than its checkpoint (the first run goes back 1 day). On S3 it lists only
+  the dated folders Bedrock writes (`…/YYYY/MM/DD/HH/`) since the checkpoint, so the cost of a
+  run never depends on how much history the bucket holds
 - extracts the final exchange of each conversation
 - resolves which agent it belongs to, from the caller's IAM role or session name
 - sends it to AKTO, then moves the checkpoint forward

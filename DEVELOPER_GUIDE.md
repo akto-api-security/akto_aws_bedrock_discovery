@@ -41,6 +41,7 @@ APIs and `fetch`, then drive the real handlers.
 | `extraction.test.js` | Only the final exchange is emitted; a tool result is not a user question |
 | `message-format.test.js` | `tag.source` and `tag['bot-name']` are always set (AKTO drops messages without them) |
 | `pipeline.test.js` | The run budget prevents overlapping invocations; S3 can't starve AgentCore |
+| `scale.test.js` | A 2-million-object bucket lists only the lookback window; files are read in LastModified order across hour folders; same-second files at a checkpoint are not skipped; overlapping runs and Lambda retries are refused; AgentCore events are processed in chunks; sending is concurrent |
 
 Sample payloads live in `test/payloads/`. To write a new scenario, use `test/harness.js`:
 
@@ -83,6 +84,10 @@ VERSION=v4.6-dev npm run deploy    # packages, then update-function-code on akto
 aws lambda invoke --function-name akto-bedrock-log-processor-unified-<acct> out.json && cat out.json
 aws logs tail /aws/lambda/akto-bedrock-log-processor-unified-<acct> --follow
 ```
+
+Only one processor run works at a time: a run that starts while another holds
+`akto/markers/bedrock-logs/run-lock.json` exits with `Skipping this run` in its log. If
+a manual invoke is skipped, wait for the scheduled run to finish (at most ~10 minutes).
 
 `npm run deploy` updates only the discovery Lambda. For attacher or interceptor changes,
 run `aws lambda update-function-code --zip-file fileb://../akto-bedrock-processor.zip` on
@@ -140,6 +145,21 @@ next check, so no client action is needed.
 template URL with clients that need the new resources. Existing stacks keep running the
 old template with new code, so new code must not depend on a new env var or permission
 without a safe fallback.
+
+## Runtime settings
+
+These are optional environment variables on the processor Lambda. They are read on
+every run, so a change takes effect on the next run without a template update or a
+redeploy, and the updater never overwrites them.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOKBACK_DAYS` | `1` | How far back a pipeline reads when it has no checkpoint (a new deployment) |
+| `MAX_CATCHUP_DAYS` | `3` | The oldest checkpoint that is resumed in full; older ones restart from this many days ago |
+| `SEND_CONCURRENCY` | `10` | AKTO requests in flight at once (`1` = sequential) |
+| `FILE_CONCURRENCY` | `4` | S3 log files downloaded and parsed at once |
+| `SEND_BATCH_SIZE` | `1` | Messages per AKTO request (the ingest broker rejects bodies over 1MB) |
+| `RUN_BUDGET_MS` | 80% of the schedule | Wall-clock work per run |
 
 ## Useful tools
 

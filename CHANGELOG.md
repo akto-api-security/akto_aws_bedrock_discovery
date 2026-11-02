@@ -8,6 +8,40 @@ Published builds of the AKTO Bedrock integration, newest first. Builds live in
 releases are code-only. v3.x and v4.x were published in parallel during August
 (v3.x: discovery only; v4.x: with gateway guardrails) and were merged in v4.4.
 
+## v4.6 — 2026-11-02
+
+Code only: reaches every stack through the updater, with no template change. Verified
+on a 300,000-file bucket at 256 MB: v4.5 timed out at 900 s with memory full; v4.6
+listed 2,504 objects, read 2,504 files, sent 2,403 messages and finished in 96 s using
+146 MB.
+
+- **Fixed:**
+  - The S3 pipeline listed the entire logs prefix every run before filtering to the
+    lookback window. On a bucket with millions of log files, the listing exhausted
+    memory and the 15-minute timeout before any file was read, so no checkpoint was
+    ever written. It now reads only Bedrock's dated folders (`…/YYYY/MM/DD/HH/`) from
+    the checkpoint to now, one hour at a time, with the time budget checked throughout.
+    A prefix without dated folders falls back to one full listing that holds only
+    unprocessed files.
+  - Files sharing the checkpoint's LastModified second were skipped permanently. The
+    manifest now records them (`processedKeysAtCheckpoint`).
+  - The AgentCore pipeline loaded every new event of a log group before processing
+    any; it now processes and checkpoints 5,000 events at a time.
+  - Overlapping runs (a schedule firing during a long run) and Lambda's automatic
+    retries of a failed run processed the same files concurrently. A run lock in the
+    markers bucket (`akto/markers/bedrock-logs/run-lock.json`, written with S3
+    conditional writes) now admits one run at a time, and a retry recognises its own
+    request ID and exits. Any failure of the lock itself is logged and the run proceeds.
+- **Changed:**
+  - AKTO requests are sent 10 at a time (`SEND_CONCURRENCY`) and log files are read 4 at
+    a time (`FILE_CONCURRENCY`), still one message per request.
+  - Log files are decompressed and parsed as a stream.
+  - First-run lookback is 1 day (`LOOKBACK_DAYS`); a stale checkpoint resumes up to
+    3 days back (`MAX_CATCHUP_DAYS`). Both apply to the S3 and AgentCore pipelines.
+- **Tests:** `scale.test.js` (43 tests), including a 2-million-object bucket. The test
+  runner now counts the `node:test` suite (`identityActor.test.js`), which it
+  previously reported as `CRASH`.
+
 ## v4.5 — 2026-09-10 · Template
 
 - **Added:**

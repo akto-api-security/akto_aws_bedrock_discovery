@@ -6,7 +6,7 @@
  */
 const {
     DATA_INGESTION_ENDPOINT, AKTO_API_KEY, SEND_BATCH_SIZE, MAX_BATCH_BYTES,
-    SEND_DEADLINE_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS
+    SEND_DEADLINE_MARGIN_MS, FETCH_TIMEOUT_MS, MAX_SEND_ATTEMPTS, SEND_CONCURRENCY
 } = require('./config');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -136,7 +136,7 @@ async function sendBatchWithRetry(batch, batchNum, totalBatches, timeLeft) {
 }
 
 /**
- * Splits messages into batches and sends them to AKTO sequentially.
+ * Splits messages into batches and sends them to AKTO, up to SEND_CONCURRENCY at once.
  *
  * Returns {sent, quarantined[]} rather than throwing on a batch the server will never
  * accept.
@@ -151,38 +151,51 @@ async function sendToDataIngestionService(messages, timeLeft) {
     const startedAt = Date.now();
     const quarantined = [];
     let sent = 0;
-    console.log(`📤 Sending ${messages.length} message(s) to ${host} in ${batches.length} batch(es) of up to ${SEND_BATCH_SIZE}`);
+    const workers = Math.min(SEND_CONCURRENCY, batches.length);
+    console.log(`📤 Sending ${messages.length} message(s) to ${host} in ${batches.length} batch(es) of up to ${SEND_BATCH_SIZE}, ${workers} at a time`);
 
-    for (let i = 0; i < batches.length; i++) {
-        if (timeLeft && timeLeft() < SEND_DEADLINE_MARGIN_MS) {
-            // Stop before starting something that can't finish. Transient by nature —
-            // the caller must not checkpoint past what is still unsent.
-            const error = new Error(`Deadline reached after ${i}/${batches.length} batch(es) — ${timeLeft()}ms left, need ${SEND_DEADLINE_MARGIN_MS}ms. Remaining messages will be resent next run.`);
-            error.sentBeforeFailure = sent;
-            throw error;
-        }
-        try {
-            await sendBatchWithRetry(batches[i], i + 1, batches.length, timeLeft);
-            sent += batches[i].length;
-        } catch (error) {
-            if (!isPermanentRejection(error)) {
-                // Retries are already spent, but this could succeed later. Fail the
-                // flush so the caller leaves the checkpoint where it is.
-                error.sentBeforeFailure = sent;
-                throw error;
+    // Workers take the next unsent batch until none are left or one fails transiently.
+    // A transient failure stops new batches from starting; those already in flight
+    // finish, and then the whole send fails so the caller keeps the checkpoint.
+    let nextBatch = 0;
+    let failure = null;
+    const worker = async () => {
+        while (!failure && nextBatch < batches.length) {
+            const i = nextBatch++;
+            if (timeLeft && timeLeft() < SEND_DEADLINE_MARGIN_MS) {
+                // Stop before starting something that can't finish. Transient by nature —
+                // the caller must not checkpoint past what is still unsent.
+                failure = failure || new Error(`Deadline reached after ${i}/${batches.length} batch(es) — ${timeLeft()}ms left, need ${SEND_DEADLINE_MARGIN_MS}ms. Remaining messages will be resent next run.`);
+                return;
             }
-            const bytes = Buffer.byteLength(JSON.stringify({ batchData: batches[i] }), 'utf8');
-            for (const requestId of requestIdsOf(batches[i])) {
-                quarantined.push({
-                    requestId,
-                    bytes,
-                    status: error.httpStatus || 0,
-                    reason: String(error.message).slice(0, 200),
-                    at: new Date().toISOString()
-                });
+            try {
+                await sendBatchWithRetry(batches[i], i + 1, batches.length, timeLeft);
+                sent += batches[i].length;
+            } catch (error) {
+                if (!isPermanentRejection(error)) {
+                    // Retries are already spent, but this could succeed later. Fail the
+                    // flush so the caller leaves the checkpoint where it is.
+                    failure = failure || error;
+                    return;
+                }
+                const bytes = Buffer.byteLength(JSON.stringify({ batchData: batches[i] }), 'utf8');
+                for (const requestId of requestIdsOf(batches[i])) {
+                    quarantined.push({
+                        requestId,
+                        bytes,
+                        status: error.httpStatus || 0,
+                        reason: String(error.message).slice(0, 200),
+                        at: new Date().toISOString()
+                    });
+                }
+                console.error(`🚫 Batch ${i + 1}/${batches.length} PERMANENTLY rejected after ${MAX_SEND_ATTEMPTS} attempt(s) — quarantining ${batches[i].length} message(s) (${bytes}B, requestId ${requestIdsOf(batches[i]).join(',')}) and continuing. Recorded in manifest.failedMessages.`);
             }
-            console.error(`🚫 Batch ${i + 1}/${batches.length} PERMANENTLY rejected after ${MAX_SEND_ATTEMPTS} attempt(s) — quarantining ${batches[i].length} message(s) (${bytes}B, requestId ${requestIdsOf(batches[i]).join(',')}) and continuing. Recorded in manifest.failedMessages.`);
         }
+    };
+    await Promise.all(Array.from({ length: workers }, worker));
+    if (failure) {
+        failure.sentBeforeFailure = sent;
+        throw failure;
     }
 
     const elapsed = Date.now() - startedAt;
