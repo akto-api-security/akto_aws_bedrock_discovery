@@ -15,7 +15,10 @@ for (const suite of suites) {
         out = (e.stdout || '') + (e.stderr || '');
         failedSuites.push(suite);
     }
-    const summary = (out.match(/^(\d+) passed, (\d+) failed$/m) || [])[0] || 'CRASH';
+    // assert-lite suites print "N passed, M failed"; node:test suites print "ℹ pass N" / "ℹ fail M".
+    const nodeTest = out.match(/^ℹ pass (\d+)$/m) && out.match(/^ℹ fail (\d+)$/m);
+    const summary = (out.match(/^(\d+) passed, (\d+) failed$/m) || [])[0]
+        || (nodeTest ? `${out.match(/^ℹ pass (\d+)$/m)[1]} passed, ${out.match(/^ℹ fail (\d+)$/m)[1]} failed` : 'CRASH');
     const count = Number((summary.match(/^(\d+)/) || [])[1] || 0);
     total += count;
     process.stdout.write(`  ${suite.padEnd(30)} ${summary}\n`);

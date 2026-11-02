@@ -56,6 +56,7 @@ function load(state, env = {}) {
         // would silently leak into the next.
         SEND_BATCH_SIZE: '', MAX_TRACE_BYTES: '', RUN_BUDGET_MS: '', S3_BUDGET_SHARE: '',
         SCHEDULE_INTERVAL_MS: '', INGEST_SERVICE_AGENT_TRAFFIC: '',
+        LOOKBACK_DAYS: '', MAX_CATCHUP_DAYS: '', SEND_CONCURRENCY: '', FILE_CONCURRENCY: '',
         DEPLOYMENT_MODE: '', BEDROCK_LOGGING_MODE: '', BEDROCK_BUCKET_BASE_NAME: '', ...env
     });
 
@@ -67,7 +68,13 @@ function load(state, env = {}) {
     const s3Client = { async send(command) {
         const type = command.constructor.name;
         count(type);
-        if (type === 'ListObjectsV2Command') return { Contents: state.files || [] };
+        if (type === 'ListObjectsV2Command') {
+            state.listCalls = (state.listCalls || 0) + 1;
+            const response = state.listObjects ? state.listObjects(command.input) : listObjects(state.files || [], command.input);
+            state.keysListed = (state.keysListed || 0) + (response.Contents || []).length;
+            return response;
+        }
+        if (String(command.input.Key).endsWith('run-lock.json')) return runLock(state, type, command.input);
         if (type === 'PutObjectCommand') {
             state.putKeys.push(command.input.Key);
             if (String(command.input.Key).includes('agentcore-tracing')) state.traceManifest = command.input.Body;
@@ -85,6 +92,10 @@ function load(state, env = {}) {
                 return { Body: Readable.from([Buffer.from(state.manifest)]) };
             }
             if (state.fileDelayMs) await new Promise((r) => setTimeout(r, state.fileDelayMs));
+            if (state.rawBodyFor) {
+                const raw = state.rawBodyFor(key);
+                if (raw) return { Body: Readable.from([raw]) };
+            }
             const entries = state.entriesFor ? state.entriesFor(key) : [logEntry({ i: 0 })];
             const body = entries.map((e) => JSON.stringify(e)).join('\n') + '\n';
             return { Body: Readable.from([zlib.gzipSync(Buffer.from(body))]) };
@@ -128,7 +139,14 @@ function load(state, env = {}) {
         if (type === 'DescribeLogGroupsCommand') return { logGroups: state.logGroups || [] };
         if (type === 'FilterLogEventsCommand') {
             if (state.groupDelayMs) await new Promise((r) => setTimeout(r, state.groupDelayMs));
-            return { events: state.logEvents || [] };
+            // Paginated like CloudWatch: events from startTime on, `limit` per page.
+            const { startTime = 0, limit = 10000, nextToken } = command.input;
+            const events = (state.logEvents || []).filter((e) => e.timestamp >= startTime);
+            const from = Number(nextToken || 0);
+            return {
+                events: events.slice(from, from + limit),
+                nextToken: from + limit < events.length ? String(from + limit) : undefined
+            };
         }
         return {};
     } };
@@ -165,9 +183,17 @@ function load(state, env = {}) {
         cloudWatchLogsClient, iamClient
     };
 
+    state.inFlight = 0;
+    state.maxInFlight = 0;
     global.fetch = async (_url, options) => {
         const body = JSON.parse(options.body);
         state.posts.push(body.batchData.length);
+        if (state.fetchDelayMs) {
+            state.inFlight++;
+            state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+            await new Promise((r) => setTimeout(r, state.fetchDelayMs));
+            state.inFlight--;
+        }
         const ids = body.batchData.map((m) => {
             try { return JSON.parse(m.requestHeaders)['X-Request-Id']; } catch { return ''; }
         });
@@ -181,6 +207,49 @@ function load(state, env = {}) {
         config: require.cache[configPath].exports,
         modules: (name) => require(path.join(LAMBDA, name))
     };
+}
+
+/**
+ * ListObjectsV2 over an in-memory object list, with S3's semantics: keys in lexical
+ * order, Prefix filtering, Delimiter roll-up into CommonPrefixes, and MaxKeys pages.
+ */
+function listObjects(files, { Prefix = '', Delimiter, MaxKeys = 1000, ContinuationToken }) {
+    const sorted = files.filter((f) => f.Key.startsWith(Prefix)).sort((a, b) => (a.Key < b.Key ? -1 : 1));
+    const entries = [];
+    const seen = new Set();
+    for (const file of sorted) {
+        const rest = file.Key.slice(Prefix.length);
+        const cut = Delimiter ? rest.indexOf(Delimiter) : -1;
+        if (cut >= 0) {
+            const common = Prefix + rest.slice(0, cut + Delimiter.length);
+            if (!seen.has(common)) { seen.add(common); entries.push({ common }); }
+        } else {
+            entries.push({ file });
+        }
+    }
+    const start = Number(ContinuationToken || 0);
+    const page = entries.slice(start, start + MaxKeys);
+    return {
+        Contents: page.filter((e) => e.file).map((e) => e.file),
+        CommonPrefixes: page.filter((e) => e.common).map((e) => ({ Prefix: e.common })),
+        NextContinuationToken: start + MaxKeys < entries.length ? String(start + MaxKeys) : undefined
+    };
+}
+
+/** S3 conditional writes on the run lock: If-None-Match creates, If-Match replaces one exact version. */
+function runLock(state, type, input) {
+    state.lockKey = input.Key;
+    if (state.lockError) throw state.lockError;
+    if (type === 'GetObjectCommand') {
+        if (!state.lock) throw awsError('NoSuchKey');
+        return { Body: Readable.from([Buffer.from(state.lock.body)]), ETag: state.lock.etag };
+    }
+    const preconditionFailed = () => Object.assign(awsError('PreconditionFailed'), { $metadata: { httpStatusCode: 412 } });
+    if (input.IfNoneMatch === '*' && state.lock) throw preconditionFailed();
+    if (input.IfMatch && (!state.lock || state.lock.etag !== input.IfMatch)) throw preconditionFailed();
+    state.lockVersion = (state.lockVersion || 0) + 1;
+    state.lock = { body: input.Body, etag: `"v${state.lockVersion}"` };
+    return { ETag: state.lock.etag };
 }
 
 /** S3 objects, oldest first. LastModified is relative to now so the lookback accepts them. */
@@ -202,4 +271,4 @@ function quiet() {
 const invoke = (handler, msLeft = 800000) =>
     handler({ source: 'aws.events' }, { getRemainingTimeInMillis: () => msLeft });
 
-module.exports = { LAMBDA, load, logEntry, mkFiles, mkGroups, quiet, invoke, awsError };
+module.exports = { LAMBDA, load, logEntry, mkFiles, mkGroups, quiet, invoke, awsError, listObjects };

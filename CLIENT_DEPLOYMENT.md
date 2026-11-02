@@ -117,12 +117,15 @@ aws lambda invoke --function-name akto-bedrock-log-processor-unified-$ACCOUNT \
 # Watch its logs
 aws logs tail /aws/lambda/akto-bedrock-log-processor-unified-$ACCOUNT --follow --region <region>
 
-# Checkpoints appear after the first run
+# Checkpoints appear after the first run: manifest.json files, plus run-lock.json,
+# which keeps runs from overlapping (managed automatically, don't edit it)
 aws s3 ls s3://<markers-bucket>/akto/markers/ --recursive
 ```
 
 Then check AKTO for new traffic with source `AWS_BEDROCK`. The first run back-fills the
-last 3 days. Later runs pick up only new data.
+last day. Later runs pick up only new data; if the processor is stopped for a while, it
+catches up on up to 3 days when it resumes. Both windows can be changed with the
+`LOOKBACK_DAYS` and `MAX_CATCHUP_DAYS` environment variables on the processor Lambda.
 
 If interception is on, the `GatewayAttachmentResult` stack output summarises what
 happened at deploy time, and `/aws/lambda/akto-bedrock-gw-attacher-cf-<account>` logs
@@ -260,8 +263,10 @@ With auto-deployment on, accounts that later join those OUs get it automatically
 - All resources are named `akto-bedrock-org-*-<account>-<region>`, so they can't clash
   with a single-account stack.
 - **Verify:** `aws s3 ls s3://<markers-bucket>/ --recursive` shows
-  `<account>/<region>/bedrock-logs/manifest.json` for each account after its first run
-  (within 10 minutes). Each account's processor log says which bucket it discovered, or
+  `<account>/<region>/bedrock-logs/manifest.json` (and the `run-lock.json` that keeps
+  runs from overlapping) for each account after its first run (within 10 minutes). Each
+  stack instance reads only its own account's logs, and its own region's folder when
+  there is one. Each account's processor log says which bucket it discovered, or
   why it skipped.
 - **Updates** are automatic in every account, the same as for a single account.
 - **Uninstall:** delete the stack instances, then the StackSet, then (optionally) the

@@ -16,9 +16,23 @@ const { section, acheck, done } = require('./assert-lite');
 
 const STACKSET = { DEPLOYMENT_MODE: 'stackset', LOGS_BUCKET_NAME: '', AWS_ACCOUNT_ID: '111122223333', BEDROCK_AWS_REGION: 'eu-west-1' };
 
+/** The dated folder Bedrock writes to for `account`/`region` at time `ms` (UTC). */
+const pad = (n) => String(n).padStart(2, '0');
+function bedrockFolder(account, region, ms = Date.now() - 30 * 60e3) {
+    const d = new Date(ms);
+    return `AWSLogs/${account}/BedrockModelInvocationLogs/${region}/${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/${pad(d.getUTCHours())}/`;
+}
+const OWN = '111122223333';
+
+/**
+ * Single mode reads the configured prefix ('p/' in the harness); stackset mode reads the
+ * prefix discovered from the logging configuration ('AWSLogs/'), so its files sit where
+ * Bedrock really writes them.
+ */
 function fresh(extra = {}) {
     return { manifest: null, traceManifest: null, files: mkFiles(3), entriesFor: () => [logEntry({ i: 0 })], failPlan: () => null, ...extra };
 }
+const freshStackset = (extra = {}) => fresh({ files: mkFiles(3, `${bedrockFolder(OWN, 'eu-west-1')}f`), ...extra });
 
 async function run(state, env) {
     const restore = quiet();
@@ -47,7 +61,7 @@ async function run(state, env) {
 
     section('stackset mode: checkpoints keyed by account and region');
     {
-        const state = fresh();
+        const state = freshStackset();
         const { res, body } = await run(state, STACKSET);
         await acheck('logs bucket is discovered from the logging configuration', async () => {
             assert.strictEqual(state.awsCalls.GetModelInvocationLoggingConfigurationCommand, 1);
@@ -60,6 +74,56 @@ async function run(state, env) {
             assert.ok(!state.putKeys.some((k) => k.startsWith('akto/markers/')), state.putKeys.join(', '));
         });
         await acheck('LOGS_BUCKET_NAME is not required', async () => assert.strictEqual(res.statusCode, 200));
+        await acheck('the run lock sits under <account>/<region>/ too', async () => {
+            assert.ok(state.lock, 'no lock written');
+            assert.strictEqual(state.lockKey, '111122223333/eu-west-1/bedrock-logs/run-lock.json');
+        });
+    }
+
+    section('stackset mode: a bucket shared by several accounts and regions');
+    {
+        // One organization bucket: this account in two regions, plus another account.
+        // The role may only read its own account's keys, and this stack instance runs
+        // for eu-west-1 — so only those files are read.
+        const files = [
+            ...mkFiles(3, `${bedrockFolder(OWN, 'eu-west-1')}own-`),
+            ...mkFiles(2, `${bedrockFolder(OWN, 'us-east-1')}other-region-`),
+            ...mkFiles(4, `${bedrockFolder('999988887777', 'eu-west-1')}other-account-`)
+        ];
+        const read = [];
+        const state = fresh({ files, entriesFor: (key) => { read.push(key); return [logEntry({ i: 0 })]; } });
+        const { body } = await run(state, STACKSET);
+        await acheck('only this account\'s files for this region are read', async () => {
+            assert.strictEqual(body.s3.filesDone, 3, read.join(', '));
+            assert.ok(read.every((k) => k.includes(`/${OWN}/`) && k.includes('/eu-west-1/')), read.join(', '));
+        });
+        await acheck('another account\'s logs never fail as unreadable', async () => assert.strictEqual(body.s3.filesFailed, 0));
+    }
+    {
+        // This account logs only from another region's folder: kept rather than dropped,
+        // so a layout this code does not expect still reads the account's own logs.
+        const read = [];
+        const state = fresh({
+            files: mkFiles(2, `${bedrockFolder(OWN, 'us-east-1')}f`),
+            entriesFor: (key) => { read.push(key); return [logEntry({ i: 0 })]; }
+        });
+        const { body } = await run(state, STACKSET);
+        await acheck('with no folder for this region, the account\'s other folders are still read', async () => {
+            assert.strictEqual(body.s3.filesDone, 2, read.join(', '));
+        });
+    }
+    {
+        // No dated folders at all: the full-listing fallback applies the same account rule.
+        const read = [];
+        const state = fresh({
+            files: [...mkFiles(2, `AWSLogs/${OWN}/flat-`), ...mkFiles(3, 'AWSLogs/999988887777/flat-')],
+            entriesFor: (key) => { read.push(key); return [logEntry({ i: 0 })]; }
+        });
+        const { body } = await run(state, STACKSET);
+        await acheck('the full-listing fallback also reads only this account\'s files', async () => {
+            assert.strictEqual(body.s3.filesDone, 2, read.join(', '));
+            assert.strictEqual(body.s3.filesFailed, 0);
+        });
     }
 
     section('stackset mode: account logging only to CloudWatch');
